@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.agenti_helix/
+.cursor/
+.venv/
+dist/
+build/
+*.egg-info/
