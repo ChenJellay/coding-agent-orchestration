@@ -1,14 +1,14 @@
-## Phase 2 – Verification Loop
+## Verification – Checkpointed Loop
 
-Phase 2 wraps the Phase 1 single-file edit primitive in a **checkpointed, self-verifying loop** implemented as a LangGraph state machine. It introduces explicit checkpoints, a local Judge model, and deterministic retry/rollback semantics.
+The verification layer wraps the single-file edit primitive in a **checkpointed, self-verifying loop** implemented as a LangGraph state machine. It introduces explicit checkpoints, a local Judge model, and deterministic retry/rollback semantics.
 
 ### Modules
 
-- `phase2/checkpointing.py`: Task and checkpoint models, JSON-based persistence, and simple file-content rollback helpers.
-- `phase2/judge_client.py`: HTTP client for the local Judge model service, plus `JudgeRequest`/`JudgeResponse` schemas.
-- `phase2/verification_loop.py`: LangGraph graph that orchestrates the verification loop around `run_single_agent_edit`.
-- `phase2/config.py`: Tunable configuration (Judge base URL, timeout, max retries).
-- `phase2/cli.py`: Demo CLI wiring the loop to the `demo-repo` React project.
+- `backend/agenti_helix/verification/checkpointing.py`: Task and checkpoint models, JSON-based persistence, and simple file-content rollback helpers.
+- `backend/agenti_helix/verification/judge_client.py`: HTTP client for the local Judge model service, plus `JudgeRequest`/`JudgeResponse` schemas.
+- `backend/agenti_helix/verification/verification_loop.py`: LangGraph graph that orchestrates the verification loop around `run_single_agent_edit`.
+- `backend/agenti_helix/verification/config.py`: Tunable configuration (Judge base URL, timeout, max retries).
+- `backend/agenti_helix/verification/cli.py`: Demo CLI wiring the loop to the `demo-repo` React project.
 
 ### Judge HTTP Contract
 
@@ -65,7 +65,7 @@ flowchart TD
 2. From the project root, run:
 
 ```bash
-python -m phase2.cli
+python -m agenti_helix.verification.cli
 ```
 
 3. The CLI will:

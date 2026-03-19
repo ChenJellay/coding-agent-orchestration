@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-import phase3.intent_compiler as ic
+import agenti_helix.orchestration.intent_compiler as ic
 
 
 def test_compile_macro_intent_with_llm_uses_service_response(monkeypatch, tmp_path: Path) -> None:
@@ -51,7 +51,7 @@ def test_compile_macro_intent_with_llm_uses_service_response(monkeypatch, tmp_pa
         return DummyResponse(payload)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("phase3.intent_compiler.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("agenti_helix.orchestration.intent_compiler.urllib.request.urlopen", fake_urlopen)
 
     spec = ic.compile_macro_intent_with_llm(
         macro_intent,

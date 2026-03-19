@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from phase2.checkpointing import Checkpoint, EditTaskSpec, VerificationStatus
-from phase3 import intent_compiler, orchestrator as orch
+from agenti_helix.verification.checkpointing import Checkpoint, EditTaskSpec, VerificationStatus
+from agenti_helix.orchestration import intent_compiler, orchestrator as orch
 
 
 class DummyVerificationState:
@@ -47,7 +47,7 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
     (src / "header.js").write_text("console.log('header');\n")
 
     macro_intent = "Demo macro intent."
-    spec = orch.compile_macro_intent_to_dag(
+    spec = intent_compiler.compile_macro_intent_deterministic(
         macro_intent,
         repo_path=str(repo),
         dag_id="dag-all-pass",
@@ -55,12 +55,12 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
 
     called_tasks: list[EditTaskSpec] = []
 
-    def fake_run_phase2(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
         called_tasks.append(task)
         return DummyVerificationState(VerificationStatus.PASSED)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(orch, "run_phase2_verification_loop", fake_run_phase2)
+    monkeypatch.setattr(orch, "run_verification_loop", fake_run_verification_loop)
 
     result = orch.execute_dag(spec)
 
@@ -82,19 +82,19 @@ def test_execute_dag_blocks_downstream_on_failure(tmp_path: Path, monkeypatch) -
     (src / "header.js").write_text("console.log('header');\n")
 
     macro_intent = "Demo macro intent."
-    spec = orch.compile_macro_intent_to_dag(
+    spec = intent_compiler.compile_macro_intent_deterministic(
         macro_intent,
         repo_path=str(repo),
         dag_id="dag-with-failure",
     )
 
-    def fake_run_phase2(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
         if task.task_id == "header-style-refine":
             return DummyVerificationState(VerificationStatus.BLOCKED)
         return DummyVerificationState(VerificationStatus.PASSED)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(orch, "run_phase2_verification_loop", fake_run_phase2)
+    monkeypatch.setattr(orch, "run_verification_loop", fake_run_verification_loop)
 
     result = orch.execute_dag(spec)
 

@@ -1,3 +1,15 @@
+## Repo cleanup report (frontend/backend refactor)
+
+This repo was refactored from `phase1/`–`phase4/` into:
+
+- `backend/agenti_helix/*` (Python backend)
+- `frontend/*` (Vite React UI)
+
+### Notes
+
+- Old `phase*` folders are deprecated and can be deleted once you no longer need historical references.
+- `.agenti_helix/` execution artifacts remain at repo root.
+
 ## Repo cleanup report (Phase 1–2 scope)
 
 This repo currently implements **Phase 1** and **Phase 2** from `README.md`. Below are files I reviewed, plus anything that looks **excessive / out-of-scope / likely to surprise you**, so you can manually inspect.

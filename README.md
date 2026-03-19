@@ -1,7 +1,7 @@
 ### Agenti-Helix Implementation Plan
 
-**Status**: Phase 1 complete (Core Primitive: AST RAG + Single Execution)  
-**Goal**: Implement Agenti-Helix as an AI-native SDLC Control Plane across 5 phases, progressively layering reliability, orchestration, UI, and enterprise hardening.
+**Status**: Core primitives in place; refactored into frontend/backend modules  
+**Goal**: Implement Agenti-Helix as an AI-native SDLC Control Plane, progressively layering reliability, orchestration, UI, and enterprise hardening.
 
 ---
 
@@ -18,7 +18,7 @@ The 5 phases below build these layers incrementally, starting from a single reli
 
 ---
 
-## 2. Phase 1 – Core Primitive (AST RAG + Single Execution) ✅
+## 2. Core – Single-file edit primitive ✅
 
 **Objective**: One agent reliably edits one file without hallucinating, using AST-aware RAG and a Repository Map.
 
@@ -60,7 +60,7 @@ The 5 phases below build these layers incrementally, starting from a single reli
 
 ---
 
-## 3. Phase 2 – Verification Loop (State Management & Local Judges)
+## 3. Verification – Checkpointing & Local Judges
 
 **Objective**: Wrap the single-agent loop in a checkpointed, self-verifying state machine using local judge models.
 
@@ -106,7 +106,7 @@ The 5 phases below build these layers incrementally, starting from a single reli
 
 ---
 
-## 4. Phase 3 – Orchestrator (DAG Routing & Task Breakdown)
+## 4. Orchestration – DAG Routing & Task Breakdown
 
 **Objective**: Turn the reliable single-task loop into a DAG-based orchestrator that sequences multiple tasks deterministically.
 
@@ -150,13 +150,13 @@ The 5 phases below build these layers incrementally, starting from a single reli
 
 ---
 
-## 5. Phase 4 – Interface Integration (The Helix Canvas)
+## 5. Interface – The Helix Canvas
 
 **Objective**: Build the human-facing “Helix Canvas” UI that visualizes DAGs, state, and semantic traces, and supports management-by-exception.
 
-### Phase 4 (prototype) – How to run locally
+### Interface (prototype) – How to run locally
 
-This repo includes an early Phase 4 prototype under `phase4/`:
+This repo includes an early UI prototype under `frontend/` and a control-plane API under `backend/`:
 
 - **API server (FastAPI)**: serves `.agenti_helix/` artifacts + derived views (`/api/features`, `/api/triage`, etc.)
 - **Web UI (Vite + React/TypeScript)**: Notion-like shell with Features Kanban, Feature DAG view, Triage Inbox, Task Intervention, and Sign-Off tri-pane (v1)
@@ -164,13 +164,13 @@ This repo includes an early Phase 4 prototype under `phase4/`:
 Run the API:
 
 ```bash
-uvicorn phase4.server.main:app --reload --port 8001
+uvicorn agenti_helix.api.main:app --reload --port 8001
 ```
 
 Run the web app:
 
 ```bash
-cd phase4/web
+cd frontend
 npm install
 npm run dev
 ```

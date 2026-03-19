@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phase2.checkpointing import (
+from agenti_helix.verification.checkpointing import (
     Checkpoint,
     EditTaskSpec,
     VerificationStatus,

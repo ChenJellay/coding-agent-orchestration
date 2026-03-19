@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from phase2.checkpointing import EditTaskSpec, VerificationStatus
-from phase2 import verification_loop as vloop
+from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
+from agenti_helix.verification import verification_loop as vloop
 
 
 class DummyJudgeClient:
