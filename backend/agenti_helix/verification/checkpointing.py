@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agenti_helix.api.paths import PATHS
+
 
 class VerificationStatus(str, Enum):
     PENDING = "PENDING"
@@ -28,6 +30,14 @@ class EditTaskSpec:
     acceptance_criteria: str
     repo_path: str
 
+    # Optional plug-and-play execution configuration.
+    # When omitted, the verification loop uses default coder/judge chains.
+    coder_chain: Optional[Dict[str, Any]] = None
+    judge_chain: Optional[Dict[str, Any]] = None
+    # Execution pipeline hint: "patch" (fast, single-file) or "build" (full TDD pipeline).
+    # Used by master_orchestrator.resolve_coder_chain / resolve_judge_chain when chains are not explicit.
+    pipeline_mode: str = "patch"
+
 
 @dataclass
 class Checkpoint:
@@ -45,8 +55,9 @@ class Checkpoint:
 
 
 def _checkpoint_dir() -> Path:
-    root = Path(".").resolve()
-    return root / ".agenti_helix" / "checkpoints"
+    # Important: keep persistence rooted at `AGENTI_HELIX_REPO_ROOT` so the
+    # control-plane server can be launched from any working directory.
+    return PATHS.checkpoints_dir
 
 
 def _ensure_checkpoint_dir() -> Path:
@@ -143,13 +154,22 @@ def rollback_to_checkpoint(
     """
     Roll back the target file to the pre-state for this checkpoint.
 
-    For this demo we support a simple file-content rollback:
     - If original_content is provided, write it back.
     - Otherwise, interpret pre_state_ref as file content and restore it.
+
+    The checkpoint status is reset to RUNNING so the next verification
+    attempt starts from a clean slate, and the updated checkpoint is
+    persisted to disk so external observers (e.g. the DAG state API) see
+    the transition correctly.
     """
     target_path = Path(task.repo_path).resolve() / task.target_file
     if original_content is not None:
         restore_file_from_snapshot(target_path, original_content)
     else:
         restore_file_from_snapshot(target_path, checkpoint.pre_state_ref)
+
+    checkpoint.status = VerificationStatus.RUNNING
+    checkpoint.post_state_ref = None
+    checkpoint.diff = None
+    save_checkpoint(checkpoint)
 

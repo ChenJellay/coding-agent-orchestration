@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Dict, List, Type
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Type
 
 from pydantic import BaseModel
 
@@ -17,12 +18,23 @@ class AgentSpec:
     prompt_filename: str
     input_model: Type[BaseModel]
     output_model: Type[BaseModel]
+    # Optional backend routing hint consumed by get_default_inference_backend.
+    # None means "use the system default (mlx_local or AGENTI_HELIX_BACKEND_TYPE env)".
+    backend_type: Optional[str] = None
 
     def render(self, raw_input: Dict[str, Any]) -> str:
-        inp = self.input_model.model_validate(raw_input)
+        """Render the agent prompt from `raw_input`.
+
+        Agents with specialised input schemas (judge_v1, coder_patch_v1,
+        intent_compiler_v1) use dedicated renderers.  All other agents fall
+        through to the generic `render_prompt(template, raw_input)` path so
+        new roster agents are automatically supported without touching this
+        method.
+        """
         template = load_prompt_template(self.prompt_filename)
 
         if self.agent_id == "judge_v1":
+            inp = self.input_model.model_validate(raw_input)
             vars_dict = render_judge_variables(
                 acceptance_criteria=getattr(inp, "acceptance_criteria"),
                 original_snippet=getattr(inp, "original_snippet"),
@@ -35,6 +47,7 @@ class AgentSpec:
             return render_prompt(template, vars_dict)
 
         if self.agent_id == "coder_patch_v1":
+            inp = self.input_model.model_validate(raw_input)
             return render_prompt(
                 template,
                 {
@@ -43,31 +56,12 @@ class AgentSpec:
                 },
             )
 
-        # The remaining roster agents are prompt-only at this layer today (not yet wired into
-        # execution). Keep rendering minimal and let orchestrator-level code provide the exact
-        # prompt variables when these agents are introduced to runtime.
-        if self.agent_id in {
-            "dag_generator_v1",
-            "context_librarian_v1",
-            "sdet_v1",
-            "coder_builder_v1",
-            "security_governor_v1",
-            "judge_evaluator_v1",
-            "scribe_v1",
-        }:
-            return render_prompt(template, raw_input)
-
-        raise ValueError(f"AgentSpec.render not implemented for agent_id={self.agent_id!r}")
+        # All other agents (intent_compiler_v1 and every roster agent) use a
+        # generic render: interpolate template placeholders directly from raw_input.
+        return render_prompt(template, raw_input)
 
 
 _AGENTS: Dict[str, AgentSpec] = {
-    "dag_generator_v1": AgentSpec(
-        agent_id="dag_generator_v1",
-        description="Architect: translate Helix PRD + high-level repo map into a sequential DAG (nodes+edges).",
-        prompt_filename="dag_generator_architect.md",
-        input_model=BaseModel,
-        output_model=models.DagGeneratorOutput,
-    ),
     "coder_patch_v1": AgentSpec(
         agent_id="coder_patch_v1",
         description="Single-file coder that outputs a JSON line patch (filePath/startLine/endLine/replacementLines).",
@@ -130,6 +124,23 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="judge.md",
         input_model=models.SnippetJudgeInput,
         output_model=models.SnippetJudgeOutput,
+        backend_type="mlx_local",  # Local quantized model: fast, cheap, good for classification
+    ),
+    "memory_summarizer_v1": AgentSpec(
+        agent_id="memory_summarizer_v1",
+        description="Memory Summarizer: compress error history and past attempts into a concise scratchpad.",
+        prompt_filename="memory_summarizer.md",
+        input_model=BaseModel,
+        output_model=models.MemorySummaryOutput,
+    ),
+    "supreme_court_v1": AgentSpec(
+        agent_id="supreme_court_v1",
+        description="Supreme Court: local MLX arbitrator that resolves coder/judge deadlocks by producing a definitive patch.",
+        prompt_filename="supreme_court.md",
+        input_model=BaseModel,
+        output_model=models.SupremeCourtOutput,
+        # Same shared local model as all other agents (QWEN_MODEL_PATH / default MLX HF id).
+        backend_type="mlx_local",
     ),
 }
 
@@ -155,4 +166,37 @@ def list_agents() -> List[Dict[str, Any]]:
         )
     out.sort(key=lambda x: str(x["id"]))
     return out
+
+
+def get_agent_detail(agent_id: str) -> Dict[str, Any]:
+    """Return a JSON-serializable view of the agent, including prompt and schemas."""
+    spec = get_agent(agent_id)
+    prompt_text = load_prompt_template(spec.prompt_filename)
+
+    input_schema: Dict[str, Any] | None
+    if spec.input_model is BaseModel:
+        input_schema = None
+    else:
+        input_schema = spec.input_model.model_json_schema()
+
+    output_schema = spec.output_model.model_json_schema()
+
+    return {
+        "id": spec.agent_id,
+        "description": spec.description,
+        "prompt": prompt_text,
+        "prompt_filename": spec.prompt_filename,
+        "input_model": spec.input_model.__name__,
+        "output_model": spec.output_model.__name__,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+    }
+
+
+def update_agent_prompt(agent_id: str, new_prompt: str) -> None:
+    """Persist updated prompt text to the underlying prompt file."""
+    spec = get_agent(agent_id)
+    prompts_dir = Path(__file__).resolve().parent / "prompts"
+    path = (prompts_dir / spec.prompt_filename).resolve()
+    path.write_text(new_prompt, encoding="utf-8")
 

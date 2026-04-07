@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from pydantic import BaseModel, Field, model_validator
+from typing import Any, List, Optional
 
 # NOTE
 # - The classes below implement the “full agent roster” schemas requested.
@@ -11,21 +11,7 @@ from typing import List, Optional
 
 
 # ---------------------------------------------------------
-# 1. The DAG Generator (The Architect)
-# ---------------------------------------------------------
-class TaskNode(BaseModel):
-    task_id: str = Field(description="Unique identifier for the task, e.g., 'task_1'")
-    description: str = Field(description="Actionable description of the work to be done")
-    dependencies: List[str] = Field(description="List of task_ids that must be completed before this one")
-
-
-class DagGeneratorOutput(BaseModel):
-    chain_of_thought: str = Field(description="Internal reasoning for how to break down the user intent")
-    tasks: List[TaskNode] = Field(description="The sequential array of micro-tasks")
-
-
-# ---------------------------------------------------------
-# 2. The Context Librarian (The Scout)
+# 1. The Context Librarian (The Scout)
 # ---------------------------------------------------------
 class FileRequirement(BaseModel):
     file_path: str = Field(description="Exact path to the file in the repository")
@@ -100,6 +86,25 @@ class CoderPatchOutput(BaseModel):
     startLine: int = Field(description="1-based inclusive start line of edit range")
     endLine: int = Field(description="1-based inclusive end line of edit range")
     replacementLines: List[str] = Field(description="Replacement code lines to apply")
+    # §4.5 — Optional human escalation signal emitted instead of a patch.
+    escalate_to_human: Optional[bool] = Field(default=None, description="Set true if the task is ambiguous and requires human clarification")
+    escalation_reason: Optional[str] = Field(default=None, description="Short reason for escalation (required when escalate_to_human=true)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_escalation_shape(cls, data: Any) -> Any:
+        """
+        Allow the coder to emit an escalation object that omits patch fields.
+        Downstream will short-circuit on `escalate_to_human` and never apply a patch.
+        """
+        if not isinstance(data, dict):
+            return data
+        if data.get("escalate_to_human"):
+            data.setdefault("filePath", "")
+            data.setdefault("startLine", 0)
+            data.setdefault("endLine", 0)
+            data.setdefault("replacementLines", [])
+        return data
 
 
 class IntentCompilerInput(BaseModel):
@@ -112,6 +117,13 @@ class IntentNodeSpec(BaseModel):
     description: str = Field(description="Short description of the micro-task")
     target_file: str = Field(description="Path relative to repo root")
     acceptance_criteria: str = Field(description="Testable criteria for success")
+    pipeline_mode: str = Field(
+        default="patch",
+        description=(
+            '"patch" — fast single-file line-patch (coder_patch_v1 + judge_v1). '
+            '"build" — full TDD pipeline (librarian → sdet → coder_builder → governor → judge_evaluator).'
+        ),
+    )
 
 
 class IntentCompilerOutput(BaseModel):
@@ -134,4 +146,35 @@ class SnippetJudgeOutput(BaseModel):
     verdict: str = Field(description='Expected values: "PASS" or "FAIL"')
     justification: str = Field(description="Short justification string")
     problematic_lines: List[int] = Field(description="1-based line numbers in edited snippet that are problematic")
+
+
+# ---------------------------------------------------------
+# 8. The Memory Summarizer
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 9. The Supreme Court Arbitrator
+# ---------------------------------------------------------
+class SupremeCourtOutput(BaseModel):
+    resolved: bool = Field(
+        description="True if the Supreme Court was able to produce a definitive patch. False if escalation to human is unavoidable."
+    )
+    reasoning: str = Field(description="Arbitration reasoning explaining the decision or why resolution failed")
+    # Populated only when resolved=True — same shape as CoderPatchOutput.
+    filePath: Optional[str] = Field(default=None, description="Target file path for the resolved patch")
+    startLine: Optional[int] = Field(default=None, description="1-based start line of the resolved patch")
+    endLine: Optional[int] = Field(default=None, description="1-based end line of the resolved patch")
+    replacementLines: Optional[List[str]] = Field(default=None, description="Replacement lines for the resolved patch")
+    compromise_summary: Optional[str] = Field(default=None, description="One-sentence description of the compromise made")
+
+
+class MemorySummaryOutput(BaseModel):
+    compressed_summary: str = Field(
+        description=(
+            "2-4 sentence summary of what was attempted, what failed, and the current state. "
+            "Should preserve enough context for the next coder attempt without raw error dumps."
+        )
+    )
+    key_constraints: List[str] = Field(
+        description="Bullet list of constraints or facts the next attempt MUST respect (max 5)."
+    )
 

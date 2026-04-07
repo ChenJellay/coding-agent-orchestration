@@ -1,39 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import mlx_lm
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from agenti_helix.runtime.agent_runtime import run_agent
 from agenti_helix.agents.registry import get_agent
-
-
-# Model configuration
-MODEL_PATH = os.environ.get("QWEN_MODEL_PATH", "mlx-community/Qwen3.5-9B-MLX-4bit")
-
-_CACHED_MODEL: Any | None = None
-_CACHED_TOKENIZER: Any | None = None
-_CACHED_MODEL_ID: str | None = None
-
-
-def _get_mlx_model() -> tuple[Any, Any]:
-    global _CACHED_MODEL, _CACHED_TOKENIZER, _CACHED_MODEL_ID
-    if (
-        _CACHED_MODEL is not None
-        and _CACHED_TOKENIZER is not None
-        and _CACHED_MODEL_ID == MODEL_PATH
-    ):
-        return _CACHED_MODEL, _CACHED_TOKENIZER
-
-    model, tokenizer = mlx_lm.load(MODEL_PATH)
-    _CACHED_MODEL = model
-    _CACHED_TOKENIZER = tokenizer
-    _CACHED_MODEL_ID = MODEL_PATH
-    return model, tokenizer
+from agenti_helix.observability.debug_log import log_event
 
 
 class JudgeRequestBody(BaseModel):
@@ -55,6 +32,15 @@ class JudgeResponseBody(BaseModel):
 
 
 app = FastAPI(title="Local Judge Service", version="0.1.0")
+
+# D2: Restrict CORS to the control-plane API only; never expose to browsers directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:8001", "http://localhost:8001"],
+    allow_credentials=False,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 class IntentCompilerRequestBody(BaseModel):
@@ -83,48 +69,31 @@ def _build_intent_compiler_prompt(body: IntentCompilerRequestBody) -> str:
 @app.post("/intent-compiler", response_model=IntentCompilerResponseBody)
 def intent_compiler_endpoint(body: IntentCompilerRequestBody) -> IntentCompilerResponseBody:
     try:
-        model, tokenizer = _get_mlx_model()
+        typed = run_agent(
+            agent_id="intent_compiler_v1",
+            raw_input={"macro_intent": body.macro_intent, "repo_path": body.repo_path},
+            runtime={"temperature": 0.0},
+            observe={
+                "run_id": "judge_service",
+                "hypothesis_id": "intent_compiler",
+                "location": "judge_server:POST /intent-compiler",
+            },
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Intent compiler failed: {exc}") from exc
 
-    prompt = _build_intent_compiler_prompt(body)
-
-    make_sampler = getattr(mlx_lm, "make_sampler", None)
-    if callable(make_sampler):
-        sampler = make_sampler(temp=0.0)
-        raw = mlx_lm.generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=1024,
-            sampler=sampler,
-        )
-    else:
-        raw = mlx_lm.generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=1024,
-        )
-
-    try:
-        data = _parse_model_json(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=f"Intent compiler returned invalid JSON: {exc}") from exc
-
-    agent = get_agent("intent_compiler_v1")
-    typed = agent.output_model.model_validate(data)
-    nodes_raw = typed.nodes
-    edges_raw = typed.edges
+    nodes_raw = typed.get("nodes") or []
+    edges_raw = typed.get("edges") or []
 
     nodes: List[IntentNodeSpecBody] = [
         IntentNodeSpecBody(
-            node_id=n.node_id,
-            description=n.description,
-            target_file=n.target_file,
-            acceptance_criteria=n.acceptance_criteria,
+            node_id=str(n.get("node_id") or ""),
+            description=str(n.get("description") or ""),
+            target_file=str(n.get("target_file") or ""),
+            acceptance_criteria=str(n.get("acceptance_criteria") or ""),
         )
         for n in nodes_raw
+        if isinstance(n, dict)
     ]
 
     edges: List[List[str]] = []
@@ -132,11 +101,8 @@ def intent_compiler_endpoint(body: IntentCompilerRequestBody) -> IntentCompilerR
         if isinstance(e, (list, tuple)) and len(e) == 2:
             edges.append([str(e[0]), str(e[1])])
 
-    return IntentCompilerResponseBody(
-        dag_id=typed.dag_id,
-        nodes=nodes,
-        edges=edges,
-    )
+    dag_id = typed.get("dag_id")
+    return IntentCompilerResponseBody(dag_id=str(dag_id) if dag_id is not None else None, nodes=nodes, edges=edges)
 
 
 def _build_judge_prompt(body: JudgeRequestBody) -> str:
@@ -155,9 +121,14 @@ def _build_judge_prompt(body: JudgeRequestBody) -> str:
 
 
 def _parse_model_json(raw: str) -> Dict[str, Any]:
-    print("\n===== Model raw output start =====")
-    print(raw)
-    print("===== Model raw output end =====\n")
+    # D2: Replace raw print with structured log (controlled by AGENTI_HELIX_DISABLE_LOGGING).
+    log_event(
+        run_id="judge_server",
+        hypothesis_id="model_output",
+        location="agenti_helix/verification/judge_server.py:_parse_model_json",
+        message="Raw model output received",
+        data={"length": len(raw), "preview": raw[:200]},
+    )
 
     start = raw.find("{")
     if start == -1:
@@ -201,47 +172,40 @@ def judge_endpoint(body: JudgeRequestBody) -> JudgeResponseBody:
             )
 
     try:
-        model, tokenizer = _get_mlx_model()
+        typed = run_agent(
+            agent_id="judge_v1",
+            raw_input={
+                "repo_path": body.repo_path,
+                "target_file": body.target_file,
+                "acceptance_criteria": body.acceptance_criteria,
+                "original_snippet": body.original_snippet,
+                "edited_snippet": body.edited_snippet,
+                "language": body.language,
+                "tool_logs_json": json.dumps(body.tool_logs, indent=2),
+            },
+            runtime={"temperature": 0.0},
+            observe={
+                "run_id": "judge_service",
+                "hypothesis_id": "judge_v1",
+                "location": "judge_server:POST /judge",
+            },
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {exc}") from exc
-
-    prompt = _build_judge_prompt(body)
-
-    make_sampler = getattr(mlx_lm, "make_sampler", None)
-    if callable(make_sampler):
-        sampler = make_sampler(temp=0.0)
-        raw = mlx_lm.generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=512,
-            sampler=sampler,
-        )
-    else:
-        raw = mlx_lm.generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=512,
-        )
-
-    try:
-        data = _parse_model_json(raw)
-    except ValueError as exc:
         return JudgeResponseBody(
             verdict="FAIL",
-            justification=f"Judge model returned invalid JSON: {exc}; raw={raw!r}",
+            justification=f"Judge model failed: {exc}",
             problematic_lines=[],
         )
 
-    agent = get_agent("judge_v1")
-    typed = agent.output_model.model_validate(data)
-    verdict = str(typed.verdict).upper()
+    verdict = str(typed.get("verdict", "FAIL")).upper()
     if verdict not in {"PASS", "FAIL"}:
         verdict = "FAIL"
+    justification = str(typed.get("justification", "") or "")
+    problematic_lines_raw = typed.get("problematic_lines") or []
+    problematic_lines = [int(x) for x in problematic_lines_raw if str(x).isdigit() or isinstance(x, int)]
     return JudgeResponseBody(
         verdict=verdict,
-        justification=str(typed.justification),
-        problematic_lines=[int(x) for x in (typed.problematic_lines or [])],
+        justification=justification,
+        problematic_lines=problematic_lines,
     )
 

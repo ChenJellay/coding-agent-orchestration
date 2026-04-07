@@ -5,6 +5,77 @@
 
 ---
 
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+  
+- Node.js 20+  
+- (Optional) Apple Silicon Mac with MLX for local inference, **or** an OpenAI API key
+
+### 1. Install dependencies
+
+```bash
+# Backend
+pip install -r requirements.txt
+
+# Frontend
+cd frontend && npm install && cd ..
+```
+
+### 2. Configure environment
+
+```bash
+# Backend (copy and fill in values)
+cp backend/.env.example backend/.env
+
+# Frontend (copy and fill in values)
+cp frontend/.env.example frontend/.env.local
+```
+
+Key variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `AGENTI_HELIX_REPO_ROOT` | Absolute path to the repo the agents will edit |
+| `QWEN_MODEL_PATH` | Path to a local MLX model directory (Apple Silicon) |
+| `OPENAI_API_KEY` | Optional — only if `AGENTI_HELIX_BACKEND_TYPE=openai` (default is local MLX for all agents) |
+
+| `VITE_API_BASE_URL` | Frontend → backend URL (default: `http://127.0.0.1:8001`) |
+| `AGENTI_HELIX_API_KEY` | Bearer token for API auth (optional in dev mode) |
+
+### 3. Start all services
+
+```bash
+./scripts/start-dev.sh
+# or with a custom repo:
+./scripts/start-dev.sh --repo /path/to/your/repo
+
+# See what’s bound
+lsof -nP -iTCP:8000 -iTCP:8001 -iTCP:5173 -sTCP:LISTEN
+
+# Kill everything on those ports (replace PIDs from lsof)
+kill -9 <pids>
+
+# Start stack (foreground; Ctrl+C stops all via the script’s trap)
+cd /Users/jerrychen/startup/coding-agent-orchestration && ./scripts/start-dev.sh
+```
+
+This starts:
+- **Judge service** → `http://127.0.0.1:8000`
+- **Control-plane API** → `http://127.0.0.1:8001`  
+- **Frontend** → `http://localhost:5173`
+
+### 4. Run the demo
+
+Open [http://localhost:5173](http://localhost:5173) and click **"Run command"** on the dashboard, entering a macro intent such as:
+
+> `Add input validation to the login form in header.js`
+
+The DAG will compile, agents will execute, and you can review the diff and verdict in the tri-pane review panel.
+
+---
+
 ## 1. Overview
 
 Agenti-Helix is a four-layer system:

@@ -6,9 +6,9 @@ Write clean, modular, and highly performant code.
 
 Do not modify any logic outside the scope of the assigned task.
 
-If you encounter a missing dependency in the provided context, clearly state it in your reasoning scratchpad.
+If you encounter a missing dependency in the provided context, clearly state it in `missing_context`.
 
-Output your step-by-step implementation logic, followed by the exact code diffs matching the requested JSON schema.
+Output your step-by-step implementation logic in `implementation_logic`, then the complete updated file contents in `modified_files`. Each entry in `modified_files` must contain the **full file content** — not a patch or snippet.
 
 Inputs:
 - Current_DAG_Task:
@@ -20,15 +20,16 @@ Inputs:
 - File_Contexts_(from_Librarian):
 {file_contexts_json}
 
-Required output format (JSON only at the end):
-{
-  "diffs": [
-    {
-      "filePath": "relative/path/to/file",
-      "startLine": 1,
-      "endLine": 1,
-      "replacementLines": ["line1", "line2"]
-    }
-  ]
-}
+Required output format (JSON only, no markdown fences):
+{{
+  "implementation_logic": "step-by-step reasoning used to implement the task",
+  "modified_files": [
+    {{
+      "file_path": "relative/path/to/file",
+      "content": "complete file content as it should exist after the change"
+    }}
+  ],
+  "missing_context": null
+}}
 
+Set `missing_context` to a string describing any file or symbol the Librarian failed to provide; otherwise leave it null.

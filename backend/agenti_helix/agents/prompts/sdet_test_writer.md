@@ -8,7 +8,7 @@ Mock external dependencies (like databases or third-party APIs) using standard t
 
 Ensure the test syntax perfectly matches the repository's testing framework.
 
-Output your testing strategy reasoning, followed by the exact test code matching the requested JSON schema.
+Output your testing strategy reasoning in `testing_strategy`, then the complete test files in `test_files`. Each entry must contain the **full file content**.
 
 Inputs:
 - Current_DAG_Task:
@@ -23,13 +23,13 @@ Inputs:
 - Testing_Standards:
 """{testing_standards}"""
 
-Required output format (JSON only at the end):
-{
-  "tests": [
-    {
-      "path": "relative/path/to/test_file",
-      "content": "full test file contents"
-    }
+Required output format (JSON only, no markdown fences):
+{{
+  "testing_strategy": "reasoning for the test cases, edge cases covered, and mocking strategy",
+  "test_files": [
+    {{
+      "file_path": "relative/path/to/test_file",
+      "content": "complete test file contents"
+    }}
   ]
-}
-
+}}

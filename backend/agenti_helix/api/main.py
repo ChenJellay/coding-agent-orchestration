@@ -6,11 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from agenti_helix.agents.registry import list_agents
+from agenti_helix.agents.registry import get_agent_detail, list_agents
+from agenti_helix.api.auth import Role, require_auth, require_editor
+from agenti_helix.api.response_caches import (
+    CACHE_AVAILABLE as _CACHE_AVAILABLE,
+    FEATURES_CACHE as _FEATURES_CACHE,
+    TRIAGE_CACHE as _TRIAGE_CACHE,
+)
+from agenti_helix.api.task_commands_routes import router as task_commands_router
+from agenti_helix.core.repo_map import generate_repo_map
 
 
 @dataclass(frozen=True)
@@ -276,12 +284,24 @@ def _derive_triage(limit: int = 200) -> List[Dict[str, Any]]:
 def create_app() -> FastAPI:
     app = FastAPI(title="Agenti-Helix API", version="0.1.0")
 
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:  # type: ignore[name-defined]
+        # Ensure consistent error shape for the frontend:
+        #   { ok: false, error: { code, message } }
+        if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": exc.detail})
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "error": {"code": "http_error", "message": str(exc.detail)}},
+        )
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        # D1: Include Authorization header in CORS to allow Bearer token from browser.
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     @app.get("/api/health")
@@ -313,6 +333,8 @@ def create_app() -> FastAPI:
     def get_events(
         runId: Optional[str] = None,
         hypothesisId: Optional[str] = None,
+        traceId: Optional[str] = None,
+        dagId: Optional[str] = None,
         sinceTs: Optional[int] = None,
         limit: int = Query(default=500, ge=1, le=5000),
     ) -> List[Dict[str, Any]]:
@@ -321,6 +343,10 @@ def create_app() -> FastAPI:
             if runId is not None and e.get("runId") != runId:
                 continue
             if hypothesisId is not None and e.get("hypothesisId") != hypothesisId:
+                continue
+            if traceId is not None and e.get("traceId") != traceId:
+                continue
+            if dagId is not None and e.get("dagId") != dagId:
                 continue
             ts = e.get("timestamp")
             if sinceTs is not None and isinstance(ts, int) and ts < sinceTs:
@@ -345,7 +371,14 @@ def create_app() -> FastAPI:
 
     @app.get("/api/features")
     def get_features(limit: int = Query(default=200, ge=1, le=2000)) -> List[Dict[str, Any]]:
-        return _derive_features(limit=limit)
+        # D5: 5-second TTL cache reduces disk I/O under polling load.
+        cache_key = f"features:{limit}"
+        if _CACHE_AVAILABLE and cache_key in _FEATURES_CACHE:
+            return _FEATURES_CACHE[cache_key]  # type: ignore[index]
+        result = _derive_features(limit=limit)
+        if _CACHE_AVAILABLE:
+            _FEATURES_CACHE[cache_key] = result  # type: ignore[index]
+        return result
 
     @app.get("/api/features/{feature_id}")
     def get_feature(feature_id: str) -> Dict[str, Any]:
@@ -369,11 +402,42 @@ def create_app() -> FastAPI:
 
     @app.get("/api/triage")
     def get_triage(limit: int = Query(default=200, ge=1, le=2000)) -> Dict[str, Any]:
-        return {"items": _derive_triage(limit=limit)}
+        # D5: 5-second TTL cache to reduce disk I/O under polling load.
+        cache_key = f"triage:{limit}"
+        if _CACHE_AVAILABLE and cache_key in _TRIAGE_CACHE:
+            return {"items": _TRIAGE_CACHE[cache_key]}  # type: ignore[index]
+        items = _derive_triage(limit=limit)
+        if _CACHE_AVAILABLE:
+            _TRIAGE_CACHE[cache_key] = items  # type: ignore[index]
+        return {"items": items}
 
     @app.get("/api/agents")
     def get_agents() -> Dict[str, Any]:
         return {"agents": list_agents()}
+
+    @app.get("/api/agents/{agent_id}")
+    def get_agent(agent_id: str) -> Dict[str, Any]:
+        try:
+            return get_agent_detail(agent_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+    @app.put("/api/agents/{agent_id}/prompt")
+    def update_agent_prompt_api(
+        agent_id: str,
+        body: Dict[str, Any],
+        _role: Role = Depends(require_editor),  # D1: editor-only mutation
+    ) -> Dict[str, Any]:
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str):
+            raise HTTPException(status_code=400, detail="Body must contain string field 'prompt'")
+        from agenti_helix.agents.registry import update_agent_prompt as _update
+
+        try:
+            _update(agent_id, prompt)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"ok": True}
 
     @app.get("/api/compute")
     def get_compute() -> Dict[str, Any]:
@@ -396,13 +460,62 @@ def create_app() -> FastAPI:
                         "content": p.read_text(encoding="utf-8"),
                     }
                 )
-        raise HTTPException(status_code=404, detail="Repo map not found")
+        live = generate_repo_map(PATHS.repo_root)
+        return JSONResponse(
+            content={
+                "path": f"(generated live) {PATHS.repo_root}",
+                "format": "json",
+                "content": live.to_json(),
+            }
+        )
 
     @app.get("/api/rules")
     def get_rules() -> Dict[str, Any]:
         rules = _try_read_json(PATHS.rules_path)
         return rules if isinstance(rules, dict) else {"rules": []}
 
+    @app.get("/api/blame")
+    def get_blame(
+        file: str = Query(..., description="Repo-relative file path to blame"),
+        line: int = Query(..., ge=1, description="1-based line number"),
+    ) -> Dict[str, Any]:
+        """§4.6 — Semantic Git Blame.
+
+        Returns the commit that last touched a given line and embeds any
+        Trace-Id / Dag-Id trailers so the UI can link to the originating DAG.
+        """
+        from agenti_helix.api.git_ops import git_blame_line
+
+        result = git_blame_line(
+            repo_path=str(PATHS.repo_root),
+            file_path=file,
+            line=line,
+        )
+
+        if not result.get("found"):
+            # Surface merge-record blame as a fallback when the file isn't git-tracked.
+            merges_dir = PATHS.agenti_root / "merges"
+            if merges_dir.exists():
+                for merge_file in sorted(merges_dir.glob("*.json"), reverse=True):
+                    try:
+                        record = json.loads(merge_file.read_text(encoding="utf-8"))
+                        diff_obj = json.loads(record.get("diff") or "{}")
+                        if diff_obj.get("filePath") == file:
+                            return {
+                                "found": True,
+                                "source": "merge_record",
+                                "task_id": record.get("task_id"),
+                                "dag_id": record.get("dag_id"),
+                                "commit_sha": record.get("commit_sha"),
+                                "commit_message": record.get("commit_message"),
+                                "created_at": record.get("created_at"),
+                            }
+                    except Exception:
+                        continue
+
+        return result
+
+    app.include_router(task_commands_router)
     return app
 
 

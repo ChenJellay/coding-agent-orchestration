@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .agenti_helix/
 .cursor/
+.env.local
+frontend/.env.local
 .venv/
 dist/
 build/

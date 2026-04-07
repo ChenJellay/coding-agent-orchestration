@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import urllib.error
-import urllib.request
 
+from pydantic import ValidationError
+
+from agenti_helix.agents.models import IntentCompilerOutput as _IntentCompilerOutputModel
 from agenti_helix.observability.debug_log import log_event
+from agenti_helix.runtime.chain_defaults import default_intent_compiler_chain
+from agenti_helix.runtime.chain_runtime import run_chain
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
 from .orchestrator import DagNodeSpec, DagSpec, persist_dag_spec
+
+_MAX_COMPILE_RETRIES = 2
 
 
 @dataclass
@@ -72,8 +76,28 @@ def _resolve_target_file(repo_root: Path, target_file: str) -> str:
     return target_file
 
 
-def _default_llm_compiler_url() -> str:
-    return "http://localhost:8000/intent-compiler"
+def _run_intent_chain(macro_intent: str, repo_root: Path, *, feedback: str = "") -> Dict[str, object]:
+    """Execute the intent compiler chain once, returning the validated output dict."""
+    prompt_intent = macro_intent
+    if feedback:
+        prompt_intent = (
+            f"{macro_intent}\n\n"
+            f"Previous compilation attempt failed. Please correct the following issues and output valid JSON:\n{feedback}"
+        )
+    ctx: Dict[str, object] = {
+        "macro_intent": prompt_intent,
+        "repo_path": str(repo_root),
+    }
+    ctx = run_chain(
+        chain_spec=default_intent_compiler_chain(),
+        initial_context=ctx,
+        cancel_token=None,
+        run_id="intent",
+        hypothesis_id="LLM",
+        location_prefix="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
+    )
+    raw = ctx.get("intent_compiler_output")
+    return raw if isinstance(raw, dict) else {}
 
 
 def compile_macro_intent_with_llm(
@@ -85,72 +109,93 @@ def compile_macro_intent_with_llm(
     timeout_seconds: float = 90.0,
 ) -> DagSpec:
     repo_root = Path(repo_path).resolve()
-    service_url = (base_url or _default_llm_compiler_url()).rstrip("/")
-
-    payload = json.dumps({"macro_intent": macro_intent, "repo_path": str(repo_root)}).encode("utf-8")
-
-    request = urllib.request.Request(
-        service_url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as resp:
-            raw = resp.read().decode("utf-8")
-    except (urllib.error.URLError, TimeoutError) as exc:
+    if base_url:
         log_event(
             run_id="intent",
             hypothesis_id="LLM",
             location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-            message="Intent compiler transport error",
-            data={"base_url": service_url, "error": str(exc)},
+            message="llm_base_url ignored (in-process chain runtime mode)",
+            data={"base_url": base_url},
         )
-        raise RuntimeError(f"Transport error talking to intent compiler: {exc}") from exc
 
-    try:
-        data: Dict[str, object] = json.loads(raw)
-    except json.JSONDecodeError as exc:  # pragma: no cover
+    last_error: str = ""
+    typed: Dict[str, object] = {}
+
+    for attempt in range(1, _MAX_COMPILE_RETRIES + 1):
+        raw = _run_intent_chain(macro_intent, repo_root, feedback=last_error)
+        try:
+            validated = _IntentCompilerOutputModel.model_validate(raw)
+        except (ValidationError, Exception) as exc:
+            last_error = f"Output failed Pydantic validation: {exc}"
+            log_event(
+                run_id="intent",
+                hypothesis_id="LLM",
+                location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
+                message=f"Intent compiler output invalid (attempt {attempt}/{_MAX_COMPILE_RETRIES})",
+                data={"error": last_error},
+            )
+            continue
+
+        if not validated.nodes:
+            last_error = "Compiler returned an empty nodes list; at least one DAG node is required."
+            log_event(
+                run_id="intent",
+                hypothesis_id="LLM",
+                location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
+                message=f"Intent compiler returned empty DAG (attempt {attempt}/{_MAX_COMPILE_RETRIES})",
+                data={"error": last_error},
+            )
+            continue
+
+        typed = validated.model_dump()
         log_event(
             run_id="intent",
             hypothesis_id="LLM",
             location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-            message="Intent compiler returned invalid JSON",
-            data={"base_url": service_url, "error": str(exc), "raw": raw[:500]},
+            message="Intent compiler succeeded",
+            data={"attempt": attempt, "node_count": len(validated.nodes)},
         )
-        raise RuntimeError(f"Invalid JSON from intent compiler: {exc}; payload={raw!r}") from exc
+        break
+    else:
+        raise ValueError(
+            f"Intent compiler failed after {_MAX_COMPILE_RETRIES} attempt(s). Last error: {last_error}"
+        )
 
-    nodes_raw = data.get("nodes") or []
-    edges_raw = data.get("edges") or []
-    dag_identifier = str(data.get("dag_id") or dag_id or "dag-llm-intent")
+    nodes_raw = typed.get("nodes") or []
+    edges_raw = typed.get("edges") or []
+    dag_identifier = str(typed.get("dag_id") or dag_id or "dag-llm-intent")
 
     intent_nodes: List[IntentNodeSpec] = []
     for item in nodes_raw:
-        item_dict = dict(item)  # type: ignore[arg-type]
+        if not isinstance(item, dict):
+            continue
         intent_nodes.append(
             IntentNodeSpec(
-                node_id=str(item_dict["node_id"]),
-                description=str(item_dict["description"]),
-                target_file=str(item_dict["target_file"]),
-                acceptance_criteria=str(item_dict["acceptance_criteria"]),
+                node_id=str(item.get("node_id") or ""),
+                description=str(item.get("description") or ""),
+                target_file=str(item.get("target_file") or ""),
+                acceptance_criteria=str(item.get("acceptance_criteria") or ""),
             )
         )
 
     edges: List[Tuple[str, str]] = []
     for pair in edges_raw:
-        src, dst = pair  # type: ignore[misc]
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        src, dst = pair
         edges.append((str(src), str(dst)))
 
     dag_nodes: Dict[str, DagNodeSpec] = {}
     for n in intent_nodes:
         resolved_target = _resolve_target_file(repo_root, n.target_file)
+        pipeline_mode = getattr(n, "pipeline_mode", "patch") or "patch"
         task = EditTaskSpec(
             task_id=f"{dag_identifier}:{n.node_id}",
             intent=f"{macro_intent}\n\nSubtask: {n.description}",
             target_file=resolved_target,
             acceptance_criteria=n.acceptance_criteria,
             repo_path=str(repo_root),
+            pipeline_mode=pipeline_mode,
         )
         dag_nodes[n.node_id] = DagNodeSpec(
             node_id=n.node_id,
@@ -258,6 +303,17 @@ def compile_macro_intent_to_dag(
     use_llm: bool = True,
     llm_base_url: Optional[str] = None,
 ) -> DagSpec:
+    """
+    Compile `macro_intent` into a `DagSpec`.
+
+    When `use_llm=True` (default), the LLM intent compiler is used and a
+    `ValueError` is raised if it fails after all retries — callers must handle
+    this rather than silently falling back to the demo stub.
+
+    When `use_llm=False`, the deterministic demo compiler runs; this is only
+    appropriate for the demo repo layout (src/components/header.js). Callers
+    should not use `use_llm=False` in production.
+    """
     if use_llm:
         return compile_macro_intent_with_llm(
             macro_intent,

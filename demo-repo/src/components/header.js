@@ -5,7 +5,7 @@ export default function Header() {
     <header style={{ padding: "1rem" }}>
       <button
         style={{
-          backgroundColor: "blue",
+          backgroundColor: "green",
           color: "white",
           padding: "0.5rem 1rem",
           border: "none",

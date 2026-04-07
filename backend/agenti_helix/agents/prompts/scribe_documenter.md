@@ -6,7 +6,7 @@ Write a professional, concise Git commit message following conventional commit s
 
 Summarize the key architectural decisions made during execution to link back to the original business intent.
 
-Output your summary reasoning, followed by the commit message and semantic trace log matching the requested JSON schema.
+Output your summary reasoning in `summary_reasoning`, then the commit message and a 2–3 sentence semantic trace log.
 
 Inputs:
 - Helix_Intent:
@@ -24,13 +24,9 @@ Inputs:
 - Trace_ID:
 """{trace_id}"""
 
-Required output format (JSON only at the end):
-{
-  "commit_message": "string",
-  "trace_log": {
-    "trace_id": "optional string",
-    "summary": "string",
-    "decisions": ["string"]
-  }
-}
-
+Required output format (JSON only, no markdown fences):
+{{
+  "summary_reasoning": "analysis of the task execution used to extract key architectural decisions",
+  "commit_message": "feat(scope): short imperative description of the change",
+  "semantic_trace_log": "2–3 sentence narrative of how the agent solved the original intent, which files were changed, and why."
+}}

@@ -63,11 +63,14 @@ export type TriageItem = {
 export type TriageResponse = { items: TriageItem[] }
 
 export type EventLog = {
+  id?: string
   timestamp?: number
   message?: string
   location?: string
   runId?: string
   hypothesisId?: string
+  traceId?: string
+  dagId?: string
   data?: Record<string, unknown>
 }
 
@@ -85,11 +88,54 @@ export type Checkpoint = {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
 
+// D1: Bearer token injected centrally from VITE_API_KEY env var.
+// Set VITE_API_KEY in frontend/.env.local for authenticated deployments.
+function _authHeaders(): Record<string, string> {
+  const key = import.meta.env.VITE_API_KEY
+  if (!key) return {}
+  return { Authorization: `Bearer ${key}` }
+}
+
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`)
+  const res = await fetch(`${API_BASE}${path}`, { headers: _authHeaders() })
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+    }
     const text = await res.text().catch(() => '')
     throw new Error(`HTTP ${res.status} ${path}${text ? `: ${text}` : ''}`)
+  }
+  return (await res.json()) as T
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+    }
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} POST ${path}${text ? `: ${text}` : ''}`)
+  }
+  return (await res.json()) as T
+}
+
+async function putJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+    }
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} PUT ${path}${text ? `: ${text}` : ''}`)
   }
   return (await res.json()) as T
 }
@@ -133,7 +179,147 @@ export async function fetchCompute(): Promise<{ event_count: number }> {
   return await getJson<{ event_count: number }>('/api/compute')
 }
 
-export async function fetchAgents(): Promise<{ agents: unknown[] }> {
-  return await getJson<{ agents: unknown[] }>('/api/agents')
+export type AgentSummary = {
+  id: string
+  description: string
+  prompt: string
+  input_model: string
+  output_model: string
+}
+
+export type AgentDetail = {
+  id: string
+  description: string
+  prompt: string
+  prompt_filename: string
+  input_model: string
+  output_model: string
+  input_schema: unknown | null
+  output_schema: unknown
+}
+
+export async function fetchAgents(): Promise<{ agents: AgentSummary[] }> {
+  return await getJson<{ agents: AgentSummary[] }>('/api/agents')
+}
+
+export async function fetchAgentDetail(agentId: string): Promise<AgentDetail> {
+  return await getJson<AgentDetail>(`/api/agents/${encodeURIComponent(agentId)}`)
+}
+
+export async function updateAgentPrompt(agentId: string, prompt: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/agents/${encodeURIComponent(agentId)}/prompt`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ..._authHeaders() },
+    body: JSON.stringify({ prompt }),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} PUT /api/agents/${agentId}${text ? `: ${text}` : ''}`)
+  }
+}
+
+export async function rerunTask(params: {
+  task_id: string
+  checkpoint_id: string
+  guidance?: string
+  feature_id?: string
+  node_id?: string
+}): Promise<{ ok: true; reRunId?: string }> {
+  return await postJson('/api/tasks/rerun', params)
+}
+
+export async function abortTask(params: {
+  task_id: string
+  feature_id?: string
+  node_id?: string
+  abort_reason?: string
+}): Promise<{ ok: true; aborted?: boolean }> {
+  return await postJson('/api/tasks/abort', params)
+}
+
+export async function attachTaskContext(params: { task_id: string; doc_url: string; notes?: string }): Promise<{ ok: true }> {
+  return await postJson('/api/tasks/context', params)
+}
+
+export async function applyAndRerun(params: {
+  task_id: string
+  checkpoint_id: string
+  guidance?: string
+  doc_url?: string
+}): Promise<{ ok: true }> {
+  return await postJson('/api/tasks/apply-and-rerun', params)
+}
+
+export async function editDagIntent(dag_id: string, params: { macro_intent: string }): Promise<{ ok: true }> {
+  return await putJson(`/api/dags/${encodeURIComponent(dag_id)}/intent`, params)
+}
+
+export type MemoryResponse = {
+  summary: string
+  items?: Array<{ timestamp?: number; message?: string; location?: string | null }>
+}
+
+export type HealthResponse = {
+  ok: true
+  repo_root: string
+}
+
+export type RepoMapResponse = {
+  path: string
+  format: string
+  content: string
+}
+
+// Backend returns the JSON content of `.agenti_helix/rules.json` (best-effort).
+// We keep it flexible so the UI can render arbitrary rule structures.
+export type RulesResponse = Record<string, unknown>
+
+export async function fetchMemory(params: { runId: string; limit?: number }): Promise<MemoryResponse> {
+  const qs = new URLSearchParams()
+  if (params.limit != null) qs.set('limit', String(params.limit))
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  return await getJson<MemoryResponse>(`/api/memory?runId=${encodeURIComponent(params.runId)}${suffix}`)
+}
+
+export async function mergeTask(params: {
+  task_id: string
+  checkpoint_id: string
+  target_branch?: string
+  commit_message?: string
+}): Promise<{ ok: true; mergeRef?: string }> {
+  return await postJson('/api/tasks/merge', params)
+}
+
+export type PipelineMode = 'patch' | 'build'
+
+export async function startDagFromDashboard(params: {
+  repo_path: string
+  macro_intent: string
+  agent_ids?: string[]
+  dag_id?: string
+  use_llm?: boolean
+  pipeline_mode?: PipelineMode | null
+}): Promise<{ ok: true; dag_id: string }> {
+  const body = {
+    repo_path: params.repo_path,
+    macro_intent: params.macro_intent,
+    agent_ids: params.agent_ids ?? ['coder_patch_v1', 'judge_v1'],
+    ...(params.dag_id != null ? { dag_id: params.dag_id } : {}),
+    use_llm: params.use_llm ?? false,
+    pipeline_mode: params.pipeline_mode ?? null,
+  }
+  return await postJson('/api/dags/run', body)
+}
+
+export async function fetchHealth(): Promise<HealthResponse> {
+  return await getJson<HealthResponse>('/api/health')
+}
+
+export async function fetchRepoMap(): Promise<RepoMapResponse> {
+  return await getJson<RepoMapResponse>('/api/repo-map')
+}
+
+export async function fetchRules(): Promise<RulesResponse> {
+  return await getJson<RulesResponse>('/api/rules')
 }
 

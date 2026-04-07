@@ -34,7 +34,7 @@ def main() -> None:
         "--llm-base-url",
         type=str,
         default=None,
-        help="Override base URL for the intent compiler service (default: http://localhost:8000/intent-compiler).",
+        help="(Deprecated) Base URL for the old intent-compiler HTTP service. Ignored in chain-runtime mode.",
     )
     args = parser.parse_args()
 

@@ -29,6 +29,16 @@ Your ENTIRE response MUST be a single JSON object in the following format, with 
   ]
 }}
 
+**ESCALATION PROTOCOL**: If the intent is ambiguous, contradictory, requires access to files not in the repo map, or you genuinely cannot determine a safe minimal change, you MUST signal for human review instead of guessing. In that case, output:
+{{
+  "filePath": "",
+  "startLine": 0,
+  "endLine": 0,
+  "replacementLines": [],
+  "escalate_to_human": true,
+  "escalation_reason": "string — precise explanation of why you cannot proceed"
+}}
+
 Do NOT include any natural-language explanation, markdown, comments, or extra keys.
 Return ONLY this JSON object.
 
