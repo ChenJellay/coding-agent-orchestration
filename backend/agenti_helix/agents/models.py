@@ -79,6 +79,8 @@ class ScribeOutput(BaseModel):
 class CoderPatchInput(BaseModel):
     repo_map_json: str = Field(description="JSON string of repo map file/symbol metadata")
     intent: str = Field(description="User intent describing desired change")
+    target_file: Optional[str] = Field(default=None, description="Target file path the system intends to edit (relative)")
+    target_file_content: Optional[str] = Field(default=None, description="Current contents of target_file (verbatim)")
 
 
 class CoderPatchOutput(BaseModel):

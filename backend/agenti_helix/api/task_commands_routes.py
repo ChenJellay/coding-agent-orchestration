@@ -222,6 +222,8 @@ class ApplyAndRerunRequestBody(BaseModel):
     checkpoint_id: str
     guidance: Optional[str] = None
     doc_url: Optional[str] = None
+    feature_id: Optional[str] = None
+    node_id: Optional[str] = None
 
 
 class EditIntentRequestBody(BaseModel):
@@ -370,6 +372,8 @@ def apply_and_rerun(body: ApplyAndRerunRequestBody) -> Dict[str, Any]:
             task_id=body.task_id,
             checkpoint_id=body.checkpoint_id,
             guidance=body.guidance,
+            feature_id=body.feature_id,
+            node_id=body.node_id,
         )
     )
     return resp

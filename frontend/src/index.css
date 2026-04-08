@@ -72,12 +72,16 @@ pre {
 
 .appShell {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) minmax(300px, min(38vw, 440px));
+  grid-template-columns: var(--sidebar-w, 260px) minmax(0, 1fr) minmax(300px, min(38vw, 440px));
   height: 100%;
 }
 
+.appShell.appShell--sidebarCollapsed {
+  --sidebar-w: 72px;
+}
+
 .appShell.appShell--traceCollapsed {
-  grid-template-columns: 260px minmax(0, 1fr) 44px;
+  grid-template-columns: var(--sidebar-w, 260px) minmax(0, 1fr) 44px;
 }
 
 .sidebar {
@@ -87,6 +91,7 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 
 .sidebarHeader {
@@ -100,6 +105,31 @@ pre {
 .sidebarHeaderTitle {
   font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+.sidebarCollapseBtn {
+  margin-left: auto;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.sidebar--collapsed .sidebarHeaderTitle,
+.sidebar--collapsed .navSectionLabel,
+.sidebar--collapsed .navItemLabel {
+  display: none;
+}
+
+.sidebar--collapsed .navItem {
+  justify-content: center;
+}
+
+.sidebar--collapsed .sidebarHeader {
+  justify-content: center;
 }
 
 .navSectionLabel {

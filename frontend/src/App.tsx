@@ -13,7 +13,6 @@ import {
   fetchRepoMap,
   fetchRules,
   applyAndRerun,
-  attachTaskContext,
   fetchEvents,
   fetchFeature,
   fetchFeatures,
@@ -81,8 +80,11 @@ function Placeholder({ title }: { title: string }) {
       }}
     >
       <div style={{ fontWeight: 650, marginBottom: 6 }}>{title}</div>
-      <div style={{ color: 'var(--muted)', fontSize: 13 }}>
-        UI scaffold is live. Next: wire to the local API and implement the Kanban/DAG/tri-pane flows.
+      <div style={{ color: 'var(--muted)', fontSize: 13 }}>Page not found.</div>
+      <div style={{ marginTop: 10 }}>
+        <a className="pill" href="/">
+          Go to Dashboard
+        </a>
       </div>
     </div>
   )
@@ -192,7 +194,6 @@ function DashboardPage() {
       cancelled = true
       window.clearInterval(t)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const trustScore = useMemo(() => {
@@ -310,25 +311,7 @@ function DashboardPage() {
             </datalist>
           </div>
 
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={() => {
-                void handleRunCommand()
-              }}
-              disabled={runBusy}
-              style={{
-                borderRadius: 999,
-                border: '1px solid var(--border)',
-                background: runBusy ? 'var(--bg-muted)' : 'var(--bg)',
-                padding: '10px 14px',
-                fontSize: 12,
-                cursor: runBusy ? 'default' : 'pointer',
-              }}
-            >
-              {runBusy ? 'Scheduling…' : 'Run command'}
-            </button>
-          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }} />
         </div>
 
         <div>
@@ -381,7 +364,7 @@ function DashboardPage() {
           </div>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, alignItems: 'start' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, alignItems: 'start' }}>
           <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--bg)', padding: 12 }}>
             <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Execution pipeline</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -438,33 +421,6 @@ function DashboardPage() {
               ))}
             </div>
           </section>
-
-          <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--bg)', padding: 12 }}>
-            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>What will happen</div>
-            <div style={{ color: 'var(--muted)', fontSize: 12, lineHeight: 1.8 }}>
-              {pipelineMode === 'patch' && (
-                <>
-                  1. LLM compiles the command into a DAG of subtasks.<br />
-                  2. Each node: <b>coder_patch_v1</b> edits one file → static checks → <b>judge_v1</b> verdict.<br />
-                  3. Retries use <b>memory_summarizer_v1</b>; deadlocks escalate to <b>supreme_court_v1</b>.
-                </>
-              )}
-              {pipelineMode === 'build' && (
-                <>
-                  1. LLM compiles the command into a DAG of subtasks.<br />
-                  2. Each node: <b>context_librarian_v1</b> finds files → <b>sdet_v1</b> writes tests → <b>coder_builder_v1</b> implements → <b>security_governor_v1</b> audits → tests run → <b>judge_evaluator_v1</b> verdict.<br />
-                  3. Retries use <b>memory_summarizer_v1</b>; deadlocks escalate to <b>supreme_court_v1</b>.
-                </>
-              )}
-              {pipelineMode === 'orchestrator' && (
-                <>
-                  1. <b>intent_compiler_v1</b> (orchestrator mode) analyses each subtask and assigns pipeline_mode per node.<br />
-                  2. Simple nodes get the quick-patch chain; complex nodes get the full TDD chain.<br />
-                  3. Requires LLM inference for both DAG compilation and execution.
-                </>
-              )}
-            </div>
-          </section>
         </div>
       </section>
 
@@ -487,7 +443,7 @@ function DashboardPage() {
         </a>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(180px, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
         <div style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Trust score</div>
           <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em' }}>
@@ -517,7 +473,7 @@ function DashboardPage() {
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 420px', gap: 12, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
             <div style={{ fontWeight: 650, fontSize: 13 }}>DAG progress (top confidence)</div>
@@ -585,25 +541,6 @@ function DashboardPage() {
               </a>
             </div>
           </section>
-
-          <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
-            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Column mix</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {(
-                [
-                  ['SCOPING', counts.SCOPING],
-                  ['ORCHESTRATING', counts.ORCHESTRATING],
-                  ['BLOCKED', counts.BLOCKED],
-                  ['VERIFYING', counts.VERIFYING],
-                  ['READY_FOR_REVIEW', counts.READY_FOR_REVIEW],
-                ] as Array<[FeatureColumn, number]>
-              ).map(([col, n]) => (
-                <span key={col} className="pill">
-                  {col}: {n}
-                </span>
-              ))}
-            </div>
-          </section>
         </aside>
       </div>
     </div>
@@ -618,8 +555,7 @@ function RepositoryContextPage() {
   const [busy, setBusy] = useState(false)
 
   const [query, setQuery] = useState('')
-  const [maxLines, setMaxLines] = useState(800)
-  const [showAll, setShowAll] = useState(false)
+  const [maxLines, setMaxLines] = useState<number | 'all'>(1000)
 
   async function loadAll() {
     setBusy(true)
@@ -644,7 +580,6 @@ function RepositoryContextPage() {
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const repoLines = useMemo(() => {
@@ -657,7 +592,7 @@ function RepositoryContextPage() {
     return repoLines.filter((l) => l.toLowerCase().includes(q))
   }, [repoLines, query])
 
-  const effectiveMax = showAll ? filteredLines.length : maxLines
+  const effectiveMax = maxLines === 'all' ? filteredLines.length : maxLines
   const shownText = filteredLines.slice(0, effectiveMax).join('\n')
 
   return (
@@ -758,8 +693,8 @@ function RepositoryContextPage() {
                 <select
                   value={String(maxLines)}
                   onChange={(e) => {
-                    setMaxLines(Number(e.target.value))
-                    setShowAll(false)
+                    const v = e.target.value
+                    setMaxLines(v === 'all' ? 'all' : Number(v))
                   }}
                   style={{
                     width: '100%',
@@ -774,25 +709,11 @@ function RepositoryContextPage() {
                   <option value={200}>200</option>
                   <option value={500}>500</option>
                   <option value={800}>800</option>
+                  <option value={1000}>1000</option>
                   <option value={2000}>2000</option>
                   <option value={5000}>5000</option>
+                  <option value="all">All</option>
                 </select>
-              </div>
-              <div style={{ minWidth: 160, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                <button
-                  type="button"
-                  onClick={() => setShowAll((v) => !v)}
-                  style={{
-                    borderRadius: 999,
-                    border: '1px solid var(--border)',
-                    background: 'var(--bg)',
-                    padding: '10px 12px',
-                    fontSize: 12,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {showAll ? 'Show truncated' : 'Show all'}
-                </button>
               </div>
             </div>
           </div>
@@ -884,10 +805,8 @@ function SettingsPage() {
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const rulesText = rules ? JSON.stringify(rules, null, 2) : ''
   const apiBase = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
 
   return (
@@ -912,7 +831,7 @@ function SettingsPage() {
 
       {error ? <ErrorBox title="Settings load failed" error={error} /> : null}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>API connection</div>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 12 }}>Health + repo root used for `.agenti_helix/` artifacts.</div>
@@ -929,43 +848,24 @@ function SettingsPage() {
             </div>
           </div>
         </section>
-
-        <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
-          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Governance rules</div>
-          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 12 }}>
-            `rules.json` is loaded from the backend for the “Supreme Court” consensus router and safety constraints. UI is read-only.
-          </div>
-
-          {rules ? (
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between' }}>
-              <CopyButton text={rulesText} label="Copy rules" />
-              <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>keys: {Object.keys(rules).length}</div>
-            </div>
-          ) : (
-            <div style={{ color: 'var(--muted)', fontSize: 12 }}>Loading…</div>
-          )}
-
-          <textarea
-            value={rulesText}
-            disabled
-            style={{
-              width: '100%',
-              marginTop: 12,
-              minHeight: 360,
-              resize: 'vertical',
-              borderRadius: 12,
-              border: '1px solid var(--border)',
-              background: 'var(--bg)',
-              padding: 10,
-              color: 'var(--muted)',
-              font: 'inherit',
-              fontFamily: 'var(--mono)',
-              fontSize: 12,
-              whiteSpace: 'pre',
-            }}
-          />
-        </section>
       </div>
+
+      <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
+        <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Governance rules</div>
+        <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 12 }}>
+          `rules.json` is shown on the Repository Context page.
+        </div>
+        {rules ? (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>keys: {Object.keys(rules).length}</div>
+            <a className="pill" href="/repo#rules">
+              Open rules.json
+            </a>
+          </div>
+        ) : (
+          <div style={{ color: 'var(--muted)', fontSize: 12 }}>Loading…</div>
+        )}
+      </section>
     </div>
   )
 }
@@ -1026,16 +926,6 @@ function FeatureCard({ feature }: { feature: Feature }) {
           }}
         >
           View DAG Progress
-        </a>
-        <a
-          className="pill"
-          href={`/features/${encodeURIComponent(feature.feature_id)}/signoff`}
-          onClick={(e) => {
-            e.preventDefault()
-            navigate(`/features/${encodeURIComponent(feature.feature_id)}/signoff`)
-          }}
-        >
-          View Trace Logs
         </a>
         <a
           className="pill"
@@ -1209,24 +1099,7 @@ function FeatureDagPage() {
         </a>
       </div>
 
-      {error ? (
-        <div
-          style={{
-            border: '1px solid var(--border)',
-            borderRadius: 12,
-            background: 'var(--panel)',
-            padding: 12,
-            color: 'var(--muted)',
-            fontFamily: 'var(--mono)',
-            fontSize: 12,
-            whiteSpace: 'pre-wrap',
-          }}
-        >
-          Failed to load feature.
-
-          {`\n\n${error}`}
-        </div>
-      ) : null}
+      {error ? <ErrorBox title="Failed to load feature" error={error} /> : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
@@ -1309,6 +1182,8 @@ function TaskInterventionPage() {
   const [docUrl, setDocUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [actionNote, setActionNote] = useState<string | null>(null)
+  const [refreshTick, setRefreshTick] = useState(0)
 
   useEffect(() => {
     if (!featureId || !nodeId) return
@@ -1352,7 +1227,7 @@ function TaskInterventionPage() {
       cancelled = true
       window.clearInterval(t)
     }
-  }, [featureId, nodeId])
+  }, [featureId, nodeId, refreshTick])
 
   const task = feature?.dag.nodes?.[nodeId ?? '']?.task
   const latestCp = (checkpoints ?? [])[0] ?? null
@@ -1371,15 +1246,18 @@ function TaskInterventionPage() {
       return
     }
     setError(null)
+    setActionNote(null)
     setBusy(true)
     try {
-      await rerunTask({
+      const res = await rerunTask({
         task_id: task.task_id,
         checkpoint_id: latestCp.checkpoint_id,
         guidance: guidance.trim() || undefined,
         feature_id: featureId,
         node_id: nodeId,
       })
+      setActionNote(`Re-run scheduled${res.reRunId ? `: ${res.reRunId}` : '.'}`)
+      setRefreshTick((t) => t + 1)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1394,6 +1272,7 @@ function TaskInterventionPage() {
       return
     }
     setError(null)
+    setActionNote(null)
     setBusy(true)
     try {
       await abortTask({
@@ -1402,29 +1281,8 @@ function TaskInterventionPage() {
         node_id: nodeId,
         abort_reason: 'Aborted by user',
       })
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleAttachDocLink() {
-    if (!task) {
-      setError('Task not loaded yet.')
-      return
-    }
-    if (!docUrl.trim()) {
-      setError('Doc URL is required to attach context.')
-      return
-    }
-    setError(null)
-    setBusy(true)
-    try {
-      await attachTaskContext({
-        task_id: task.task_id,
-        doc_url: docUrl.trim(),
-      })
+      setActionNote('Abort requested.')
+      setRefreshTick((t) => t + 1)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1443,6 +1301,7 @@ function TaskInterventionPage() {
       return
     }
     setError(null)
+    setActionNote(null)
     setBusy(true)
     try {
       await applyAndRerun({
@@ -1450,7 +1309,11 @@ function TaskInterventionPage() {
         checkpoint_id: latestCp.checkpoint_id,
         guidance: guidance.trim() || undefined,
         doc_url: docUrl.trim() || undefined,
+        feature_id: featureId,
+        node_id: nodeId,
       })
+      setActionNote('Apply + re-run scheduled.')
+      setRefreshTick((t) => t + 1)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1498,22 +1361,10 @@ function TaskInterventionPage() {
         </div>
       </div>
 
-      {error ? (
-        <div
-          style={{
-            border: '1px solid var(--border)',
-            borderRadius: 12,
-            background: 'var(--panel)',
-            padding: 12,
-            color: 'var(--muted)',
-            fontFamily: 'var(--mono)',
-            fontSize: 12,
-            whiteSpace: 'pre-wrap',
-          }}
-        >
-          Failed to load intervention context.
-
-          {`\n\n${error}`}
+      {error ? <ErrorBox title="Failed to load intervention context" error={error} /> : null}
+      {actionNote ? (
+        <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 10, color: 'var(--muted)', fontSize: 12 }}>
+          {actionNote}
         </div>
       ) : null}
 
@@ -1528,7 +1379,16 @@ function TaskInterventionPage() {
 
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Execution logs</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              maxHeight: 520,
+              overflow: 'auto',
+              paddingRight: 2,
+            }}
+          >
             {(events ?? []).length === 0 ? (
               <div style={{ color: 'var(--muted)', fontSize: 12 }}>{events ? 'No events.' : 'Loading…'}</div>
             ) : null}
@@ -1583,17 +1443,6 @@ function TaskInterventionPage() {
             }}
           />
           <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-            <a
-              className="pill"
-              href="#"
-              onClick={(e) => {
-                e.preventDefault()
-                if (busy) return
-                void handleAttachDocLink()
-              }}
-            >
-              Attach doc link
-            </a>
             <a
               className="pill"
               href="#"
@@ -1664,7 +1513,7 @@ function SignoffTripanePage() {
   useEffect(() => {
     if (!feature || editMode) return
     setMacroIntentDraft(feature.dag.macro_intent ?? '')
-  }, [feature?.feature_id, editMode, feature?.dag.macro_intent])
+  }, [feature, editMode])
 
   async function handleEditIntent() {
     if (!featureId) return
@@ -1773,19 +1622,18 @@ function SignoffTripanePage() {
               if (busy) return
               void handleMergeToMain()
             }}
+            style={{
+              borderColor: 'rgba(220, 38, 38, 0.55)',
+              color: 'rgba(220, 38, 38, 1)',
+              background: 'rgba(220, 38, 38, 0.10)',
+            }}
           >
             Merge to main
           </a>
         </div>
       </div>
 
-      {error ? (
-        <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-          Failed to load sign-off view.
-
-          {`\n\n${error}`}
-        </div>
-      ) : null}
+      {error ? <ErrorBox title="Failed to load sign-off view" error={error} /> : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
@@ -1811,9 +1659,7 @@ function SignoffTripanePage() {
                 }}
               />
               {actionError ? (
-                <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-                  {actionError}
-                </div>
+                <ErrorBox error={actionError} />
               ) : null}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <a
@@ -1878,9 +1724,7 @@ function SignoffTripanePage() {
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Episodic memory</div>
           {memoryError ? (
-            <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-              {memoryError}
-            </div>
+            <ErrorBox error={memoryError} />
           ) : null}
           {memory ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -1945,7 +1789,7 @@ function SignoffDiffBlock({
     return () => {
       cancelled = true
     }
-  }, [feature?.feature_id])
+  }, [feature?.feature_id, feature?.dag.nodes, onLatestCheckpoint])
 
   if (error) return <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 10 }}>{error}</div>
   return (
@@ -1984,13 +1828,7 @@ function TriageInboxPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <PageTitle title="Triage Inbox" subtitle="Aggregated blockers across all in-flight features (management by exception)" />
 
-      {error ? (
-        <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-          Failed to load triage.
-
-          {`\n\n${error}`}
-        </div>
-      ) : null}
+      {error ? <ErrorBox title="Failed to load triage" error={error} /> : null}
 
       <div style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 8 }}>
         {(items ?? []).length === 0 ? (
@@ -2028,7 +1866,7 @@ function AgentRosterPage() {
         const res = await fetchAgents()
         if (!cancelled) {
           setAgents(res.agents)
-          if (!selectedId && res.agents[0]) setSelectedId(res.agents[0].id)
+          setSelectedId((prev) => prev ?? (res.agents[0]?.id ?? null))
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -2250,41 +2088,6 @@ function AgentRosterPage() {
   )
 }
 
-function ComputePage() {
-  const [res, setRes] = useState<{ event_count: number } | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    async function load() {
-      try {
-        setError(null)
-        const r = await fetchCompute()
-        if (!cancelled) setRes(r)
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      }
-    }
-    load()
-    const t = window.setInterval(load, 5000)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-    }
-  }, [])
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <PageTitle title="Compute" subtitle="v1 uses event volume as a proxy for burn rate." />
-      {error ? <div style={{ color: 'var(--muted)', fontSize: 12 }}>{error}</div> : null}
-      <div style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
-        <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 6 }}>Event volume</div>
-        <div style={{ color: 'var(--muted)', fontSize: 12 }}>events.jsonl count: {res?.event_count ?? '—'}</div>
-      </div>
-    </div>
-  )
-}
-
 function FeaturesKanbanPage() {
   const [features, setFeatures] = useState<Feature[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -2335,15 +2138,9 @@ function FeaturesKanbanPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <PageTitle title="Features" subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review" />
 
-      {error ? (
-        <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-          Failed to load features from API. Is the API server running?
+      {error ? <ErrorBox title="Failed to load features from API. Is the API server running?" error={error} /> : null}
 
-          {`\n\n${error}`}
-        </div>
-      ) : null}
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))', gap: 12, alignItems: 'start', minWidth: 1100 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12, alignItems: 'start' }}>
         {KANBAN_COLUMNS.map((col) => (
           <section key={col.id} style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 10, minHeight: 360 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: '6px 6px 10px' }}>
@@ -2365,41 +2162,60 @@ function FeaturesKanbanPage() {
 }
 
 function Sidebar() {
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('helix_sidebar_collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
+
+  function toggleCollapsed() {
+    setCollapsed((c) => {
+      const next = !c
+      try {
+        localStorage.setItem('helix_sidebar_collapsed', next ? '1' : '0')
+      } catch {
+        /* ignore */
+      }
+      return next
+    })
+  }
+
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${collapsed ? ' sidebar--collapsed' : ''}`}>
       <div className="sidebarHeader">
         <Icon label="AH" />
         <div className="sidebarHeaderTitle">Agenti-Helix</div>
+        <button type="button" className="sidebarCollapseBtn" onClick={toggleCollapsed} title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+          {collapsed ? '→' : '←'}
+        </button>
       </div>
 
       <div className="navSectionLabel">Control plane</div>
       <NavLink to="/" end className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="D" />
-        Dashboard
+        <span className="navItemLabel">Dashboard</span>
       </NavLink>
       <NavLink to="/features" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="K" />
-        Features
+        <span className="navItemLabel">Features</span>
       </NavLink>
       <NavLink to="/triage" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="T" />
-        Triage Inbox
+        <span className="navItemLabel">Triage Inbox</span>
       </NavLink>
       <NavLink to="/agents" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="A" />
-        Agent Roster
-      </NavLink>
-      <NavLink to="/compute" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
-        <Icon label="C" />
-        Compute
+        <span className="navItemLabel">Agent Roster</span>
       </NavLink>
       <NavLink to="/repo" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="R" />
-        Repository Context
+        <span className="navItemLabel">Repository Context</span>
       </NavLink>
       <NavLink to="/settings" className={({ isActive }) => `navItem ${isActive ? 'navItemActive' : ''}`}>
         <Icon label="S" />
-        Settings
+        <span className="navItemLabel">Settings</span>
       </NavLink>
     </aside>
   )
@@ -2439,10 +2255,7 @@ function Topbar() {
           }}
         />
       </div>
-      <div className="topbarRight">
-        <span className="pill">Burn: —</span>
-        <span className="pill">Profile</span>
-      </div>
+      <div className="topbarRight" />
     </header>
   )
 }
@@ -2468,8 +2281,18 @@ function App() {
     })
   }
 
+  const [sidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('helix_sidebar_collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
+
   return (
-    <div className={`appShell${llmPanelCollapsed ? ' appShell--traceCollapsed' : ''}`}>
+    <div
+      className={`appShell${llmPanelCollapsed ? ' appShell--traceCollapsed' : ''}${sidebarCollapsed ? ' appShell--sidebarCollapsed' : ''}`}
+    >
       <Sidebar />
       <div className="main">
         <Topbar />
@@ -2482,7 +2305,6 @@ function App() {
             <Route path="/features/:featureId/signoff" element={<SignoffTripanePage />} />
             <Route path="/triage" element={<TriageInboxPage />} />
             <Route path="/agents" element={<AgentRosterPage />} />
-            <Route path="/compute" element={<ComputePage />} />
             <Route path="/repo" element={<RepositoryContextPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Placeholder title="Not found" />} />

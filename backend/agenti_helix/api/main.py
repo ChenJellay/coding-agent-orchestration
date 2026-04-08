@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agenti_helix.agents.registry import get_agent_detail, list_agents
 from agenti_helix.api.auth import Role, require_auth, require_editor
@@ -354,6 +355,84 @@ def create_app() -> FastAPI:
             items.append(e)
         items.sort(key=lambda x: x.get("timestamp", 0))
         return items[-limit:]
+
+    def _event_key(e: Dict[str, Any]) -> str:
+        ts = e.get("timestamp") or 0
+        rid = e.get("runId") or ""
+        msg = e.get("message") or ""
+        agent = ""
+        data = e.get("data")
+        if isinstance(data, dict):
+            agent = str(data.get("agent_id") or "")
+        return f"{ts}:{rid}:{msg}:{agent}"
+
+    @app.get("/api/events/stream")
+    def stream_events(
+        runId: Optional[str] = None,
+        hypothesisId: Optional[str] = None,
+        traceId: Optional[str] = None,
+        dagId: Optional[str] = None,
+        sinceTs: Optional[int] = None,
+        heartbeatSeconds: float = Query(default=15.0, ge=1.0, le=60.0),
+    ) -> StreamingResponse:
+        """
+        Server-sent events stream of events.jsonl.
+
+        This is intentionally "best-effort" (polls the file periodically) to
+        provide near-real-time UI updates without adding a persistent queue.
+        """
+
+        def gen() -> Iterator[bytes]:
+            last_heartbeat = time.time()
+            last_seen_ts = sinceTs if sinceTs is not None else None
+            # Keep a small sliding window to dedupe repeats across polls.
+            recent_keys: List[str] = []
+
+            # Initial hello so the client knows the stream is alive.
+            yield b": ok\n\n"
+
+            while True:
+                now = time.time()
+                if now - last_heartbeat >= heartbeatSeconds:
+                    last_heartbeat = now
+                    yield b": heartbeat\n\n"
+
+                batch: List[Dict[str, Any]] = []
+                for e in _iter_jsonl(PATHS.events_path):
+                    if runId is not None and e.get("runId") != runId:
+                        continue
+                    if hypothesisId is not None and e.get("hypothesisId") != hypothesisId:
+                        continue
+                    if traceId is not None and e.get("traceId") != traceId:
+                        continue
+                    if dagId is not None and e.get("dagId") != dagId:
+                        continue
+                    ts = e.get("timestamp")
+                    if last_seen_ts is not None and isinstance(ts, int) and ts < last_seen_ts:
+                        continue
+                    batch.append(e)
+
+                batch.sort(key=lambda x: x.get("timestamp", 0))
+
+                for e in batch[-500:]:
+                    k = _event_key(e)
+                    if k in recent_keys:
+                        continue
+                    recent_keys.append(k)
+                    if len(recent_keys) > 250:
+                        recent_keys = recent_keys[-250:]
+
+                    ts = e.get("timestamp")
+                    if isinstance(ts, int):
+                        # Move the cursor forward; allow equal timestamps to still stream via dedupe.
+                        last_seen_ts = ts
+
+                    payload = json.dumps(e, ensure_ascii=False)
+                    yield f"event: event\ndata: {payload}\n\n".encode("utf-8")
+
+                time.sleep(0.8)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.get("/api/checkpoints")
     def get_checkpoints(task_id: Optional[str] = None, limit: int = Query(default=200, ge=1, le=2000)) -> List[Dict[str, Any]]:

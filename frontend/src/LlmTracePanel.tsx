@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { fetchEvents, type EventLog } from './lib/api'
+import { API_BASE_URL, fetchEvents, type EventLog } from './lib/api'
 
 type LlmTracePanelProps = {
   collapsed: boolean
@@ -77,17 +77,15 @@ function Section({
 export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelProps) {
   const [events, setEvents] = useState<EventLog[]>([])
   const [pollError, setPollError] = useState<string | null>(null)
+  const [streamStatus, setStreamStatus] = useState<'connecting' | 'open' | 'closed' | 'fallback'>('connecting')
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
 
   useEffect(() => {
-    if (selectedKey && !events.some((e) => isLlmTraceEvent(e) && eventKey(e) === selectedKey)) {
-      setSelectedKey(null)
-    }
-  }, [events, selectedKey])
-
-  useEffect(() => {
     let cancelled = false
-    async function tick() {
+    let es: EventSource | null = null
+    let pollId: number | null = null
+
+    async function pollOnce() {
       try {
         const batch = await fetchEvents({ limit: 800 })
         if (!cancelled) {
@@ -98,11 +96,64 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
         if (!cancelled) setPollError(e instanceof Error ? e.message : String(e))
       }
     }
-    void tick()
-    const id = window.setInterval(() => void tick(), 2800)
+
+    function startPollingFallback() {
+      setStreamStatus('fallback')
+      void pollOnce()
+      pollId = window.setInterval(() => void pollOnce(), 2800)
+    }
+
+    try {
+      // Keep initial state as "connecting"; avoid setState directly in effect body.
+      es = new EventSource(`${API_BASE_URL}/api/events/stream`)
+      es.onopen = () => {
+        if (cancelled) return
+        setPollError(null)
+        setStreamStatus('open')
+      }
+      es.onerror = () => {
+        if (cancelled) return
+        setStreamStatus('closed')
+        try {
+          es?.close()
+        } catch {
+          /* ignore */
+        }
+        es = null
+        // If streaming fails (proxy, CORS, server not updated), fall back to polling.
+        startPollingFallback()
+      }
+      es.addEventListener('event', (ev) => {
+        if (cancelled) return
+        const data = (ev as MessageEvent).data
+        if (typeof data !== 'string' || !data) return
+        try {
+          const parsed = JSON.parse(data) as EventLog
+          setEvents((prev) => {
+            const next = [...prev, parsed]
+            // Keep memory bounded; LLM panel only needs recent history.
+            return next.length > 1400 ? next.slice(-1400) : next
+          })
+        } catch (e) {
+          setPollError(e instanceof Error ? e.message : String(e))
+        }
+      })
+
+      // Also do a one-time fetch so the panel isn't empty until first stream tick.
+      void pollOnce()
+    } catch {
+      // If EventSource construction fails synchronously, fall back to polling.
+      startPollingFallback()
+    }
+
     return () => {
       cancelled = true
-      window.clearInterval(id)
+      if (pollId != null) window.clearInterval(pollId)
+      try {
+        es?.close()
+      } catch {
+        /* ignore */
+      }
     }
   }, [])
 
@@ -127,7 +178,12 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
     return eventKey(e)
   }, [traces])
 
-  const activeKey = selectedKey ?? latestKey
+  const selectedKeyValid = useMemo(() => {
+    if (!selectedKey) return null
+    return traces.some((e) => eventKey(e) === selectedKey) ? selectedKey : null
+  }, [traces, selectedKey])
+
+  const activeKey = selectedKeyValid ?? latestKey
 
   const selected = useMemo(() => traces.find((e) => eventKey(e) === activeKey), [traces, activeKey])
 
@@ -167,6 +223,15 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
       </header>
 
       {pollError ? <div className="llmTraceError">{pollError}</div> : null}
+      {streamStatus !== 'open' ? (
+        <div className="llmTraceError">
+          {streamStatus === 'connecting'
+            ? 'Connecting to live stream…'
+            : streamStatus === 'fallback'
+              ? 'Live stream unavailable — using polling.'
+              : 'Live stream disconnected.'}
+        </div>
+      ) : null}
 
       <div className="llmTracePicker">
         <label className="llmTracePickerLabel" htmlFor="llm-trace-select">

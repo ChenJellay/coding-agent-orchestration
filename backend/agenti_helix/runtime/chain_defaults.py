@@ -25,6 +25,16 @@ def default_coder_chain(task: Any | None = None) -> Dict[str, Any]:
                 },
             },
             {
+                "type": "tool",
+                "id": "snapshot_target",
+                "output_key": "target_file_content",
+                "tool_name": "snapshot_target_file",
+                "input_bindings": {
+                    "repo_root": {"$ref": "repo_root"},
+                    "target_file": {"$ref": "target_file"},
+                },
+            },
+            {
                 "type": "agent",
                 "id": "coder_patch",
                 "output_key": "coder_patch",
@@ -32,6 +42,8 @@ def default_coder_chain(task: Any | None = None) -> Dict[str, Any]:
                 "input_bindings": {
                     "repo_map_json": {"$ref": "repo_map_ctx.repo_map_json"},
                     "intent": {"$ref": "intent"},
+                    "target_file": {"$ref": "target_file"},
+                    "target_file_content": {"$ref": "target_file_content"},
                 },
                 "runtime": {"temperature": 0.0},
             },

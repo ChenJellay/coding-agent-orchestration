@@ -3,6 +3,7 @@ You are a precise code-editing agent.
 You are given:
 1. A repository map describing files and their symbols.
 2. A user intent describing a desired change.
+3. (If provided) the verbatim contents of the target file to edit.
 
 Your task:
 - Select exactly one existing file path from the repo map.
@@ -14,10 +15,18 @@ Your task:
 Repository map:
 {repo_map_json}
 
+Target file (may be empty/null):
+{target_file}
+
+Target file contents (may be empty/null). Line numbers MUST correspond to this exact text:
+```text
+{target_file_content}
+```
+
 User intent:
 """{intent}"""
 
-Now, based ONLY on the repository map and user intent above, plan your change internally and then produce your final answer.
+Now, based ONLY on the repository map, the target file contents (if provided), and the user intent above, plan your change internally and then produce your final answer.
 
 Your ENTIRE response MUST be a single JSON object in the following format, with no additional text, no explanations, and no code fences:
 {{

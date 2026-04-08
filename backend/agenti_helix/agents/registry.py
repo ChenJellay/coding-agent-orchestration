@@ -53,6 +53,8 @@ class AgentSpec:
                 {
                     "repo_map_json": getattr(inp, "repo_map_json"),
                     "intent": getattr(inp, "intent"),
+                    "target_file": getattr(inp, "target_file", None),
+                    "target_file_content": getattr(inp, "target_file_content", None),
                 },
             )
 

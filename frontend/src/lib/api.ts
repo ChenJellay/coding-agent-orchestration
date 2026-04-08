@@ -86,7 +86,7 @@ export type Checkpoint = {
   updated_at: number
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
 
 // D1: Bearer token injected centrally from VITE_API_KEY env var.
 // Set VITE_API_KEY in frontend/.env.local for authenticated deployments.
@@ -97,7 +97,7 @@ function _authHeaders(): Record<string, string> {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers: _authHeaders() })
+  const res = await fetch(`${API_BASE_URL}${path}`, { headers: _authHeaders() })
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
       throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
@@ -109,7 +109,7 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ..._authHeaders() },
     body: JSON.stringify(body),
@@ -125,7 +125,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ..._authHeaders() },
     body: JSON.stringify(body),
@@ -207,7 +207,7 @@ export async function fetchAgentDetail(agentId: string): Promise<AgentDetail> {
 }
 
 export async function updateAgentPrompt(agentId: string, prompt: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/agents/${encodeURIComponent(agentId)}/prompt`, {
+  const res = await fetch(`${API_BASE_URL}/api/agents/${encodeURIComponent(agentId)}/prompt`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ..._authHeaders() },
     body: JSON.stringify({ prompt }),
@@ -246,6 +246,8 @@ export async function applyAndRerun(params: {
   checkpoint_id: string
   guidance?: string
   doc_url?: string
+  feature_id?: string
+  node_id?: string
 }): Promise<{ ok: true }> {
   return await postJson('/api/tasks/apply-and-rerun', params)
 }
