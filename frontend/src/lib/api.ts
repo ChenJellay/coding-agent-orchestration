@@ -292,6 +292,24 @@ export async function mergeTask(params: {
   return await postJson('/api/tasks/merge', params)
 }
 
+export async function applyNodeSignoff(params: {
+  dag_id: string
+  node_id: string
+  task_id: string
+  checkpoint_id: string
+  signed_by?: string
+}): Promise<{ ok: true }> {
+  const { dag_id, node_id, ...body } = params
+  return await postJson(
+    `/api/dags/${encodeURIComponent(dag_id)}/nodes/${encodeURIComponent(node_id)}/signoff-apply`,
+    body,
+  )
+}
+
+export async function resumeDag(dag_id: string): Promise<{ ok: true }> {
+  return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/resume`, {})
+}
+
 export type PipelineMode = 'patch' | 'build'
 
 export async function startDagFromDashboard(params: {
@@ -310,7 +328,7 @@ export async function startDagFromDashboard(params: {
     use_llm: params.use_llm ?? false,
     pipeline_mode: params.pipeline_mode ?? null,
   }
-  return await postJson('/api/dags/run', body)
+  return await postJson<{ ok: true; dag_id: string }>('/api/dags/run', body)
 }
 
 export async function fetchHealth(): Promise<HealthResponse> {

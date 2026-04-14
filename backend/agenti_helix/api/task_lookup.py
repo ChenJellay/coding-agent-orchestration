@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from agenti_helix.api.paths import PATHS, iter_jsonl, read_json, try_read_json
 from agenti_helix.verification.checkpointing import EditTaskSpec
@@ -94,4 +94,56 @@ def load_dag_state(dag_id: str) -> Dict:
 
 def persist_dag_state(dag_id: str, state: Dict) -> None:
     dag_state_path(dag_id).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def record_verification_cycle_snapshot(
+    *,
+    dag_id: Optional[str],
+    task_id: str,
+    verification_cycle: int,
+    verification_status: Optional[str],
+    code_evidence: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Merge verification-loop progress into ``{dag_id}_state.json`` while a node is still
+    inside ``run_verification_loop`` (judge retries / coder re-attempts).
+
+    Without this, the orchestrator only persists after the node completes, so the
+    dashboard shows a frozen RUNNING node until the entire loop returns.
+    """
+    if not dag_id:
+        return
+    try:
+        ref = find_task_ref(task_id=task_id, feature_id=dag_id)
+    except (KeyError, RuntimeError):
+        return
+    node_id = ref.node_id
+    cycle = max(1, int(verification_cycle))
+    state = try_load_dag_state(dag_id)
+    if not isinstance(state, dict):
+        state = {"dag_id": dag_id, "nodes": {}}
+    nodes = state.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+        state["nodes"] = nodes
+    ns = nodes.get(node_id)
+    if not isinstance(ns, dict):
+        ns = {"node_id": node_id, "status": "RUNNING", "attempts": 1, "verification_status": None}
+        nodes[node_id] = ns
+    ns["verification_cycle"] = cycle
+    if verification_status is not None:
+        ns["verification_status"] = verification_status
+    if code_evidence:
+        ev = ns.get("code_evidence")
+        if not isinstance(ev, dict):
+            ev = {}
+        merged = {**ev, **code_evidence}
+        ns["code_evidence"] = merged
+    persist_dag_state(dag_id, state)
+    try:
+        from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
+
+        invalidate_features_and_triage_caches()
+    except Exception:
+        pass
 

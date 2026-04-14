@@ -25,6 +25,25 @@ def apply_line_patch(original_text: str, patch: LinePatch) -> str:
     if patch.start_line < 1 or patch.end_line < patch.start_line or patch.end_line > len(lines):
         raise ValueError("Invalid line range in patch")
 
+    # ── Sanity check: reject patches that would drastically shrink a range ──
+    original_span = patch.end_line - patch.start_line + 1
+    replacement_count = len(patch.replacement_lines)
+
+    if original_span > 1 and replacement_count == 0:
+        raise ValueError(
+            f"Destructive patch rejected: replacing {original_span} lines "
+            f"(L{patch.start_line}-L{patch.end_line}) with 0 lines. "
+            "Use explicit deletion if this is intentional."
+        )
+
+    if original_span > 2 and replacement_count < original_span // 3:
+        raise ValueError(
+            f"Destructive patch rejected: replacing {original_span} lines "
+            f"(L{patch.start_line}-L{patch.end_line}) with only "
+            f"{replacement_count} line(s). This would destroy surrounding code. "
+            "Narrow the range to only the lines you need to change."
+        )
+
     start_idx = patch.start_line - 1
     end_idx = patch.end_line  # slice end is exclusive
 

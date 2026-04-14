@@ -94,22 +94,26 @@ def tool_apply_line_patch_and_validate(
     target_path = repo_root_path / patch_typed.file_path
     apply_line_patch_to_file(target_path, patch_typed)
 
-    # Best-effort syntax check for JS/TS (tree-sitter).
+    # Syntax check for JS/TS (tree-sitter) — surface errors so the judge
+    # can decide to retry instead of silently accepting broken code.
+    syntax_error: str | None = None
     try:
         lang = detect_language(target_path)
         if lang in ("javascript", "typescript"):
             parse_file(target_path, lang)
-    except Exception:
-        # Let judge / verifier handle failures; syntax check is just an early guard.
-        pass
+    except Exception as exc:
+        syntax_error = str(exc)
 
     # Verification loop historically treats the patch JSON as `diff_json`.
-    return {
+    result = {
         "filePath": patch_typed.file_path,
         "startLine": patch_typed.start_line,
         "endLine": patch_typed.end_line,
         "replacementLines": patch_typed.replacement_lines,
     }
+    if syntax_error:
+        result["syntax_error"] = syntax_error
+    return result
 
 
 def tool_snapshot_target_file(*, repo_root: str | Path, target_file: str) -> str:

@@ -8,7 +8,9 @@ Flag any hardcoded secrets, API keys, or destructive database queries.
 
 If the code violates any rule, you must fail it and include the exact violation with its line number in `violations`.
 
-Output your audit reasoning in `audit_reasoning`, then the pass/fail result and the list of violations.
+First, reason step-by-step inside `<think>...</think>` tags — methodically check each rule against the diff.
+
+Then, after `</think>`, output a single JSON object with your audit reasoning, the pass/fail result, and the list of violations.
 
 Inputs:
 - Coder_Output_Diff_(JSON):

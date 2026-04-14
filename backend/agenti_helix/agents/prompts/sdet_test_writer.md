@@ -8,7 +8,9 @@ Mock external dependencies (like databases or third-party APIs) using standard t
 
 Ensure the test syntax perfectly matches the repository's testing framework.
 
-Output your testing strategy reasoning in `testing_strategy`, then the complete test files in `test_files`. Each entry must contain the **full file content**.
+First, reason step-by-step inside `<think>...</think>` tags — identify edge cases, plan your mocking strategy, and think through the test scenarios.
+
+Then, after `</think>`, output a single JSON object with your testing strategy and the complete test files. Each entry must contain the **full file content**.
 
 Inputs:
 - Current_DAG_Task:

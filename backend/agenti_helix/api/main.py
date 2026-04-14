@@ -170,12 +170,16 @@ def _feature_column_from_state(
     judge_msgs = {
         "Judge evaluated edit",
         "Marked checkpoint PASSED",
+        "Judge PASS — staged post-state; workspace rolled back pending manual sign-off",
         "Rolled back and scheduled retry",
         "Marked checkpoint BLOCKED (retries exhausted)",
     }
     if any(e.get("runId") == dag_id and e.get("message") in judge_msgs for e in events):
         if any(s in {"RUNNING"} for s in statuses):
             return "VERIFYING"
+
+    if any(s == "AWAITING_SIGNOFF" for s in statuses):
+        return "VERIFYING"
 
     if statuses and all(s == "PASSED_VERIFICATION" for s in statuses):
         return "READY_FOR_REVIEW"

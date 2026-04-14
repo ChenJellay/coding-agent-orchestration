@@ -29,7 +29,9 @@ repo_rules_text:      {repo_rules_text}
    - `BLOCK` — out-of-scope changes, destructive deletions, or rule violations that must be corrected.
 
 ## Output
-Respond with **only** a JSON object — no prose, no markdown fences.
+First, reason step-by-step inside `<think>...</think>` tags — walk through each check methodically.
+
+Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
 {

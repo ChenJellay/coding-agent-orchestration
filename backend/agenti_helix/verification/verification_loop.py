@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import py_compile
 import subprocess
@@ -15,6 +16,7 @@ from agenti_helix.runtime.chain_runtime import run_chain
 # master_orchestrator is imported lazily inside node_run_coder / node_call_judge
 # to break the verification_loop ↔ orchestrator circular dependency.
 
+from agenti_helix.api.task_lookup import record_verification_cycle_snapshot
 from agenti_helix.memory.indexer import index_from_verification_state
 
 from .checkpointing import (
@@ -23,6 +25,7 @@ from .checkpointing import (
     VerificationStatus,
     create_pre_checkpoint,
     record_post_state,
+    restore_file_from_snapshot,
     rollback_to_checkpoint,
     save_checkpoint,
     snapshot_file,
@@ -81,6 +84,17 @@ def _resolve_target_path(task: EditTaskSpec) -> Path:
     return Path(task.repo_path).resolve() / task.target_file
 
 
+def _text_fingerprint(text: str) -> Dict[str, Any]:
+    """Stable, compact evidence for pre/post code comparisons (logged + merged into dag state)."""
+    raw = text.encode("utf-8")
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def _patch_pipeline(task: EditTaskSpec) -> bool:
+    """Line-patch verification requires staging + manual sign-off before workspace is final."""
+    return (getattr(task, "pipeline_mode", None) or "patch") == "patch"
+
+
 def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
     if _is_cancelled(state.cancel_token):
         return state
@@ -96,9 +110,21 @@ def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
         hypothesis_id="pre_checkpoint",
         location="agenti_helix/verification/verification_loop.py:node_take_pre_checkpoint",
         message="Created pre-checkpoint and captured original file snapshot",
-        data={"task_id": state.task.task_id, "target_file": state.task.target_file, "checkpoint_id": checkpoint.checkpoint_id},
+        data={
+            "task_id": state.task.task_id,
+            "target_file": state.task.target_file,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "pre_execution_fingerprint": _text_fingerprint(original),
+        },
         trace_id=state.trace_id,
         dag_id=state.dag_id,
+    )
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=VerificationStatus.RUNNING.value,
+        code_evidence={"pre_execution": _text_fingerprint(original)},
     )
     return state
 
@@ -127,6 +153,14 @@ def node_run_coder(state: VerificationState) -> VerificationState:
             state.checkpoint.status = VerificationStatus.BLOCKED
             save_checkpoint(state.checkpoint)
         return state
+
+    cp_st = state.checkpoint.status.value if state.checkpoint else None
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=cp_st,
+    )
 
     repo_root = Path(state.task.repo_path).resolve()
     intent = _build_coder_intent(state)
@@ -167,14 +201,27 @@ def node_run_coder(state: VerificationState) -> VerificationState:
 
         state.diff_json = ctx.get("diff_json")
         state.coder_error = None
+        _tp = _resolve_target_path(state.task)
+        post_coder_text = _tp.read_text() if _tp.exists() else ""
         log_event(
             run_id=state.task.task_id,
             hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
             location="agenti_helix/verification/verification_loop.py:node_run_coder",
             message="Coder chain produced diff_json",
-            data={"task_id": state.task.task_id, "diff_json": state.diff_json},
+            data={
+                "task_id": state.task.task_id,
+                "diff_json": state.diff_json,
+                "post_coder_fingerprint": _text_fingerprint(post_coder_text),
+            },
             trace_id=state.trace_id,
             dag_id=state.dag_id,
+        )
+        record_verification_cycle_snapshot(
+            dag_id=state.dag_id,
+            task_id=state.task.task_id,
+            verification_cycle=state.retry_count + 1,
+            verification_status=cp_st,
+            code_evidence={"post_coder": _text_fingerprint(post_coder_text)},
         )
         return state
     except Exception as exc:
@@ -338,14 +385,28 @@ def node_run_static_checks(state: VerificationState) -> VerificationState:
     repo_root = Path(state.task.repo_path).resolve()
     logs = _run_static_checks(repo_root, state.task.target_file)
     state.static_check_logs = logs
+    post_static_text = (repo_root / state.task.target_file).read_text() if (repo_root / state.task.target_file).exists() else ""
     log_event(
         run_id=state.task.task_id,
         hypothesis_id=f"static_checks_attempt_{state.retry_count + 1}",
         location="agenti_helix/verification/verification_loop.py:node_run_static_checks",
         message="Static checks completed",
-        data={"task_id": state.task.task_id, "passed": logs.get("passed"), "errors": logs.get("errors", [])},
+        data={
+            "task_id": state.task.task_id,
+            "passed": logs.get("passed"),
+            "errors": logs.get("errors", []),
+            "post_static_checks_fingerprint": _text_fingerprint(post_static_text),
+        },
         trace_id=state.trace_id,
         dag_id=state.dag_id,
+    )
+    _cp = state.checkpoint
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=_cp.status.value if _cp is not None else None,
+        code_evidence={"post_static_checks": _text_fingerprint(post_static_text)},
     )
     return state
 
@@ -441,21 +502,70 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
     verdict_label = f"verdict_attempt_{state.retry_count + 1}"
 
     if str(verdict).upper() == "PASS":
-        record_post_state(
-            state.checkpoint,
-            post_state_ref=target_path.read_text(),
-            diff=json.dumps(state.diff_json or {}, indent=2),
-            tool_logs={"judge": state.judge_response, "static_checks": state.static_check_logs or {}},
-            status=VerificationStatus.PASSED,
-        )
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id=verdict_label,
-            location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
-            message="Marked checkpoint PASSED",
-            data={"task_id": state.task.task_id, "checkpoint_id": state.checkpoint.checkpoint_id},
-            trace_id=state.trace_id,
+        post_judge_body = target_path.read_text()
+        tool_logs_base = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
+        if _patch_pipeline(state.task):
+            record_post_state(
+                state.checkpoint,
+                post_state_ref=post_judge_body,
+                diff=json.dumps(state.diff_json or {}, indent=2),
+                tool_logs=tool_logs_base,
+                status=VerificationStatus.PASSED_PENDING_SIGNOFF,
+            )
+            # Roll back only the workspace file — do not call ``rollback_to_checkpoint`` here because
+            # that resets checkpoint metadata to RUNNING for retry flows.
+            pre_body = state.original_content if state.original_content is not None else state.checkpoint.pre_state_ref
+            restore_file_from_snapshot(target_path, pre_body)
+            log_event(
+                run_id=state.task.task_id,
+                hypothesis_id=verdict_label,
+                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
+                message="Judge PASS — staged post-state; workspace rolled back pending manual sign-off",
+                data={
+                    "task_id": state.task.task_id,
+                    "checkpoint_id": state.checkpoint.checkpoint_id,
+                    "post_judge_fingerprint": _text_fingerprint(post_judge_body),
+                    "workspace_after_rollback_fingerprint": _text_fingerprint(
+                        target_path.read_text() if target_path.exists() else ""
+                    ),
+                },
+                trace_id=state.trace_id,
+                dag_id=state.dag_id,
+            )
+        else:
+            record_post_state(
+                state.checkpoint,
+                post_state_ref=post_judge_body,
+                diff=json.dumps(state.diff_json or {}, indent=2),
+                tool_logs=tool_logs_base,
+                status=VerificationStatus.PASSED,
+            )
+            log_event(
+                run_id=state.task.task_id,
+                hypothesis_id=verdict_label,
+                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
+                message="Marked checkpoint PASSED",
+                data={
+                    "task_id": state.task.task_id,
+                    "checkpoint_id": state.checkpoint.checkpoint_id,
+                    "post_judge_fingerprint": _text_fingerprint(post_judge_body),
+                },
+                trace_id=state.trace_id,
+                dag_id=state.dag_id,
+            )
+        record_verification_cycle_snapshot(
             dag_id=state.dag_id,
+            task_id=state.task.task_id,
+            verification_cycle=state.retry_count + 1,
+            verification_status=state.checkpoint.status.value,
+            code_evidence={
+                "post_judge": _text_fingerprint(post_judge_body),
+                "comparison_pre_vs_post_judge": {
+                    "pre_sha256": _text_fingerprint(state.original_content or "")["sha256"],
+                    "post_judge_sha256": _text_fingerprint(post_judge_body)["sha256"],
+                    "identical": (state.original_content or "") == post_judge_body,
+                },
+            },
         )
         return state
 
@@ -517,6 +627,12 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
         data={"task_id": state.task.task_id, "checkpoint_id": state.checkpoint.checkpoint_id, "retry_count": state.retry_count},
         trace_id=state.trace_id,
         dag_id=state.dag_id,
+    )
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=VerificationStatus.RUNNING.value,
     )
     return state
 
@@ -777,6 +893,7 @@ def build_verification_graph() -> StateGraph:
             return END
         if state.checkpoint is not None and state.checkpoint.status in (
             VerificationStatus.PASSED,
+            VerificationStatus.PASSED_PENDING_SIGNOFF,
             VerificationStatus.BLOCKED,
         ):
             return END

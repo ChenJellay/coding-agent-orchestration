@@ -6,10 +6,11 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.api.paths import PATHS
+from agenti_helix.api.task_lookup import try_load_dag_state
 from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
 from agenti_helix.verification.verification_loop import run_verification_loop
 
@@ -20,6 +21,8 @@ class DagNodeStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     PASSED_VERIFICATION = "PASSED_VERIFICATION"
+    # Patch pipeline: judge approved but workspace rolled back until POST sign-off apply.
+    AWAITING_SIGNOFF = "AWAITING_SIGNOFF"
     FAILED = "FAILED"
     ESCALATED = "ESCALATED"
 
@@ -60,11 +63,14 @@ class DagExecutionResult:
     dag_id: str
     node_states: Dict[str, DagNodeExecutionState]
     failed_nodes: List[str] = field(default_factory=list)
+    paused_for_signoff: bool = False
 
     @property
     def all_passed(self) -> bool:
-        return not self.failed_nodes and all(
-            s.status is DagNodeStatus.PASSED_VERIFICATION for s in self.node_states.values()
+        return (
+            not self.failed_nodes
+            and not self.paused_for_signoff
+            and all(s.status is DagNodeStatus.PASSED_VERIFICATION for s in self.node_states.values())
         )
 
 
@@ -112,18 +118,25 @@ def persist_dag_execution_state(
     """Persist only the execution state snapshot for a DAG."""
     _ensure_dag_dir()
     path = _dag_path(f"{dag_id}_state")
-    data = {
-        "dag_id": dag_id,
-        "nodes": {
-            node_id: {
-                "node_id": state.node_id,
-                "status": state.status.value,
-                "attempts": state.attempts,
-                "verification_status": state.verification_status.value if state.verification_status is not None else None,
-            }
-            for node_id, state in node_states.items()
-        },
-    }
+    prior = try_load_dag_state(dag_id)
+    prior_nodes = prior.get("nodes") if isinstance(prior, dict) else None
+    merged_nodes: Dict[str, Any] = {}
+    for node_id, state in node_states.items():
+        base: Dict[str, Any] = {
+            "node_id": state.node_id,
+            "status": state.status.value,
+            "attempts": state.attempts,
+            "verification_status": state.verification_status.value if state.verification_status is not None else None,
+        }
+        if isinstance(prior_nodes, dict):
+            prev = prior_nodes.get(node_id) or prior_nodes.get(str(node_id))
+            if isinstance(prev, dict):
+                for k, v in prev.items():
+                    if k in {"node_id", "status", "attempts", "verification_status"}:
+                        continue
+                    base[k] = v
+        merged_nodes[node_id] = base
+    data = {"dag_id": dag_id, "nodes": merged_nodes}
     path.write_text(json.dumps(data, indent=2))
 
 
@@ -156,6 +169,48 @@ def _topological_order(spec: DagSpec) -> List[str]:
     return order
 
 
+def _dag_node_status_from_value(raw: Optional[str]) -> Optional[DagNodeStatus]:
+    if not raw:
+        return None
+    try:
+        return DagNodeStatus(str(raw))
+    except ValueError:
+        return None
+
+
+def _verification_status_from_value(raw: Optional[str]) -> Optional[VerificationStatus]:
+    if not raw:
+        return None
+    try:
+        return VerificationStatus(str(raw))
+    except ValueError:
+        return None
+
+
+def _initial_node_states_from_disk(spec: DagSpec) -> Dict[str, DagNodeExecutionState]:
+    """Seed node execution state from a persisted ``*_state.json`` when resuming a DAG."""
+    existing = try_load_dag_state(spec.dag_id)
+    out: Dict[str, DagNodeExecutionState] = {}
+    nodes_raw = (existing or {}).get("nodes") if isinstance(existing, dict) else None
+    for node_id in spec.nodes:
+        base = DagNodeExecutionState(node_id=node_id)
+        if isinstance(nodes_raw, dict):
+            raw_ns = nodes_raw.get(node_id) or nodes_raw.get(str(node_id))
+            if isinstance(raw_ns, dict):
+                st = _dag_node_status_from_value(raw_ns.get("status"))  # type: ignore[arg-type]
+                vs = _verification_status_from_value(raw_ns.get("verification_status"))  # type: ignore[arg-type]
+                if st is not None:
+                    base.status = st
+                if vs is not None:
+                    base.verification_status = vs
+                try:
+                    base.attempts = int(raw_ns.get("attempts") or 0)
+                except (TypeError, ValueError):
+                    base.attempts = 0
+        out[node_id] = base
+    return out
+
+
 def execute_dag(spec: DagSpec) -> DagExecutionResult:
     """
     Execute a DAG by routing each node through the verification loop.
@@ -168,9 +223,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
 
     trace_id = str(uuid.uuid4())
 
-    node_states: Dict[str, DagNodeExecutionState] = {
-        node_id: DagNodeExecutionState(node_id=node_id) for node_id in spec.nodes
-    }
+    node_states = _initial_node_states_from_disk(spec)
 
     order = _topological_order(spec)
     predecessors: Dict[str, Set[str]] = {node_id: set() for node_id in spec.nodes}
@@ -178,6 +231,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         predecessors.setdefault(dst, set()).add(src)
 
     failed_nodes: List[str] = []
+    paused_for_signoff = False
 
     log_event(
         run_id=spec.dag_id,
@@ -191,13 +245,22 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
 
     for node_id in order:
         node_state = node_states[node_id]
+        if node_state.status is DagNodeStatus.RUNNING:
+            node_state.status = DagNodeStatus.PENDING
+        if node_state.status in (DagNodeStatus.PASSED_VERIFICATION, DagNodeStatus.AWAITING_SIGNOFF):
+            continue
+        if node_state.status is DagNodeStatus.FAILED:
+            continue
         if node_state.status is not DagNodeStatus.PENDING:
             continue
 
         preds = predecessors.get(node_id, set())
-        if any(node_states[p].status is not DagNodeStatus.PASSED_VERIFICATION for p in preds):
+        if any(node_states[p].status is DagNodeStatus.FAILED for p in preds):
             node_state.status = DagNodeStatus.FAILED
             failed_nodes.append(node_id)
+            continue
+        if any(node_states[p].status is not DagNodeStatus.PASSED_VERIFICATION for p in preds):
+            # Upstream still running, pending, or awaiting human sign-off — do not fail this node yet.
             continue
 
         node_state.status = DagNodeStatus.RUNNING
@@ -214,6 +277,10 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
             dag_id=spec.dag_id,
         )
 
+        # Persist RUNNING before the verification loop: the loop may run for a long time
+        # (judge/coder retries) and the UI polls ``*_state.json``.
+        persist_dag_execution_state(spec.dag_id, node_states)
+
         cp_status: Optional[VerificationStatus] = None
         try:
             final_state = run_verification_loop(
@@ -227,6 +294,19 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
 
             if cp_status is VerificationStatus.PASSED:
                 node_state.status = DagNodeStatus.PASSED_VERIFICATION
+            elif cp_status is VerificationStatus.PASSED_PENDING_SIGNOFF:
+                node_state.status = DagNodeStatus.AWAITING_SIGNOFF
+                node_state.verification_status = VerificationStatus.PASSED_PENDING_SIGNOFF
+                paused_for_signoff = True
+                log_event(
+                    run_id=spec.dag_id,
+                    hypothesis_id=node_id,
+                    location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+                    message="DAG paused — judge-approved patch staged; awaiting manual sign-off before downstream nodes",
+                    data={"node_id": node_id, "task_id": node_spec.task.task_id},
+                    trace_id=trace_id,
+                    dag_id=spec.dag_id,
+                )
             else:
                 node_state.status = DagNodeStatus.FAILED
                 failed_nodes.append(node_id)
@@ -252,6 +332,9 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
 
         persist_dag_execution_state(spec.dag_id, node_states)
 
+        if paused_for_signoff:
+            break
+
     log_event(
         run_id=spec.dag_id,
         hypothesis_id="dag_end",
@@ -266,6 +349,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         dag_id=spec.dag_id,
         node_states=node_states,
         failed_nodes=failed_nodes,
+        paused_for_signoff=paused_for_signoff,
     )
 
 

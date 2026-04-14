@@ -15,6 +15,8 @@ Your task:
 2. Draft a fresh, minimal patch that directly addresses the root cause.
 3. If the conflict is genuinely irresolvable (e.g., the intent is ambiguous, contradictory, or requires human clarification), set `resolved: false` and explain clearly.
 
+First, reason step-by-step inside `<think>...</think>` tags — analyse the pattern of failures, identify the root cause, and plan your definitive patch.
+
 ---
 
 Original intent:
@@ -31,7 +33,7 @@ Full error history:
 
 ---
 
-Your ENTIRE response MUST be a single JSON object with no additional text, no explanations, and no code fences:
+After your `</think>` tag, your response MUST be a single JSON object with no additional text, no explanations, and no code fences:
 
 If you CAN resolve the deadlock:
 {{

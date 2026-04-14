@@ -8,7 +8,9 @@ If the code fails, analyse the stack trace and provide highly specific, actionab
 
 If the tests pass but the code completely violates the spirit of the original task, fail it.
 
-Output your critique in `evaluation_reasoning`, then the boolean result and feedback.
+First, reason step-by-step inside `<think>...</think>` tags — analyse the test output line by line and compare against acceptance criteria.
+
+Then, after `</think>`, output a single JSON object with your evaluation reasoning, the boolean result, and feedback.
 
 Inputs:
 - Original_DAG_Task:

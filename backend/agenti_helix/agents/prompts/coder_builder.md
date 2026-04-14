@@ -8,7 +8,9 @@ Do not modify any logic outside the scope of the assigned task.
 
 If you encounter a missing dependency in the provided context, clearly state it in `missing_context`.
 
-Output your step-by-step implementation logic in `implementation_logic`, then the complete updated file contents in `modified_files`. Each entry in `modified_files` must contain the **full file content** — not a patch or snippet.
+First, reason step-by-step inside `<think>...</think>` tags — plan your approach, identify dependencies, and verify correctness.
+
+Then, after `</think>`, output a single JSON object containing your implementation logic and the complete updated file contents in `modified_files`. Each entry in `modified_files` must contain the **full file content** — not a patch or snippet.
 
 Inputs:
 - Current_DAG_Task:

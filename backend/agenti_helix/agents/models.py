@@ -131,7 +131,29 @@ class IntentNodeSpec(BaseModel):
 class IntentCompilerOutput(BaseModel):
     dag_id: Optional[str] = Field(default=None, description="Optional DAG id")
     nodes: List[IntentNodeSpec] = Field(description="DAG nodes")
-    edges: List[List[str]] = Field(description="Edges as [from, to] pairs")
+    edges: List[List[str]] = Field(
+        default_factory=list,
+        description="Edges as [from, to] pairs",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_single_node_or_missing_edges(cls, data: Any) -> Any:
+        """
+        Local models sometimes emit a single node dict at the top level (no `nodes` array),
+        or omit `edges`. Normalize so validation matches the prompt schema.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "nodes" in data:
+            out = dict(data)
+            out.setdefault("edges", [])
+            return out
+        if "node_id" in data and "target_file" in data:
+            dag_id = data.get("dag_id")
+            node = {k: v for k, v in data.items() if k != "dag_id"}
+            return {"dag_id": dag_id, "nodes": [node], "edges": []}
+        return data
 
 
 class SnippetJudgeInput(BaseModel):

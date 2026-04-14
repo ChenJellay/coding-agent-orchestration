@@ -10,7 +10,19 @@ from agenti_helix.agents.registry import get_agent
 from agenti_helix.api.job_registry import TaskCancelledError
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.inference_backends import get_default_inference_backend
-from agenti_helix.runtime.json_utils import extract_first_json_object
+from agenti_helix.runtime.json_utils import extract_first_json_object, try_fallback_snippet_judge_dict
+
+import re
+
+_THINK_EXTRACT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _extract_thinking(raw: str) -> str | None:
+    """Pull out the concatenated contents of all ``<think>`` blocks, or None."""
+    matches = _THINK_EXTRACT_RE.findall(raw)
+    if not matches:
+        return None
+    return "\n---\n".join(m.strip() for m in matches if m.strip()) or None
 
 
 def _llm_trace_enabled() -> bool:
@@ -98,6 +110,9 @@ def run_agent(
     trace_id = obs.get("trace_id") if isinstance(obs.get("trace_id"), str) else None
     dag_id = obs.get("dag_id") if isinstance(obs.get("dag_id"), str) else None
 
+    # Extract thinking content for trace logging (before JSON extraction strips it).
+    thinking_content = _extract_thinking(raw)
+
     def _trace_payload(**extra: Any) -> Dict[str, Any]:
         p, p_trunc = _clip_trace_text(prompt)
         r_out, r_trunc = _clip_trace_text(raw)
@@ -109,11 +124,67 @@ def run_agent(
             "raw_output": r_out,
             "raw_output_truncated": r_trunc,
         }
+        if thinking_content:
+            t, t_trunc = _clip_trace_text(thinking_content)
+            payload["thinking"] = t
+            payload["thinking_truncated"] = t_trunc
         payload.update(extra)
         return payload
 
+    data: Dict[str, Any] | None = None
+    parse_exc: Exception | None = None
     try:
         data = extract_first_json_object(raw)
+    except Exception as exc:
+        parse_exc = exc
+        if agent_id == "judge_v1":
+            fb = try_fallback_snippet_judge_dict(raw)
+            if fb is not None:
+                data = fb
+                parse_exc = None
+                # region agent log
+                try:
+                    _p = "/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-18115f.log"
+                    import time as _time
+
+                    with open(_p, "a", encoding="utf-8") as _df:
+                        _df.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "18115f",
+                                    "timestamp": int(_time.time() * 1000),
+                                    "location": "agent_runtime.py:run_agent",
+                                    "message": "judge_v1_json_fallback_used",
+                                    "data": {"verdict": fb.get("verdict"), "agent_id": agent_id},
+                                    "hypothesisId": "H3",
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                except OSError:
+                    pass
+                # endregion
+
+    if parse_exc is not None:
+        if _llm_trace_enabled():
+            log_event(
+                run_id=run_id_log,
+                hypothesis_id=hyp_log,
+                location=loc_log,
+                message="LLM inference (parse/validation failed)",
+                data=_trace_payload(
+                    error=str(parse_exc),
+                    parsed_output=None,
+                ),
+                trace_id=trace_id,
+                dag_id=dag_id,
+            )
+        raise parse_exc
+
+    assert data is not None
+
+    try:
         output_model: type[BaseModel] = agent.output_model
         typed = output_model.model_validate(data)
         result = typed.model_dump()

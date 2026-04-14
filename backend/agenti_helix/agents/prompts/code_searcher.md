@@ -30,7 +30,9 @@ target_files:     {target_files}
 5. Limit output to the 20 most relevant matches. If there are more, note the total count.
 
 ## Output
-Respond with **only** a JSON object — no prose, no markdown fences.
+First, reason step-by-step inside `<think>...</think>` tags — plan your search strategy and mentally apply the pattern.
+
+Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
 {

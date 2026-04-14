@@ -35,7 +35,9 @@ resolution_summary:   {resolution_summary}
 If `final_verdict` is `"ESCALATED"`, write the episode anyway — document what the human resolved and why the agent couldn't do it autonomously. This is the most valuable type of episode.
 
 ## Output
-Respond with **only** a JSON object — no prose, no markdown fences.
+First, reason step-by-step inside `<think>...</think>` tags — identify the root cause, turning point, and generalisable patterns.
+
+Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
 {

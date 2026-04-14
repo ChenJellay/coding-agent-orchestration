@@ -33,6 +33,8 @@ import {
   rerunTask,
   updateAgentPrompt,
   mergeTask,
+  applyNodeSignoff,
+  resumeDag,
   startDagFromDashboard,
   type PipelineMode,
 } from './lib/api'
@@ -1109,7 +1111,12 @@ function FeatureDagPage() {
             {Object.keys(nodes).map((nodeId) => {
               const s = stateNodes[nodeId]
               const tone = nodeTone(s?.status, s?.verification_status ?? null)
-              const retry = s?.attempts ? ` · ${s.attempts}x` : ''
+              const tryLabel =
+                typeof s?.verification_cycle === 'number' && s.verification_cycle > 0
+                  ? ` · try ${s.verification_cycle}`
+                  : s?.attempts
+                    ? ` · ${s.attempts}x`
+                    : ''
               return (
                 <span
                   key={nodeId}
@@ -1123,7 +1130,7 @@ function FeatureDagPage() {
                   }}
                   style={{ cursor: 'pointer' }}
                 >
-                  <NodePill tone={tone} label={`${nodeId}${retry}`} />
+                  <NodePill tone={tone} label={`${nodeId}${tryLabel}`} />
                 </span>
               )
             })}
@@ -1482,6 +1489,7 @@ function SignoffTripanePage() {
   const [memory, setMemory] = useState<MemoryResponse | null>(null)
   const [memoryError, setMemoryError] = useState<string | null>(null)
   const [mergeCandidate, setMergeCandidate] = useState<Checkpoint | null>(null)
+  const [pendingSignoff, setPendingSignoff] = useState<{ checkpoint: Checkpoint; nodeId: string } | null>(null)
 
   useEffect(() => {
     if (!featureId) return
@@ -1556,6 +1564,41 @@ function SignoffTripanePage() {
     }
   }
 
+  async function handleApplySignoff() {
+    if (!featureId || !pendingSignoff) {
+      setActionError('No judge-approved change is waiting for sign-off (patch pipeline).')
+      return
+    }
+    setActionError(null)
+    setBusy(true)
+    try {
+      await applyNodeSignoff({
+        dag_id: featureId,
+        node_id: pendingSignoff.nodeId,
+        task_id: pendingSignoff.checkpoint.task_id,
+        checkpoint_id: pendingSignoff.checkpoint.checkpoint_id,
+      })
+      await resumeDag(featureId)
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleResumeDagOnly() {
+    if (!featureId) return
+    setActionError(null)
+    setBusy(true)
+    try {
+      await resumeDag(featureId)
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function handleMergeToMain() {
     if (!mergeCandidate) {
       setActionError('No verified checkpoint available yet for merge.')
@@ -1613,6 +1656,28 @@ function SignoffTripanePage() {
             }}
           >
             View episodic memory
+          </a>
+          <a
+            className="pill"
+            href="#"
+            onClick={(e) => {
+              e.preventDefault()
+              if (busy) return
+              void handleApplySignoff()
+            }}
+          >
+            {busy ? 'Working…' : 'Apply sign-off & resume DAG'}
+          </a>
+          <a
+            className="pill"
+            href="#"
+            onClick={(e) => {
+              e.preventDefault()
+              if (busy) return
+              void handleResumeDagOnly()
+            }}
+          >
+            Resume DAG only
           </a>
           <a
             className="pill"
@@ -1716,7 +1781,11 @@ function SignoffTripanePage() {
           <div style={{ color: 'var(--muted)', fontSize: 12 }}>
             v1 shows the latest checkpoint diff per task (starting with the most recent checkpoint across all tasks).
           </div>
-          <SignoffDiffBlock feature={feature} onLatestCheckpoint={setMergeCandidate} />
+          <SignoffDiffBlock
+            feature={feature}
+            onLatestCheckpoint={setMergeCandidate}
+            onPendingSignoff={setPendingSignoff}
+          />
         </section>
       </div>
 
@@ -1753,9 +1822,11 @@ function SignoffTripanePage() {
 function SignoffDiffBlock({
   feature,
   onLatestCheckpoint,
+  onPendingSignoff,
 }: {
   feature: FeatureDetails | null
   onLatestCheckpoint?: (cp: Checkpoint | null) => void
+  onPendingSignoff?: (pick: { checkpoint: Checkpoint; nodeId: string } | null) => void
 }) {
   const [cp, setCp] = useState<Checkpoint | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -1765,21 +1836,37 @@ function SignoffDiffBlock({
     async function load() {
       try {
         setError(null)
-        const taskIds = Object.values(feature?.dag.nodes ?? {}).map((n) => n.task.task_id)
-        if (taskIds.length === 0) {
+        const nodeEntries = Object.entries(feature?.dag.nodes ?? {})
+        if (nodeEntries.length === 0) {
           setCp(null)
+          onLatestCheckpoint?.(null)
+          onPendingSignoff?.(null)
           return
         }
-        const all: Checkpoint[] = []
-        for (const tid of taskIds.slice(0, 10)) {
-          const cps = await fetchCheckpoints({ task_id: tid, limit: 1 })
-          if (cps[0]) all.push(cps[0])
+        const latestPerNode: Array<{ nodeId: string; cp: Checkpoint }> = []
+        let pending: { checkpoint: Checkpoint; nodeId: string } | null = null
+        let mergeEligible: Checkpoint | null = null
+
+        for (const [nodeId, n] of nodeEntries.slice(0, 12)) {
+          const cps = await fetchCheckpoints({ task_id: n.task.task_id, limit: 8 })
+          if (cps[0]) latestPerNode.push({ nodeId, cp: cps[0] })
+          for (const c of cps) {
+            if (c.status === 'PASSED_PENDING_SIGNOFF' && !pending) {
+              pending = { checkpoint: c, nodeId }
+            }
+            if (c.status === 'PASSED' && !mergeEligible) {
+              mergeEligible = c
+            }
+          }
         }
-        all.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))
-        const chosen = all[0] ?? null
+
+        latestPerNode.sort((a, b) => (b.cp.updated_at ?? 0) - (a.cp.updated_at ?? 0))
+        const display = pending?.checkpoint ?? latestPerNode[0]?.cp ?? null
+
         if (!cancelled) {
-          setCp(chosen)
-          onLatestCheckpoint?.(chosen)
+          setCp(display)
+          onLatestCheckpoint?.(mergeEligible)
+          onPendingSignoff?.(pending)
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -1789,7 +1876,7 @@ function SignoffDiffBlock({
     return () => {
       cancelled = true
     }
-  }, [feature?.feature_id, feature?.dag.nodes, onLatestCheckpoint])
+  }, [feature?.feature_id, feature?.dag.nodes, onLatestCheckpoint, onPendingSignoff])
 
   if (error) return <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 10 }}>{error}</div>
   return (

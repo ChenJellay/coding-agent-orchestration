@@ -15,6 +15,8 @@ from agenti_helix.api.paths import PATHS
 class VerificationStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
+    # Judge approved patch pipeline output; workspace rolled back until human sign-off applies it.
+    PASSED_PENDING_SIGNOFF = "PASSED_PENDING_SIGNOFF"
     PASSED = "PASSED"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
@@ -143,6 +145,28 @@ def snapshot_file(path: Path) -> str:
 def restore_file_from_snapshot(path: Path, snapshot: str) -> None:
     """Restore a file to a previous snapshot."""
     path.write_text(snapshot)
+
+
+def apply_signed_off_checkpoint(*, task: EditTaskSpec, checkpoint: Checkpoint, signed_by: Optional[str] = None) -> None:
+    """
+    Materialize judge-approved content from a staged checkpoint onto disk.
+
+    Expects ``PASSED_PENDING_SIGNOFF`` with ``post_state_ref`` holding the full proposed file body
+    (patch pipeline). Idempotent if the file already matches ``post_state_ref``.
+    """
+    if checkpoint.status is not VerificationStatus.PASSED_PENDING_SIGNOFF:
+        raise ValueError(f"Checkpoint must be PASSED_PENDING_SIGNOFF, got {checkpoint.status!r}")
+    if not checkpoint.post_state_ref:
+        raise ValueError("Checkpoint has no post_state_ref to apply")
+
+    target_path = Path(task.repo_path).resolve() / task.target_file
+    target_path.write_text(checkpoint.post_state_ref, encoding="utf-8")
+
+    logs = dict(checkpoint.tool_logs or {})
+    logs["manual_signoff"] = {"signed_by": signed_by or "anonymous", "applied_at": time.time()}
+    checkpoint.tool_logs = logs
+    checkpoint.status = VerificationStatus.PASSED
+    save_checkpoint(checkpoint)
 
 
 def rollback_to_checkpoint(

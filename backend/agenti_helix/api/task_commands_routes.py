@@ -26,6 +26,7 @@ from agenti_helix.verification.checkpointing import (
     EditTaskSpec,
     Checkpoint,
     VerificationStatus,
+    apply_signed_off_checkpoint,
     load_checkpoint,
     rollback_to_checkpoint,
 )
@@ -178,6 +179,14 @@ def _run_rerun_job(
             verification_status=cp_status,
             bump_attempts=False,
         )
+    elif cp_status == VerificationStatus.PASSED_PENDING_SIGNOFF:
+        _set_node_state(
+            dag_id=dag_id,
+            node_id=node_id,
+            status=DagNodeStatus.AWAITING_SIGNOFF,
+            verification_status=cp_status,
+            bump_attempts=False,
+        )
     else:
         _set_node_state(
             dag_id=dag_id,
@@ -275,6 +284,12 @@ class MergeRequestBody(BaseModel):
     checkpoint_id: str
     target_branch: Optional[str] = "main"
     commit_message: Optional[str] = None
+
+
+class SignoffApplyRequestBody(BaseModel):
+    task_id: str
+    checkpoint_id: str
+    signed_by: Optional[str] = Field(default=None, description="Optional reviewer id or display name for audit trail.")
 
 
 @router.post("/api/tasks/rerun")
@@ -589,6 +604,90 @@ def get_episodic_memory(query: str = "", limit: int = 25) -> Dict[str, Any]:
     )
 
     return {"summary": summary, "total": total, "items": items}
+
+
+@router.post("/api/dags/{dag_id}/nodes/{node_id}/signoff-apply")
+def apply_node_signoff(
+    dag_id: str,
+    node_id: str,
+    body: SignoffApplyRequestBody,
+    _role: Role = Depends(require_editor),
+) -> Dict[str, Any]:
+    """
+    Materialize a judge-approved patch after manual sign-off (patch pipeline only).
+
+    Expects checkpoint status ``PASSED_PENDING_SIGNOFF`` with staged ``post_state_ref``.
+    """
+    try:
+        ref = find_task_ref(task_id=body.task_id, feature_id=dag_id, node_id=node_id)
+    except KeyError:
+        raise_http_error(code="task_not_found", message="Unknown task_id for this DAG/node", status_code=404)
+    except RuntimeError as exc:
+        raise_http_error(code="task_lookup_error", message=str(exc), status_code=500)
+
+    try:
+        checkpoint = load_checkpoint(body.checkpoint_id)
+    except FileNotFoundError:
+        raise_http_error(code="checkpoint_not_found", message="Unknown checkpoint_id", status_code=404)
+
+    if checkpoint.task_id != ref.task.task_id:
+        raise_http_error(code="checkpoint_mismatch", message="checkpoint_id does not belong to task_id", status_code=409)
+
+    if checkpoint.status != VerificationStatus.PASSED_PENDING_SIGNOFF:
+        raise_http_error(
+            code="checkpoint_not_staged",
+            message="Checkpoint must be PASSED_PENDING_SIGNOFF (judge-approved, not yet applied)",
+            status_code=409,
+        )
+
+    try:
+        apply_signed_off_checkpoint(task=ref.task, checkpoint=checkpoint, signed_by=body.signed_by)
+    except ValueError as exc:
+        raise_http_error(code="signoff_apply_failed", message=str(exc), status_code=409)
+
+    _set_node_state(
+        dag_id=dag_id,
+        node_id=node_id,
+        status=DagNodeStatus.PASSED_VERIFICATION,
+        verification_status=VerificationStatus.PASSED,
+        bump_attempts=False,
+    )
+    invalidate_features_and_triage_caches()
+
+    log_event(
+        run_id=dag_id,
+        hypothesis_id=node_id,
+        location="agenti_helix/api/task_commands_routes.py:apply_node_signoff",
+        message="Manual sign-off applied — workspace updated to staged post-state",
+        data={"task_id": body.task_id, "checkpoint_id": body.checkpoint_id},
+    )
+
+    return {"ok": True}
+
+
+@router.post("/api/dags/{dag_id}/resume")
+def resume_dag_execution(dag_id: str, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
+    """
+    Continue DAG execution after upstream nodes reached ``PASSED_VERIFICATION``
+    (e.g. following ``signoff-apply`` on an ``AWAITING_SIGNOFF`` node).
+    """
+    try:
+        spec = load_dag_spec(dag_id)
+    except FileNotFoundError:
+        raise_http_error(code="dag_not_found", message=f"DAG not found for dag_id={dag_id!r}", status_code=404)
+
+    start_background_job(
+        meta={"dag_id": dag_id, "action": "resume-dag"},
+        target=lambda _cancel_token: execute_dag(spec),
+    )
+    log_event(
+        run_id=dag_id,
+        hypothesis_id="resume",
+        location="agenti_helix/api/task_commands_routes.py:resume_dag_execution",
+        message="DAG resume scheduled",
+        data={"dag_id": dag_id},
+    )
+    return {"ok": True}
 
 
 @router.post("/api/tasks/merge")

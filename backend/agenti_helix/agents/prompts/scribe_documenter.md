@@ -6,7 +6,9 @@ Write a professional, concise Git commit message following conventional commit s
 
 Summarize the key architectural decisions made during execution to link back to the original business intent.
 
-Output your summary reasoning in `summary_reasoning`, then the commit message and a 2–3 sentence semantic trace log.
+First, reason step-by-step inside `<think>...</think>` tags — trace the intent through the DAG execution to extract key decisions.
+
+Then, after `</think>`, output a single JSON object with your summary reasoning, commit message, and semantic trace log.
 
 Inputs:
 - Helix_Intent:

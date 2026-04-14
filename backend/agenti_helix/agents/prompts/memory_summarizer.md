@@ -30,7 +30,9 @@ Attempt number: {attempt}
 
 ## Output Format
 
-Respond with ONLY valid JSON — no markdown fences, no preamble:
+First, reason step-by-step inside `<think>...</think>` tags — identify patterns across failures and distil actionable constraints.
+
+Then, after `</think>`, respond with ONLY valid JSON — no markdown fences, no preamble:
 
 {
   "compressed_summary": "...",

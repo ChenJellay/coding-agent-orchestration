@@ -28,7 +28,9 @@ acceptance_criteria:  {acceptance_criteria}
 6. Write a `task_relevance_summary`: one paragraph explaining how this doc applies to the current task and what the coder should do differently because of it.
 
 ## Output
-Respond with **only** a JSON object — no prose, no markdown fences.
+First, reason step-by-step inside `<think>...</think>` tags — identify which parts of the doc are relevant to the task and extract actionable constraints.
+
+Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
 {
