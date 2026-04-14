@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import os
+import re
+import time
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 
 def _mlx_max_tokens_default() -> int:
@@ -26,12 +27,71 @@ def _mlx_inference_timeout() -> Optional[float]:
         return 300.0
 
 
+def _mlx_stream_progress_interval() -> int:
+    """How many tokens between llm_progress event writes (0 = disabled)."""
+    return int(os.environ.get("AGENTI_HELIX_MLX_PROGRESS_INTERVAL", "50"))
+
+
 def _openai_max_tokens_default() -> int:
     return int(os.environ.get("OPENAI_MAX_TOKENS", "8192"))
 
 
+# ---------------------------------------------------------------------------
+# Think-block stripping
+# ---------------------------------------------------------------------------
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove <think>…</think> blocks from model output and strip surrounding whitespace."""
+    return _THINK_RE.sub("", text).strip()
+
+
+def _apply_no_think_template(prompt: str, tokenizer: Any) -> str:
+    """Wrap the rendered prompt in a chat template with thinking disabled.
+
+    Qwen3 / Qwen3.5 support ``enable_thinking=False`` in apply_chat_template,
+    which injects an empty ``<think>\\n\\n</think>\\n\\n`` prefix into the
+    assistant turn.  This tells the model to skip extended reasoning and emit
+    the answer directly.
+
+    Falls back to the original prompt string if the tokenizer does not support
+    this parameter (e.g., older tokenizer versions, non-Qwen models).
+    """
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        formatted: str = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        return formatted
+    except (TypeError, AttributeError):
+        # Tokenizer doesn't support enable_thinking — use raw prompt.
+        return prompt
+
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+
 class InferenceBackend(Protocol):
-    def generate(self, prompt: str, *, max_tokens: Optional[int], temperature: float) -> str: ...
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: Optional[int],
+        temperature: float,
+        on_progress: Optional[Callable[[int, float, str], None]] = None,
+    ) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# MLX local
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -90,34 +150,89 @@ class MLXLocalInferenceBackend:
         _CACHED_MODEL_ID = self._cfg.model_path
         return model, tokenizer
 
-    def generate(self, prompt: str, *, max_tokens: Optional[int], temperature: float) -> str:
-        # Import lazily so this module can be imported in environments without MLX deps.
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: Optional[int],
+        temperature: float,
+        on_progress: Optional[Callable[[int, float, str], None]] = None,
+    ) -> str:
+        """Run inference, returning only the answer (think blocks stripped).
+
+        Key behaviours:
+        - Wraps the prompt in a Qwen3/3.5 no-think chat template so the model
+          skips extended reasoning and emits the answer directly.
+        - Uses stream_generate so we can fire on_progress callbacks every
+          AGENTI_HELIX_MLX_PROGRESS_INTERVAL tokens (default 50).
+        - Enforces AGENTI_HELIX_MLX_TIMEOUT_SECONDS (default 300 s) by checking
+          elapsed time inside the streaming loop, then raising TimeoutError.
+        """
         import mlx_lm  # type: ignore
 
         model, tokenizer = self._get_mlx_model()
         mt = max_tokens if max_tokens is not None else _mlx_max_tokens_default()
-        make_sampler = getattr(mlx_lm, "make_sampler", None)
-
-        def _run_generate() -> str:
-            if callable(make_sampler):
-                sampler = make_sampler(temp=float(temperature))
-                return str(mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=mt, sampler=sampler))
-            # Older mlx_lm versions may not accept sampler.
-            return str(mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=mt))
-
+        progress_interval = _mlx_stream_progress_interval()
         timeout = _mlx_inference_timeout()
-        if timeout is None:
-            return _run_generate()
 
+        # Apply no-think template so Qwen3/3.5 skips the <think>…</think> block.
+        formatted_prompt = _apply_no_think_template(prompt, tokenizer)
+
+        make_sampler = getattr(mlx_lm, "make_sampler", None)
+        sampler_kwargs: dict[str, Any] = {}
+        if callable(make_sampler):
+            sampler_kwargs["sampler"] = make_sampler(temp=float(temperature))
+
+        def _stream() -> str:
+            chunks: list[str] = []
+            start = time.monotonic()
+            last_progress = 0
+
+            for response in mlx_lm.stream_generate(
+                model,
+                tokenizer,
+                prompt=formatted_prompt,
+                max_tokens=mt,
+                **sampler_kwargs,
+            ):
+                chunks.append(response.text)
+                n = response.generation_tokens
+
+                # Wall-clock timeout check (fires mid-stream, not just at start).
+                if timeout is not None and (time.monotonic() - start) > timeout:
+                    raise TimeoutError(
+                        f"MLX inference timed out after {timeout:.0f} s "
+                        f"({n} tokens generated). "
+                        "Increase AGENTI_HELIX_MLX_TIMEOUT_SECONDS or set to 0 to disable."
+                    )
+
+                # Periodic progress callback.
+                if on_progress and progress_interval > 0 and n - last_progress >= progress_interval:
+                    last_progress = n
+                    snippet = "".join(chunks)[-120:]  # last 120 chars for a preview
+                    on_progress(n, response.generation_tps, snippet)
+
+            raw = "".join(chunks)
+            return strip_think_blocks(raw)
+
+        # Run the streaming loop in a background thread so the caller's thread
+        # stays responsive and we can enforce the timeout from outside if needed.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_run_generate)
+            future = pool.submit(_stream)
             try:
-                return future.result(timeout=timeout)
+                # Give an extra 10 s grace over the in-loop timeout for cleanup.
+                outer_timeout = (timeout + 10) if timeout is not None else None
+                return future.result(timeout=outer_timeout)
             except concurrent.futures.TimeoutError:
                 raise TimeoutError(
-                    f"MLX inference timed out after {timeout:.0f} s. "
+                    f"MLX inference timed out after {timeout:.0f} s (outer guard). "
                     "Increase AGENTI_HELIX_MLX_TIMEOUT_SECONDS or set to 0 to disable."
                 )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible HTTP
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -140,7 +255,14 @@ class OpenAIChatBackend:
     def __init__(self, cfg: OpenAIConfig) -> None:
         self._cfg = cfg
 
-    def generate(self, prompt: str, *, max_tokens: Optional[int], temperature: float) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: Optional[int],
+        temperature: float,
+        on_progress: Optional[Callable[[int, float, str], None]] = None,
+    ) -> str:
         try:
             import httpx  # type: ignore
         except ImportError as exc:  # pragma: no cover
@@ -162,6 +284,11 @@ class OpenAIChatBackend:
         response.raise_for_status()
         data = response.json()
         return str(data["choices"][0]["message"]["content"])
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 
 def get_default_inference_backend(runtime_cfg: Optional[dict[str, Any]] = None) -> InferenceBackend:
@@ -198,4 +325,3 @@ def get_default_inference_backend(runtime_cfg: Optional[dict[str, Any]] = None) 
         f"Unknown inference backend_type={backend_type!r}. "
         "Supported values: 'mlx_local', 'openai'."
     )
-

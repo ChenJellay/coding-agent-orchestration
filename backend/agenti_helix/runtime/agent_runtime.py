@@ -97,18 +97,40 @@ def run_agent(
     if "backend_type" in runtime_cfg:
         inference_backend_cfg["backend_type"] = runtime_cfg["backend_type"]
 
-    backend = get_default_inference_backend(inference_backend_cfg)
-    raw = backend.generate(prompt, max_tokens=max_tokens, temperature=temperature)
-
-    if _is_cancelled(cancel_token):
-        raise TaskCancelledError("Agent run cancelled after inference")
-
     obs = observe or {}
     run_id_log = str(obs.get("run_id") or "_llm")
     hyp_log = str(obs.get("hypothesis_id") or agent_id)
     loc_log = str(obs.get("location") or "agent_runtime:run_agent")
     trace_id = obs.get("trace_id") if isinstance(obs.get("trace_id"), str) else None
     dag_id = obs.get("dag_id") if isinstance(obs.get("dag_id"), str) else None
+
+    backend = get_default_inference_backend(inference_backend_cfg)
+
+    # Build a progress callback that writes llm_progress events to the event log
+    # every N tokens so the frontend can show live generation status.
+    def _on_progress(token_count: int, tps: float, snippet: str) -> None:
+        if not _llm_trace_enabled():
+            return
+        log_event(
+            run_id=run_id_log,
+            hypothesis_id=hyp_log,
+            location=loc_log,
+            message="LLM inference in progress",
+            data={
+                "kind": "llm_progress",
+                "agent_id": agent_id,
+                "token_count": token_count,
+                "tokens_per_second": round(tps, 1),
+                "partial_tail": snippet,
+            },
+            trace_id=trace_id,
+            dag_id=dag_id,
+        )
+
+    raw = backend.generate(prompt, max_tokens=max_tokens, temperature=temperature, on_progress=_on_progress)
+
+    if _is_cancelled(cancel_token):
+        raise TaskCancelledError("Agent run cancelled after inference")
 
     # Extract thinking content for trace logging (before JSON extraction strips it).
     thinking_content = _extract_thinking(raw)
