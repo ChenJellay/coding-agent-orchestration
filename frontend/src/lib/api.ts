@@ -335,12 +335,23 @@ export async function fetchMemory(params: { runId: string; limit?: number }): Pr
   return await getJson<MemoryResponse>(`/api/memory?runId=${encodeURIComponent(params.runId)}${suffix}`)
 }
 
+export async function applyNodeSignoff(params: {
+  dag_id: string
+  node_id: string
+  task_id: string
+  checkpoint_id: string
+  signed_by?: string
+}): Promise<{ ok: true }> {
+  const { dag_id, node_id, ...body } = params
+  return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/nodes/${encodeURIComponent(node_id)}/signoff-apply`, body)
+}
+
 export async function mergeTask(params: {
   task_id: string
   checkpoint_id: string
   target_branch?: string
   commit_message?: string
-}): Promise<{ ok: true; mergeRef?: string }> {
+}): Promise<{ ok: true; mergeRef?: string; sha?: string; simulated?: boolean }> {
   return await postJson('/api/tasks/merge', params)
 }
 

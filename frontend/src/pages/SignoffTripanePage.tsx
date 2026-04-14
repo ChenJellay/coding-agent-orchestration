@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
+  applyNodeSignoff,
   editDagIntent,
   fetchCheckpoints,
   fetchEvents,
@@ -79,6 +80,7 @@ export function SignoffTripanePage() {
   const [memory, setMemory] = useState<MemoryResponse | null>(null)
   const [memoryError, setMemoryError] = useState<string | null>(null)
   const [mergeCandidate, setMergeCandidate] = useState<Checkpoint | null>(null)
+  const [mergeResult, setMergeResult] = useState<{ mergeRef?: string; sha?: string; simulated?: boolean } | null>(null)
 
   useEffect(() => {
     if (!featureId) return
@@ -159,14 +161,32 @@ export function SignoffTripanePage() {
       return
     }
     setActionError(null)
+    setMergeResult(null)
     setBusy(true)
     try {
-      await mergeTask({
+      // The patch pipeline produces PASSED_PENDING_SIGNOFF checkpoints.
+      // signoff-apply must be called first to materialise the staged file on disk
+      // and transition the checkpoint to PASSED before the merge endpoint will accept it.
+      if (mergeCandidate.status === 'PASSED_PENDING_SIGNOFF') {
+        // task_id format is "{dag_id}:{node_id}" e.g. "header-color-update:N1"
+        const colonIdx = mergeCandidate.task_id.lastIndexOf(':')
+        const dag_id = colonIdx > 0 ? mergeCandidate.task_id.slice(0, colonIdx) : mergeCandidate.task_id
+        const node_id = colonIdx > 0 ? mergeCandidate.task_id.slice(colonIdx + 1) : 'N1'
+        await applyNodeSignoff({
+          dag_id,
+          node_id,
+          task_id: mergeCandidate.task_id,
+          checkpoint_id: mergeCandidate.checkpoint_id,
+          signed_by: 'ui-user',
+        })
+      }
+      const res = await mergeTask({
         task_id: mergeCandidate.task_id,
         checkpoint_id: mergeCandidate.checkpoint_id,
         target_branch: 'main',
-        commit_message: 'Merge verified checkpoint',
+        commit_message: `feat(agenti): ${feature?.dag.macro_intent?.slice(0, 72) ?? mergeCandidate.task_id}`,
       })
+      setMergeResult(res)
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -231,6 +251,27 @@ export function SignoffTripanePage() {
       </div>
 
       {error ? <ErrorBox title="Failed to load sign-off view" error={error} /> : null}
+      {actionError ? <ErrorBox title="Action failed" error={actionError} /> : null}
+      {mergeResult ? (
+        <div style={{
+          margin: '0 0 4px',
+          padding: '10px 14px',
+          borderRadius: 12,
+          border: '1px solid rgba(46, 160, 67, 0.4)',
+          background: 'rgba(46, 160, 67, 0.08)',
+          fontSize: 12,
+          color: 'var(--text)',
+          display: 'flex',
+          gap: 10,
+          alignItems: 'center',
+        }}>
+          <span style={{ color: 'rgba(46, 160, 67, 1)', fontWeight: 700 }}>✓ Merged</span>
+          {mergeResult.simulated
+            ? <span style={{ color: 'var(--muted)' }}>Simulated merge (set AGENTI_HELIX_GIT_COMMIT_ENABLED=true for real git commits)</span>
+            : <span>Real git commit: <code style={{ fontFamily: 'var(--mono)' }}>{mergeResult.sha?.slice(0, 8)}</code></span>}
+          {mergeResult.mergeRef ? <span style={{ color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 11 }}>{mergeResult.mergeRef}</span> : null}
+        </div>
+      ) : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
