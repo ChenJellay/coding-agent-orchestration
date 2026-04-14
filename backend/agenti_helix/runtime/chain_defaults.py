@@ -45,7 +45,9 @@ def default_coder_chain(task: Any | None = None) -> Dict[str, Any]:
                     "target_file": {"$ref": "target_file"},
                     "target_file_content": {"$ref": "target_file_content"},
                 },
-                "runtime": {"temperature": 0.0},
+                # Patch output is a small JSON object (startLine/endLine/replacementLines).
+                # Cap at 1024 tokens to prevent runaway generation.
+                "runtime": {"temperature": 0.0, "max_tokens": 1024},
             },
             {
                 "type": "tool",
@@ -106,7 +108,9 @@ def default_judge_chain(task: Any | None = None) -> Dict[str, Any]:
                     "language": {"$ref": "language"},
                     "tool_logs_json": {"$ref": "tool_logs_json"},
                 },
-                "runtime": {"temperature": 0.0},
+                # Judge output is a JSON verdict + reasoning. Historical max ~17K chars
+                # (~4K tokens). Cap at 6144 to handle verbose outputs without runaway.
+                "runtime": {"temperature": 0.0, "max_tokens": 6144},
             },
         ]
     }
@@ -143,7 +147,7 @@ def default_full_pipeline_coder_chain(task: Any | None = None) -> Dict[str, Any]
                     "dag_task": {"$ref": "intent"},
                     "ast_repo_map_json": {"$ref": "ast_repo_map_ctx.ast_repo_map_json"},
                 },
-                "runtime": {"temperature": 0.0},
+                "runtime": {"temperature": 0.0, "max_tokens": 2048},
             },
             # 3. Load file contents identified by the librarian.
             {
@@ -172,7 +176,7 @@ def default_full_pipeline_coder_chain(task: Any | None = None) -> Dict[str, Any]
                         "Ensure tests fail before the implementation exists."
                     ),
                 },
-                "runtime": {"temperature": 0.1},
+                "runtime": {"temperature": 0.1, "max_tokens": 4096},
             },
             # 5. Coder Builder: implement the feature.
             {
@@ -185,7 +189,7 @@ def default_full_pipeline_coder_chain(task: Any | None = None) -> Dict[str, Any]
                     "acceptance_criteria": {"$ref": "acceptance_criteria"},
                     "file_contexts_json": {"$ref": "file_contexts.file_contexts_json"},
                 },
-                "runtime": {"temperature": 0.0},
+                "runtime": {"temperature": 0.0, "max_tokens": 8192},
             },
             # 6. Write all files (code + tests) to disk; output becomes diff_json.
             {
@@ -243,7 +247,7 @@ def default_full_pipeline_judge_chain(task: Any | None = None) -> Dict[str, Any]
                     "diff_json": {"$ref": "diff_json.diff_json_str"},
                     "repo_rules_text": {"$ref": "rules.repo_rules_text"},
                 },
-                "runtime": {"temperature": 0.0},
+                "runtime": {"temperature": 0.0, "max_tokens": 2048},
             },
             # 4. Judge Evaluator: assess test results against acceptance criteria.
             {
@@ -258,7 +262,7 @@ def default_full_pipeline_judge_chain(task: Any | None = None) -> Dict[str, Any]
                     "sdet_tests_json": {"$ref": "diff_json.diff_json_str"},
                     "terminal_logs": {"$ref": "test_results.terminal_logs"},
                 },
-                "runtime": {"temperature": 0.0},
+                "runtime": {"temperature": 0.0, "max_tokens": 4096},
             },
             # 5. Map to the verdict shape expected by the verification loop.
             {
@@ -302,7 +306,9 @@ def default_intent_compiler_chain() -> Dict[str, Any]:
                     "repo_path": {"$ref": "repo_path"},
                     "repo_map_json": {"$ref": "repo_map_ctx.repo_map_json"},
                 },
-                "runtime": {"temperature": 0.0},
+                # Intent compiler produces a DAG spec JSON (nodes + edges).
+                # Historical max ~16K chars (~4K tokens). Cap at 6144 with headroom.
+                "runtime": {"temperature": 0.0, "max_tokens": 6144},
             }
         ]
     }

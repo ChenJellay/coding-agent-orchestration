@@ -1,13 +1,29 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
+
 def _mlx_max_tokens_default() -> int:
     """Generation ceiling when callers omit max_tokens (read at call time for correct env/tests)."""
     return int(os.environ.get("AGENTI_HELIX_MLX_MAX_TOKENS", "262144"))
+
+
+def _mlx_inference_timeout() -> Optional[float]:
+    """Wall-clock timeout in seconds for a single MLX generate() call.
+
+    Defaults to 300 s (5 min).  Set AGENTI_HELIX_MLX_TIMEOUT_SECONDS=0 to
+    disable the timeout entirely.
+    """
+    raw = os.environ.get("AGENTI_HELIX_MLX_TIMEOUT_SECONDS", "300").strip()
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return 300.0
 
 
 def _openai_max_tokens_default() -> int:
@@ -79,28 +95,29 @@ class MLXLocalInferenceBackend:
         import mlx_lm  # type: ignore
 
         model, tokenizer = self._get_mlx_model()
-        # None = no practical cap for local models (large ceiling; generation ends at EOS).
         mt = max_tokens if max_tokens is not None else _mlx_max_tokens_default()
         make_sampler = getattr(mlx_lm, "make_sampler", None)
-        if callable(make_sampler):
-            sampler = make_sampler(temp=float(temperature))
-            content = mlx_lm.generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=mt,
-                sampler=sampler,
-            )
-        else:
-            # Older mlx_lm versions may not accept sampler.
-            content = mlx_lm.generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=mt,
-            )
 
-        return str(content)
+        def _run_generate() -> str:
+            if callable(make_sampler):
+                sampler = make_sampler(temp=float(temperature))
+                return str(mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=mt, sampler=sampler))
+            # Older mlx_lm versions may not accept sampler.
+            return str(mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=mt))
+
+        timeout = _mlx_inference_timeout()
+        if timeout is None:
+            return _run_generate()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run_generate)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"MLX inference timed out after {timeout:.0f} s. "
+                    "Increase AGENTI_HELIX_MLX_TIMEOUT_SECONDS or set to 0 to disable."
+                )
 
 
 @dataclass(frozen=True)
