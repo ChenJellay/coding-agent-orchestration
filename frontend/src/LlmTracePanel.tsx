@@ -87,10 +87,10 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
 
     async function pollOnce() {
       try {
-        const batch = await fetchEvents({ limit: 800 })
+        const result = await fetchEvents({ limit: 800 })
         if (!cancelled) {
           setPollError(null)
-          setEvents(batch)
+          setEvents(result.items)
         }
       } catch (e) {
         if (!cancelled) setPollError(e instanceof Error ? e.message : String(e))
