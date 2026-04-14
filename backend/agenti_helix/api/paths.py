@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -68,4 +68,39 @@ def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
                 continue
             if isinstance(payload, dict):
                 yield payload
+
+
+def iter_jsonl_from_offset(path: Path, byte_offset: int) -> Tuple[Iterator[Dict[str, Any]], int]:
+    """Read new JSONL records starting at `byte_offset`.
+
+    Returns (iterator_of_dicts, new_byte_offset) so callers can resume
+    from where they left off without re-scanning the full file.
+    """
+    if not path.exists():
+        return iter(()), byte_offset
+
+    file_size = path.stat().st_size
+    if byte_offset >= file_size:
+        return iter(()), file_size
+
+    with path.open("rb") as f:
+        f.seek(byte_offset)
+        raw = f.read()
+
+    new_offset = byte_offset + len(raw)
+    text = raw.decode("utf-8", errors="replace")
+
+    records: list[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+
+    return iter(records), new_offset
 

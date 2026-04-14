@@ -230,10 +230,20 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
             else:
                 node_state.status = DagNodeStatus.FAILED
                 failed_nodes.append(node_id)
-        except Exception:
+        except Exception as exc:
+            import traceback  # noqa: PLC0415
             node_state.status = DagNodeStatus.FAILED
             node_state.verification_status = None
             failed_nodes.append(node_id)
+            log_event(
+                run_id=spec.dag_id,
+                hypothesis_id=node_id,
+                location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+                message="Node crashed with unhandled exception",
+                data={"error": str(exc), "traceback": traceback.format_exc()},
+                trace_id=trace_id,
+                dag_id=spec.dag_id,
+            )
 
         log_event(
             run_id=spec.dag_id,

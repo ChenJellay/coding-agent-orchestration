@@ -278,7 +278,7 @@ class MergeRequestBody(BaseModel):
 
 
 @router.post("/api/tasks/rerun")
-def rerun_task(body: RerunRequestBody) -> Dict[str, Any]:
+def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     try:
         ref = find_task_ref(task_id=body.task_id, feature_id=body.feature_id, node_id=body.node_id)
     except KeyError:
@@ -315,7 +315,7 @@ def rerun_task(body: RerunRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/abort")
-def abort_task(body: AbortRequestBody) -> Dict[str, Any]:
+def abort_task(body: AbortRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     try:
         ref = find_task_ref(task_id=body.task_id, feature_id=body.feature_id, node_id=body.node_id)
     except KeyError:
@@ -348,7 +348,7 @@ def abort_task(body: AbortRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/context")
-def attach_task_context(body: TaskContextRequestBody) -> Dict[str, Any]:
+def attach_task_context(body: TaskContextRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     # Do not fetch remote URLs server-side; we only persist the reference + notes.
     save_task_context(task_id=body.task_id, doc_url=body.doc_url, notes=body.notes)
     log_event(
@@ -362,7 +362,7 @@ def attach_task_context(body: TaskContextRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/apply-and-rerun")
-def apply_and_rerun(body: ApplyAndRerunRequestBody) -> Dict[str, Any]:
+def apply_and_rerun(body: ApplyAndRerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     if body.doc_url:
         save_task_context(task_id=body.task_id, doc_url=body.doc_url, notes=None)
 
@@ -380,7 +380,7 @@ def apply_and_rerun(body: ApplyAndRerunRequestBody) -> Dict[str, Any]:
 
 
 @router.put("/api/dags/{dag_id}/intent")
-def edit_dag_intent(dag_id: str, body: EditIntentRequestBody) -> Dict[str, Any]:
+def edit_dag_intent(dag_id: str, body: EditIntentRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     # Recompile DAG spec and run it (background) so UI can poll.
     repo_root = str(PATHS.repo_root)
     try:
@@ -491,16 +491,16 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
         invalidate_features_and_triage_caches()
         execute_dag(spec)
 
-    start_background_job(
+    job = start_background_job(
         meta={"dag_id": dag_id, "action": "ui-run", "pipeline_mode": body.pipeline_mode},
         target=_compile_and_execute,
     )
 
-    return {"ok": True, "dag_id": dag_id}
+    return {"ok": True, "dag_id": dag_id, "job_id": job.job_id}
 
 
 @router.put("/api/dags/{dag_id}/nodes/{node_id}/chains")
-def update_node_chains(dag_id: str, node_id: str, body: UpdateNodeChainsRequestBody) -> Dict[str, Any]:
+def update_node_chains(dag_id: str, node_id: str, body: UpdateNodeChainsRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     spec_path = PATHS.dags_dir / f"{dag_id}.json"
     if not spec_path.exists():
         raise_http_error(code="dag_not_found", message="DAG not found", status_code=404)

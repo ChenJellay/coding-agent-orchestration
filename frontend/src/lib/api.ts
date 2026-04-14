@@ -88,52 +88,92 @@ export type Checkpoint = {
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
 
-// D1: Bearer token injected centrally from VITE_API_KEY env var.
-// Set VITE_API_KEY in frontend/.env.local for authenticated deployments.
+/** Default per-request timeout in milliseconds. 0 = no timeout. */
+const DEFAULT_TIMEOUT_MS = 15_000
+
+// Bearer token injected centrally from VITE_API_KEY env var.
 function _authHeaders(): Record<string, string> {
   const key = import.meta.env.VITE_API_KEY
   if (!key) return {}
   return { Authorization: `Bearer ${key}` }
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, { headers: _authHeaders() })
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+/**
+ * Fetch with an AbortController-backed timeout.
+ * Rejects with a named `TimeoutError` if the request exceeds `timeoutMs`.
+ * Pass `timeoutMs=0` to disable the timeout (e.g. for SSE streams).
+ */
+async function fetchWithTimeout(
+  url: string,
+  opts: RequestInit = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<Response> {
+  if (timeoutMs <= 0) {
+    return fetch(url, opts)
+  }
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal })
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw Object.assign(new Error(`Request timed out after ${timeoutMs}ms: ${url}`), { name: 'TimeoutError' })
     }
+    throw err
+  } finally {
+    clearTimeout(id)
+  }
+}
+
+function _handleStatus(res: Response, method: string, path: string): void {
+  if (res.ok) return
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+  }
+}
+
+async function getJson<T>(path: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const res = await fetchWithTimeout(`${API_BASE_URL}${path}`, { headers: _authHeaders() }, timeoutMs)
+  _handleStatus(res, 'GET', path)
+  if (!res.ok) {
     const text = await res.text().catch(() => '')
     throw new Error(`HTTP ${res.status} ${path}${text ? `: ${text}` : ''}`)
   }
   return (await res.json()) as T
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ..._authHeaders() },
-    body: JSON.stringify(body),
-  })
+async function getResponse(path: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
+  const res = await fetchWithTimeout(`${API_BASE_URL}${path}`, { headers: _authHeaders() }, timeoutMs)
+  _handleStatus(res, 'GET', path)
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} ${path}${text ? `: ${text}` : ''}`)
+  }
+  return res
+}
+
+async function postJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}${path}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json', ..._authHeaders() }, body: JSON.stringify(body) },
+    timeoutMs,
+  )
+  _handleStatus(res, 'POST', path)
+  if (!res.ok) {
     const text = await res.text().catch(() => '')
     throw new Error(`HTTP ${res.status} POST ${path}${text ? `: ${text}` : ''}`)
   }
   return (await res.json()) as T
 }
 
-async function putJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ..._authHeaders() },
-    body: JSON.stringify(body),
-  })
+async function putJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}${path}`,
+    { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._authHeaders() }, body: JSON.stringify(body) },
+    timeoutMs,
+  )
+  _handleStatus(res, 'PUT', path)
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
     throw new Error(`HTTP ${res.status} PUT ${path}${text ? `: ${text}` : ''}`)
   }
@@ -152,19 +192,31 @@ export async function fetchTriage(): Promise<TriageResponse> {
   return await getJson<TriageResponse>('/api/triage')
 }
 
+export type EventsResult = {
+  items: EventLog[]
+  /** Byte offset returned by the server (X-File-Size header). Pass as `sinceBytes` next poll. */
+  fileSize: number | null
+}
+
 export async function fetchEvents(params: {
   runId?: string
   hypothesisId?: string
   sinceTs?: number
+  sinceBytes?: number
   limit?: number
-}): Promise<EventLog[]> {
+}): Promise<EventsResult> {
   const qs = new URLSearchParams()
   if (params.runId) qs.set('runId', params.runId)
   if (params.hypothesisId) qs.set('hypothesisId', params.hypothesisId)
   if (params.sinceTs != null) qs.set('sinceTs', String(params.sinceTs))
+  if (params.sinceBytes != null) qs.set('sinceBytes', String(params.sinceBytes))
   if (params.limit != null) qs.set('limit', String(params.limit))
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
-  return await getJson<EventLog[]>(`/api/events${suffix}`)
+  const res = await getResponse(`/api/events${suffix}`)
+  const items = (await res.json()) as EventLog[]
+  const fileSizeRaw = res.headers.get('X-File-Size')
+  const fileSize = fileSizeRaw != null ? parseInt(fileSizeRaw, 10) : null
+  return { items, fileSize }
 }
 
 export async function fetchCheckpoints(params: { task_id?: string; limit?: number }): Promise<Checkpoint[]> {
@@ -294,6 +346,21 @@ export async function mergeTask(params: {
 
 export type PipelineMode = 'patch' | 'build'
 
+export type JobStatus = {
+  job_id: string
+  status: 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  created_at: number
+  finished_at: number | null
+  last_heartbeat_at: number | null
+  error: string | null
+  meta: Record<string, unknown>
+  stalled: boolean
+}
+
+export async function fetchJobStatus(jobId: string): Promise<JobStatus> {
+  return await getJson<JobStatus>(`/api/jobs/${encodeURIComponent(jobId)}`)
+}
+
 export async function startDagFromDashboard(params: {
   repo_path: string
   macro_intent: string
@@ -301,7 +368,7 @@ export async function startDagFromDashboard(params: {
   dag_id?: string
   use_llm?: boolean
   pipeline_mode?: PipelineMode | null
-}): Promise<{ ok: true; dag_id: string }> {
+}): Promise<{ ok: true; dag_id: string; job_id?: string }> {
   const body = {
     repo_path: params.repo_path,
     macro_intent: params.macro_intent,

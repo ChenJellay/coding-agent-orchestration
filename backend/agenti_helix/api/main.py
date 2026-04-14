@@ -3,16 +3,23 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, List, Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+import anyio
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agenti_helix.agents.registry import get_agent_detail, list_agents
 from agenti_helix.api.auth import Role, require_auth, require_editor
+from agenti_helix.api.paths import (
+    PATHS,
+    iter_jsonl as _iter_jsonl,
+    iter_jsonl_from_offset as _iter_jsonl_from_offset,
+    read_json as _read_json,
+    try_read_json as _try_read_json,
+)
 from agenti_helix.api.response_caches import (
     CACHE_AVAILABLE as _CACHE_AVAILABLE,
     FEATURES_CACHE as _FEATURES_CACHE,
@@ -22,68 +29,11 @@ from agenti_helix.api.task_commands_routes import router as task_commands_router
 from agenti_helix.core.repo_map import generate_repo_map
 
 
-@dataclass(frozen=True)
-class HelixPaths:
-    repo_root: Path
-
-    @property
-    def agenti_root(self) -> Path:
-        return self.repo_root / ".agenti_helix"
-
-    @property
-    def dags_dir(self) -> Path:
-        return self.agenti_root / "dags"
-
-    @property
-    def checkpoints_dir(self) -> Path:
-        return self.agenti_root / "checkpoints"
-
-    @property
-    def logs_dir(self) -> Path:
-        return self.agenti_root / "logs"
-
-    @property
-    def events_path(self) -> Path:
-        return self.logs_dir / "events.jsonl"
-
-    @property
-    def rules_path(self) -> Path:
-        return self.agenti_root / "rules.json"
-
-    @property
-    def repo_map_path(self) -> Path:
-        return self.repo_root / "repo_map.json"
-
-
-def _repo_root_from_env() -> Path:
-    return Path(os.environ.get("AGENTI_HELIX_REPO_ROOT", Path(".").resolve())).resolve()
-
-
-PATHS = HelixPaths(repo_root=_repo_root_from_env())
-
-
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _try_read_json(path: Path) -> Optional[Any]:
-    if not path.exists():
-        return None
-    return _read_json(path)
-
-
-def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
-    if not path.exists():
-        return ()
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+def _cors_origins_from_env() -> list[str]:
+    raw = os.environ.get("AGENTI_HELIX_CORS_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 
 def _list_dag_ids() -> List[str]:
@@ -298,16 +248,39 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=_cors_origins_from_env(),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "OPTIONS"],
-        # D1: Include Authorization header in CORS to allow Bearer token from browser.
         allow_headers=["Content-Type", "Authorization"],
     )
 
     @app.get("/api/health")
     def health() -> Dict[str, Any]:
         return {"ok": True, "repo_root": str(PATHS.repo_root)}
+
+    @app.get("/api/jobs/{job_id}")
+    def get_job_status(job_id: str) -> Dict[str, Any]:
+        """Return the current status of a background job including heartbeat timestamp."""
+        from agenti_helix.api.job_registry import get_job  # noqa: PLC0415
+
+        rec = get_job(job_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "job_id": rec.job_id,
+            "status": rec.status,
+            "created_at": rec.created_at,
+            "finished_at": rec.finished_at,
+            "last_heartbeat_at": rec.last_heartbeat_at,
+            "error": rec.error,
+            "meta": rec.meta,
+            # Convenience flag: job is stalled if RUNNING with no heartbeat for > 30 s
+            "stalled": (
+                rec.status == "RUNNING"
+                and rec.last_heartbeat_at is not None
+                and (time.time() - rec.last_heartbeat_at) > 30
+            ),
+        }
 
     @app.get("/api/dags")
     def list_dags() -> List[Dict[str, Any]]:
@@ -332,15 +305,33 @@ def create_app() -> FastAPI:
 
     @app.get("/api/events")
     def get_events(
+        response: Response,
         runId: Optional[str] = None,
         hypothesisId: Optional[str] = None,
         traceId: Optional[str] = None,
         dagId: Optional[str] = None,
         sinceTs: Optional[int] = None,
+        sinceBytes: Optional[int] = None,
         limit: int = Query(default=500, ge=1, le=5000),
     ) -> List[Dict[str, Any]]:
+        """Return filtered events.
+
+        When `sinceBytes` is provided, only bytes after that offset are read
+        (O(new bytes) instead of O(file size)).  The response includes an
+        `X-File-Size` header so callers can pass the value back as `sinceBytes`
+        on the next poll.
+        """
+        if sinceBytes is not None and sinceBytes >= 0:
+            raw_iter, new_offset = _iter_jsonl_from_offset(PATHS.events_path, sinceBytes)
+            response.headers["X-File-Size"] = str(new_offset)
+            source: Iterable[Dict[str, Any]] = raw_iter
+        else:
+            file_size = PATHS.events_path.stat().st_size if PATHS.events_path.exists() else 0
+            response.headers["X-File-Size"] = str(file_size)
+            source = _iter_jsonl(PATHS.events_path)
+
         items: List[Dict[str, Any]] = []
-        for e in _iter_jsonl(PATHS.events_path):
+        for e in source:
             if runId is not None and e.get("runId") != runId:
                 continue
             if hypothesisId is not None and e.get("hypothesisId") != hypothesisId:
@@ -356,18 +347,8 @@ def create_app() -> FastAPI:
         items.sort(key=lambda x: x.get("timestamp", 0))
         return items[-limit:]
 
-    def _event_key(e: Dict[str, Any]) -> str:
-        ts = e.get("timestamp") or 0
-        rid = e.get("runId") or ""
-        msg = e.get("message") or ""
-        agent = ""
-        data = e.get("data")
-        if isinstance(data, dict):
-            agent = str(data.get("agent_id") or "")
-        return f"{ts}:{rid}:{msg}:{agent}"
-
     @app.get("/api/events/stream")
-    def stream_events(
+    async def stream_events(
         runId: Optional[str] = None,
         hypothesisId: Optional[str] = None,
         traceId: Optional[str] = None,
@@ -375,30 +356,29 @@ def create_app() -> FastAPI:
         sinceTs: Optional[int] = None,
         heartbeatSeconds: float = Query(default=15.0, ge=1.0, le=60.0),
     ) -> StreamingResponse:
+        """Server-sent events stream of events.jsonl.
+
+        Uses a byte-offset cursor so each poll reads only new bytes instead of
+        re-scanning the full file.  The async generator releases the event loop
+        between polls instead of blocking a worker thread.
         """
-        Server-sent events stream of events.jsonl.
+        _sinceTs = sinceTs
 
-        This is intentionally "best-effort" (polls the file periodically) to
-        provide near-real-time UI updates without adding a persistent queue.
-        """
+        async def gen() -> AsyncIterator[bytes]:
+            file_offset: int = 0
+            last_heartbeat = time.monotonic()
 
-        def gen() -> Iterator[bytes]:
-            last_heartbeat = time.time()
-            last_seen_ts = sinceTs if sinceTs is not None else None
-            # Keep a small sliding window to dedupe repeats across polls.
-            recent_keys: List[str] = []
-
-            # Initial hello so the client knows the stream is alive.
             yield b": ok\n\n"
 
             while True:
-                now = time.time()
+                now = time.monotonic()
                 if now - last_heartbeat >= heartbeatSeconds:
                     last_heartbeat = now
                     yield b": heartbeat\n\n"
 
-                batch: List[Dict[str, Any]] = []
-                for e in _iter_jsonl(PATHS.events_path):
+                new_events, file_offset = _iter_jsonl_from_offset(PATHS.events_path, file_offset)
+
+                for e in new_events:
                     if runId is not None and e.get("runId") != runId:
                         continue
                     if hypothesisId is not None and e.get("hypothesisId") != hypothesisId:
@@ -408,29 +388,12 @@ def create_app() -> FastAPI:
                     if dagId is not None and e.get("dagId") != dagId:
                         continue
                     ts = e.get("timestamp")
-                    if last_seen_ts is not None and isinstance(ts, int) and ts < last_seen_ts:
+                    if _sinceTs is not None and isinstance(ts, int) and ts < _sinceTs:
                         continue
-                    batch.append(e)
-
-                batch.sort(key=lambda x: x.get("timestamp", 0))
-
-                for e in batch[-500:]:
-                    k = _event_key(e)
-                    if k in recent_keys:
-                        continue
-                    recent_keys.append(k)
-                    if len(recent_keys) > 250:
-                        recent_keys = recent_keys[-250:]
-
-                    ts = e.get("timestamp")
-                    if isinstance(ts, int):
-                        # Move the cursor forward; allow equal timestamps to still stream via dedupe.
-                        last_seen_ts = ts
-
                     payload = json.dumps(e, ensure_ascii=False)
                     yield f"event: event\ndata: {payload}\n\n".encode("utf-8")
 
-                time.sleep(0.8)
+                await anyio.sleep(0.8)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 

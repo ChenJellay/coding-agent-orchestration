@@ -28,6 +28,7 @@ class JobRecord:
     cancel_token: CancelToken = field(default_factory=CancelToken)
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+    last_heartbeat_at: Optional[float] = None
     error: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -70,15 +71,39 @@ def _mark_finished(job: JobRecord, *, status: JobStatus, error: Optional[str] = 
         job.error = error
 
 
+_HEARTBEAT_INTERVAL_SECONDS = 10
+
+
+def _heartbeat_loop(rec: JobRecord) -> None:
+    """Emit a heartbeat every 10 s while the job is RUNNING."""
+    # Lazy import to avoid a circular dependency with debug_log at module load time.
+    from agenti_helix.observability.debug_log import log_event  # noqa: PLC0415
+
+    while True:
+        time.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+        with _LOCK:
+            if rec.status != "RUNNING":
+                break
+            rec.last_heartbeat_at = time.time()
+
+        dag_id = rec.meta.get("dag_id") or ""
+        node_id = rec.meta.get("node_id") or rec.meta.get("task_id") or rec.job_id
+        log_event(
+            run_id=dag_id or rec.job_id,
+            hypothesis_id=str(node_id),
+            location="agenti_helix/api/job_registry.py:_heartbeat_loop",
+            message="job_heartbeat",
+            data={"job_id": rec.job_id, "meta": rec.meta},
+        )
+
+
 def start_background_job(
     *,
     meta: Optional[Dict[str, Any]],
     target: Callable[[CancelToken], Any],
     task_key: Optional[str] = None,
 ) -> JobRecord:
-    """
-    Start `target(cancel_token)` in a background thread and update JobRecord status.
-    """
+    """Start `target(cancel_token)` in a background thread and update JobRecord status."""
     rec = create_job(meta=meta)
     if task_key:
         with _LOCK:
@@ -96,12 +121,11 @@ def start_background_job(
 
         if task_key:
             with _LOCK:
-                # Only clear if the index still points at this job.
                 if _JOB_INDEX_BY_TASK_KEY.get(task_key) == rec.job_id:
                     _JOB_INDEX_BY_TASK_KEY.pop(task_key, None)
 
-    t = threading.Thread(target=_runner, name=f"agenti_job_{rec.job_id}", daemon=True)
-    t.start()
+    threading.Thread(target=_runner, name=f"agenti_job_{rec.job_id}", daemon=True).start()
+    threading.Thread(target=_heartbeat_loop, args=(rec,), name=f"agenti_hb_{rec.job_id}", daemon=True).start()
     return rec
 
 
