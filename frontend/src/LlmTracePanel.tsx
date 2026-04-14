@@ -11,6 +11,18 @@ function isLlmTraceEvent(e: EventLog): boolean {
   return Boolean(d && typeof d === 'object' && (d as { kind?: string }).kind === 'llm_trace')
 }
 
+function isLlmProgressEvent(e: EventLog): boolean {
+  const d = e.data
+  return Boolean(d && typeof d === 'object' && (d as { kind?: string }).kind === 'llm_progress')
+}
+
+type ProgressData = {
+  agent_id?: string
+  token_count?: number
+  tokens_per_second?: number
+  partial_tail?: string
+}
+
 function formatTs(ts: number | undefined): string {
   if (ts == null || !Number.isFinite(ts)) return '—'
   try {
@@ -157,6 +169,18 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
     }
   }, [])
 
+  // Latest llm_progress event — shows live token count while inference is running.
+  const liveProgress = useMemo(() => {
+    const progEvents = events.filter(isLlmProgressEvent)
+    const last = progEvents[progEvents.length - 1]
+    if (!last) return null
+    const d = last.data as ProgressData
+    // Only show if this progress event is recent (within 30s of now).
+    const age = Date.now() - (last.timestamp ?? 0)
+    if (age > 30_000) return null
+    return { agent: d.agent_id ?? '?', tokens: d.token_count ?? 0, tps: d.tokens_per_second ?? 0, tail: d.partial_tail ?? '' }
+  }, [events])
+
   const traces = useMemo(() => {
     const list = events.filter(isLlmTraceEvent)
     const seen = new Set<string>()
@@ -230,6 +254,19 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
             : streamStatus === 'fallback'
               ? 'Live stream unavailable — using polling.'
               : 'Live stream disconnected.'}
+        </div>
+      ) : null}
+
+      {liveProgress ? (
+        <div className="llmTraceProgress">
+          <span className="llmTraceProgressDot" />
+          <span>
+            <strong>{liveProgress.agent}</strong> generating… {liveProgress.tokens} tokens
+            {liveProgress.tps > 0 ? ` · ${liveProgress.tps.toFixed(1)} tok/s` : ''}
+          </span>
+          {liveProgress.tail ? (
+            <span className="llmTraceProgressTail">…{liveProgress.tail.slice(-80)}</span>
+          ) : null}
         </div>
       ) : null}
 
