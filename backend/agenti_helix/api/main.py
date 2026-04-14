@@ -178,8 +178,10 @@ def _feature_column_from_state(
         if any(s in {"RUNNING"} for s in statuses):
             return "VERIFYING"
 
+    # AWAITING_SIGNOFF = judge approved, workspace staged, waiting for human sign-off.
+    # This is "done verifying" — show it as READY_FOR_REVIEW, not VERIFYING.
     if any(s == "AWAITING_SIGNOFF" for s in statuses):
-        return "VERIFYING"
+        return "READY_FOR_REVIEW"
 
     if statuses and all(s == "PASSED_VERIFICATION" for s in statuses):
         return "READY_FOR_REVIEW"
