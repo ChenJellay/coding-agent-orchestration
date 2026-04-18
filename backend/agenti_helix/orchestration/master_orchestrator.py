@@ -10,6 +10,7 @@ from agenti_helix.runtime.chain_defaults import (
     default_full_pipeline_coder_chain,
     default_full_pipeline_judge_chain,
 )
+from agenti_helix.runtime.pipeline_presets import get_pipeline_workflow, is_pipeline_preset
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
 
@@ -28,7 +29,10 @@ def resolve_coder_chain(task: EditTaskSpec) -> Dict[str, Any]:
     workflow = getattr(task, "workflow", None)
     if workflow:
         return build_workflow_coder_chain(list(workflow), task)
-    if getattr(task, "pipeline_mode", "patch") == "build":
+    pipeline_mode = getattr(task, "pipeline_mode", "patch")
+    if is_pipeline_preset(pipeline_mode):
+        return build_workflow_coder_chain(get_pipeline_workflow(str(pipeline_mode)), task)
+    if pipeline_mode == "build":
         return default_full_pipeline_coder_chain(task)
     return default_coder_chain(task)
 
@@ -48,6 +52,9 @@ def resolve_judge_chain(task: EditTaskSpec) -> Dict[str, Any]:
     workflow = getattr(task, "workflow", None)
     if workflow:
         return build_workflow_judge_chain(list(workflow), task)
-    if getattr(task, "pipeline_mode", "patch") == "build":
+    pipeline_mode = getattr(task, "pipeline_mode", "patch")
+    if is_pipeline_preset(pipeline_mode):
+        return build_workflow_judge_chain(get_pipeline_workflow(str(pipeline_mode)), task)
+    if pipeline_mode == "build":
         return default_full_pipeline_judge_chain(task)
     return default_judge_chain(task)

@@ -95,20 +95,6 @@ def remove_dag_from_workflow(dag_id: str, _role: Role = Depends(require_editor))
     )
     return {"ok": True, "removed_spec": removed_spec, "removed_state": removed_state}
 
-# region agent log
-def _debug_write(payload: Dict[str, Any]) -> None:
-    # Minimal NDJSON logger for debug-mode sessions; avoid secrets/PII.
-    try:
-        import json as _json
-        from pathlib import Path as _Path
-
-        p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.open("a", encoding="utf-8").write(_json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-# endregion agent log
-
 
 def _ensure_dag_state_initialized(*, dag_id: str) -> Dict[str, Any]:
     existing = try_load_dag_state(dag_id)
@@ -330,7 +316,8 @@ class ExecuteDagFromDashboardRequestBody(BaseModel):
         description=(
             "Override pipeline for all DAG nodes: "
             '"patch" (fast single-file, coder_patch_v1 + judge_v1) or '
-            '"build" (full TDD pipeline: librarian → sdet → coder_builder → governor → judge_evaluator). '
+            '"build" (full TDD pipeline: librarian → sdet → coder_builder → governor → judge_evaluator), '
+            '"product_eng", "diff_guard_patch", "secure_build_plus", or "lint_type_gate". '
             "When null, the orchestrator assigns pipeline_mode per node (requires use_llm=true)."
         ),
     )
@@ -549,26 +536,6 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     _use_llm = body.use_llm
     _pipeline_mode = body.pipeline_mode
 
-    # region agent log
-    _debug_write(
-        {
-            "sessionId": "a3db40",
-            "runId": "pre-fix",
-            "hypothesisId": "H3",
-            "location": "agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
-            "message": "UI requested DAG run",
-            "data": {
-                "dag_id": dag_id,
-                "use_llm": bool(_use_llm),
-                "pipeline_mode": _pipeline_mode,
-                "macro_intent_len": len(_macro_intent or ""),
-                "repo_path_tail": str(_repo_path)[-120:],
-            },
-            "timestamp": int(time.time() * 1000),
-        }
-    )
-    # endregion agent log
-
     def _compile_and_execute(_cancel_token: object) -> None:
         """Compile the DAG spec (possibly via LLM) and execute it — all in the background."""
         try:
@@ -579,19 +546,6 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
                 use_llm=_use_llm,
             )
         except Exception as exc:
-            # region agent log
-            _debug_write(
-                {
-                    "sessionId": "a3db40",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H4",
-                    "location": "agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
-                    "message": "Intent compile failed; DAG execution aborted",
-                    "data": {"dag_id": dag_id, "error": str(exc)[:2000]},
-                    "timestamp": int(time.time() * 1000),
-                }
-            )
-            # endregion agent log
             log_event(
                 run_id=dag_id,
                 hypothesis_id="orchestrator",
@@ -600,20 +554,6 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
                 data={"error": str(exc)},
             )
             return
-
-        # region agent log
-        _debug_write(
-            {
-                "sessionId": "a3db40",
-                "runId": "pre-fix",
-                "hypothesisId": "H5",
-                "location": "agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
-                "message": "Intent compile succeeded; about to execute DAG",
-                "data": {"dag_id": dag_id, "node_ids": sorted(list(spec.nodes.keys()))[:50], "node_count": len(spec.nodes)},
-                "timestamp": int(time.time() * 1000),
-            }
-        )
-        # endregion agent log
 
         # Apply pipeline_mode override when provided.
         for _node_id, node in spec.nodes.items():
@@ -631,33 +571,7 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
 
         persist_dag_spec(spec)
         invalidate_features_and_triage_caches()
-        # region agent log
-        _debug_write(
-            {
-                "sessionId": "a3db40",
-                "runId": "pre-fix",
-                "hypothesisId": "H9",
-                "location": "agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
-                "message": "Calling execute_dag(spec)",
-                "data": {"dag_id": dag_id},
-                "timestamp": int(time.time() * 1000),
-            }
-        )
-        # endregion agent log
         execute_dag(spec)
-        # region agent log
-        _debug_write(
-            {
-                "sessionId": "a3db40",
-                "runId": "pre-fix",
-                "hypothesisId": "H10",
-                "location": "agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
-                "message": "execute_dag(spec) returned",
-                "data": {"dag_id": dag_id},
-                "timestamp": int(time.time() * 1000),
-            }
-        )
-        # endregion agent log
 
     start_background_job(
         meta={"dag_id": dag_id, "action": "ui-run", "pipeline_mode": body.pipeline_mode},

@@ -14,20 +14,6 @@ from agenti_helix.api.task_lookup import try_load_dag_state
 from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
 from agenti_helix.verification.verification_loop import run_verification_loop
 
-# region agent log
-def _debug_write(payload: Dict[str, Any]) -> None:
-    try:
-        import json as _json
-        from pathlib import Path as _Path
-        import time as _time
-
-        p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.open("a", encoding="utf-8").write(_json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-# endregion agent log
-
 
 class DagNodeStatus(str, Enum):
     """Execution status for a DAG node."""
@@ -233,19 +219,6 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
     A unique `trace_id` is generated per DAG run and propagated to every
     verification loop so all events can be correlated.
     """
-    # region agent log
-    _debug_write(
-        {
-            "sessionId": "a3db40",
-            "runId": "pre-fix",
-            "hypothesisId": "H8",
-            "location": "agenti_helix/orchestration/orchestrator.py:execute_dag",
-            "message": "Entered execute_dag",
-            "data": {"dag_id": getattr(spec, "dag_id", None), "node_count": len(getattr(spec, "nodes", {}) or {})},
-            "timestamp": __import__("time").time_ns() // 1_000_000,
-        }
-    )
-    # endregion agent log
     persist_dag_spec(spec)
 
     trace_id = str(uuid.uuid4())

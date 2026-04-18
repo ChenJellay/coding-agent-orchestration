@@ -300,6 +300,8 @@ def default_full_pipeline_judge_chain(task: Any | None = None) -> Dict[str, Any]
 # can be split cleanly into a coder chain (produces a diff) and a judge chain
 # (evaluates the diff).
 _CODER_SIDE_AGENTS = {
+    "doc_fetcher_v1",
+    "code_searcher_v1",
     "context_librarian_v1",
     "sdet_v1",
     "coder_builder_v1",
@@ -307,8 +309,13 @@ _CODER_SIDE_AGENTS = {
 }
 _JUDGE_SIDE_AGENTS = {
     "security_governor_v1",
+    "diff_validator_v1",
+    "linter_v1",
+    "type_checker_v1",
     "judge_evaluator_v1",
     "judge_v1",
+    "scribe_v1",
+    "memory_writer_v1",
 }
 
 
@@ -355,7 +362,7 @@ def _block_context_librarian() -> List[Dict[str, Any]]:
         {**_agent_step(
             "context_librarian", "context_librarian_v1", "librarian_output",
             {
-                "dag_task": {"$ref": "intent"},
+                "dag_task": {"$ref": "task_input.intent"},
                 "ast_repo_map_json": {"$ref": "ast_repo_map_ctx.ast_repo_map_json"},
             },
             max_tokens=2048,
@@ -372,8 +379,8 @@ def _block_sdet() -> List[Dict[str, Any]]:
         {**_agent_step(
             "sdet", "sdet_v1", "sdet_output",
             {
-                "dag_task": {"$ref": "intent"},
-                "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                "dag_task": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
                 "context_chunks_json": {"$ref": "file_contexts.file_contexts_json"},
                 "testing_standards": (
                     "Follow the repository's existing testing patterns. "
@@ -398,13 +405,38 @@ def _block_coder_builder(has_sdet: bool) -> List[Dict[str, Any]]:
         _agent_step(
             "coder_builder", "coder_builder_v1", "coder_output",
             {
-                "dag_task": {"$ref": "intent"},
-                "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                "dag_task": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
                 "file_contexts_json": {"$ref": "file_contexts.file_contexts_json"},
             },
             max_tokens=8192,
         ),
         _tool_step("write_files", "write_all_files", "diff_json", write_bindings),
+    ]
+
+
+def _block_doc_fetcher() -> List[Dict[str, Any]]:
+    return [
+        {**_tool_step("fetch_doc_context", "fetch_doc_content", "doc_context", {
+            "task_id": {"$ref": "task_id"},
+        }), "skip_if_present": True},
+        {**_agent_step(
+            "doc_fetcher", "doc_fetcher_v1", "doc_fetcher_output",
+            {
+                "doc_url": {"$ref": "doc_context.doc_url"},
+                "doc_content": {"$ref": "doc_context.doc_content"},
+                "intent": {"$ref": "intent"},
+                "target_file": {"$ref": "target_file"},
+                "acceptance_criteria": {"$ref": "acceptance_criteria"},
+            },
+            max_tokens=3072,
+        ), "skip_if_present": True},
+        _tool_step("augment_task_inputs", "build_augmented_task_inputs", "task_input", {
+            "intent": {"$ref": "intent"},
+            "acceptance_criteria": {"$ref": "acceptance_criteria"},
+            "doc_fetcher_output": {"$ref": "doc_fetcher_output"},
+            "task_notes": {"$ref": "doc_context.notes"},
+        }),
     ]
 
 
@@ -423,7 +455,7 @@ def _block_coder_patch() -> List[Dict[str, Any]]:
             "coder_patch", "coder_patch_v1", "coder_patch",
             {
                 "repo_map_json": {"$ref": "repo_map_ctx.repo_map_json"},
-                "intent": {"$ref": "intent"},
+                "intent": {"$ref": "task_input.intent"},
                 "target_file": {"$ref": "target_file"},
                 "target_file_content": {"$ref": "target_file_content"},
             },
@@ -460,13 +492,83 @@ def _block_judge_evaluator() -> List[Dict[str, Any]]:
         _agent_step(
             "judge_evaluator", "judge_evaluator_v1", "judge_eval",
             {
-                "dag_task": {"$ref": "intent"},
-                "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                "dag_task": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
                 "coder_diff_json": {"$ref": "diff_json.diff_json_str"},
                 "sdet_tests_json": {"$ref": "diff_json.diff_json_str"},
                 "terminal_logs": {"$ref": "test_results.terminal_logs"},
             },
             max_tokens=4096,
+        ),
+    ]
+
+
+def _block_diff_validator() -> List[Dict[str, Any]]:
+    return [
+        _tool_step("collect_git_diff", "get_git_diff", "git_diff_ctx", {
+            "repo_root": {"$ref": "repo_root"},
+        }),
+        _tool_step("load_rules_for_diff", "load_rules", "diff_rules", {"repo_root": {"$ref": "repo_root"}}),
+        _agent_step(
+            "diff_validator", "diff_validator_v1", "diff_validator_output",
+            {
+                "intent": {"$ref": "task_input.intent"},
+                "target_file": {"$ref": "target_file"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+                "git_diff": {"$ref": "git_diff_ctx.git_diff"},
+                "allowed_paths": {"$ref": "allowed_paths"},
+                "repo_rules_text": {"$ref": "diff_rules.repo_rules_text"},
+            },
+            max_tokens=3072,
+        ),
+    ]
+
+
+def _block_linter() -> List[Dict[str, Any]]:
+    return [
+        _tool_step("snapshot_for_lint", "snapshot_target_file", "lint_file_content", {
+            "repo_root": {"$ref": "repo_root"},
+            "target_file": {"$ref": "target_file"},
+        }),
+        _tool_step("run_linter", "run_linter", "lint_run", {
+            "repo_root": {"$ref": "repo_root"},
+            "target_file": {"$ref": "target_file"},
+        }),
+        _agent_step(
+            "linter", "linter_v1", "linter_output",
+            {
+                "target_file": {"$ref": "lint_run.target_file"},
+                "language": {"$ref": "lint_run.language"},
+                "file_content": {"$ref": "lint_file_content"},
+                "linter_raw_output": {"$ref": "lint_run.linter_raw_output"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+            },
+            max_tokens=3072,
+        ),
+    ]
+
+
+def _block_type_checker() -> List[Dict[str, Any]]:
+    return [
+        _tool_step("snapshot_for_typecheck", "snapshot_target_file", "type_file_content", {
+            "repo_root": {"$ref": "repo_root"},
+            "target_file": {"$ref": "target_file"},
+        }),
+        _tool_step("run_typecheck", "run_typecheck", "typecheck_run", {
+            "repo_root": {"$ref": "repo_root"},
+            "target_file": {"$ref": "target_file"},
+        }),
+        _agent_step(
+            "type_checker", "type_checker_v1", "type_checker_output",
+            {
+                "target_file": {"$ref": "typecheck_run.target_file"},
+                "language": {"$ref": "typecheck_run.language"},
+                "file_content": {"$ref": "type_file_content"},
+                "type_checker_output": {"$ref": "typecheck_run.type_checker_output"},
+                "intent": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+            },
+            max_tokens=3072,
         ),
     ]
 
@@ -484,17 +586,55 @@ def _block_judge_v1() -> List[Dict[str, Any]]:
             "static_check_logs": {"$ref": "static_check_logs"},
         }),
         _agent_step(
-            "judge", "judge_v1", "judge_response",
+            "judge", "judge_v1", "snippet_judge_response",
             {
                 "repo_path": {"$ref": "repo_path"},
                 "target_file": {"$ref": "target_file"},
-                "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
                 "original_snippet": {"$ref": "original_snippet"},
                 "edited_snippet": {"$ref": "edited_snippet"},
                 "language": {"$ref": "language"},
                 "tool_logs_json": {"$ref": "tool_logs_json"},
             },
             max_tokens=6144,
+        ),
+    ]
+
+
+def _block_scribe() -> List[Dict[str, Any]]:
+    return [
+        _agent_step(
+            "scribe", "scribe_v1", "scribe_output",
+            {
+                "task_id": {"$ref": "task_id"},
+                "dag_id": {"$ref": "dag_id"},
+                "intent": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+                "final_verdict": {"$ref": "judge_response.verdict"},
+                "resolution_summary": {"$ref": "judge_response.justification"},
+            },
+            max_tokens=2048,
+        ),
+    ]
+
+
+def _block_memory_writer() -> List[Dict[str, Any]]:
+    return [
+        _agent_step(
+            "memory_writer", "memory_writer_v1", "memory_writer_output",
+            {
+                "task_id": {"$ref": "task_id"},
+                "dag_id": {"$ref": "dag_id"},
+                "target_file": {"$ref": "target_file"},
+                "intent": {"$ref": "task_input.intent"},
+                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+                "final_verdict": {"$ref": "judge_response.verdict"},
+                "attempt_count": {"$ref": "attempt_count"},
+                "error_history": {"$ref": "error_history"},
+                "patch_summaries": {"$ref": "patch_summaries"},
+                "resolution_summary": {"$ref": "judge_response.justification"},
+            },
+            max_tokens=2048,
         ),
     ]
 
@@ -524,6 +664,7 @@ def build_workflow_coder_chain(workflow: List[str], task: Any | None = None) -> 
     if not coder_side:
         return default_coder_chain(task)
 
+    has_doc_fetcher = "doc_fetcher_v1" in coder_side
     has_librarian = "context_librarian_v1" in coder_side
     has_sdet = "sdet_v1" in coder_side
     has_builder = "coder_builder_v1" in coder_side
@@ -534,6 +675,8 @@ def build_workflow_coder_chain(workflow: List[str], task: Any | None = None) -> 
     needs_librarian = (has_builder or has_sdet) and not has_librarian
 
     steps: List[Dict[str, Any]] = []
+    if has_doc_fetcher:
+        steps.extend(_block_doc_fetcher())
     if needs_librarian:
         steps.extend(_block_context_librarian())
     if has_librarian:
@@ -563,12 +706,23 @@ def build_workflow_judge_chain(workflow: List[str], task: Any | None = None) -> 
         return default_judge_chain(task)
 
     has_governor = "security_governor_v1" in judge_side
+    has_diff_validator = "diff_validator_v1" in judge_side
+    has_linter = "linter_v1" in judge_side
+    has_type_checker = "type_checker_v1" in judge_side
     has_evaluator = "judge_evaluator_v1" in judge_side
     has_judge_v1 = "judge_v1" in judge_side
+    has_scribe = "scribe_v1" in judge_side
+    has_memory_writer = "memory_writer_v1" in judge_side
 
     steps: List[Dict[str, Any]] = []
     if has_governor:
         steps.extend(_block_security_governor())
+    if has_diff_validator:
+        steps.extend(_block_diff_validator())
+    if has_linter:
+        steps.extend(_block_linter())
+    if has_type_checker:
+        steps.extend(_block_type_checker())
     if has_evaluator:
         steps.extend(_block_judge_evaluator())
 
@@ -582,13 +736,38 @@ def build_workflow_judge_chain(workflow: List[str], task: Any | None = None) -> 
         if has_governor:
             map_bindings["is_safe"] = {"$ref": "governor_output.is_safe"}
             map_bindings["violations"] = {"$ref": "governor_output.violations"}
-        steps.append(_tool_step("map_verdict", "map_evaluator_verdict", "judge_response", map_bindings))
+        if has_diff_validator:
+            map_bindings["diff_validator_output"] = {"$ref": "diff_validator_output"}
+        if has_linter:
+            map_bindings["linter_output"] = {"$ref": "linter_output"}
+        if has_type_checker:
+            map_bindings["type_checker_output"] = {"$ref": "type_checker_output"}
+        steps.append(_tool_step("map_verdict", "map_evaluator_verdict", "provisional_judge_response", map_bindings))
 
     if has_judge_v1:
-        # `judge_v1` directly emits `judge_response`. When combined with evaluator, it runs last
-        # and overwrites the mapped verdict — an explicit "strict snippet judge has final say"
-        # semantic that matches how the existing single-judge chain is used.
         steps.extend(_block_judge_v1())
+
+    finalize_needed = has_evaluator or has_judge_v1 or has_diff_validator or has_governor or has_linter or has_type_checker
+    if finalize_needed:
+        finalize_bindings: Dict[str, Any] = {}
+        if has_evaluator:
+            finalize_bindings["base_judge_response"] = {"$ref": "provisional_judge_response"}
+        if has_judge_v1:
+            finalize_bindings["snippet_judge_response"] = {"$ref": "snippet_judge_response"}
+        if has_diff_validator:
+            finalize_bindings["diff_validator_output"] = {"$ref": "diff_validator_output"}
+        if has_governor:
+            finalize_bindings["governor_output"] = {"$ref": "governor_output"}
+        if has_linter:
+            finalize_bindings["linter_output"] = {"$ref": "linter_output"}
+        if has_type_checker:
+            finalize_bindings["type_checker_output"] = {"$ref": "type_checker_output"}
+        steps.append(_tool_step("finalize_verdict", "finalize_judge_verdict", "judge_response", finalize_bindings))
+
+    if has_scribe:
+        steps.extend(_block_scribe())
+    if has_memory_writer:
+        steps.extend(_block_memory_writer())
 
     if not steps:
         return default_judge_chain(task)

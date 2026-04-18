@@ -5,6 +5,7 @@ from typing import Any
 
 from agenti_helix.verification.checkpointing import Checkpoint, EditTaskSpec, VerificationStatus
 from agenti_helix.orchestration import intent_compiler, orchestrator as orch
+from agenti_helix.api.paths import HelixPaths
 
 
 class DummyVerificationState:
@@ -21,6 +22,8 @@ class DummyVerificationState:
 
 
 def test_compile_macro_intent_creates_linear_dag(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(orch, "PATHS", HelixPaths(repo_root=tmp_path.resolve()))
+    monkeypatch.setattr(orch, "try_load_dag_state", lambda _dag_id: None)
     repo = tmp_path / "demo-repo"
     src = repo / "src" / "components"
     src.mkdir(parents=True)
@@ -41,6 +44,8 @@ def test_compile_macro_intent_creates_linear_dag(tmp_path: Path, monkeypatch) ->
 
 
 def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(orch, "PATHS", HelixPaths(repo_root=tmp_path.resolve()))
+    monkeypatch.setattr(orch, "try_load_dag_state", lambda _dag_id: None)
     repo = tmp_path / "demo-repo"
     src = repo / "src" / "components"
     src.mkdir(parents=True)
@@ -55,7 +60,7 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
 
     called_tasks: list[EditTaskSpec] = []
 
-    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec, **_kwargs) -> Any:  # type: ignore[override]
         called_tasks.append(task)
         return DummyVerificationState(VerificationStatus.PASSED)
 
@@ -63,6 +68,7 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
     monkeypatch.setattr(orch, "run_verification_loop", fake_run_verification_loop)
 
     result = orch.execute_dag(spec)
+    assert len(called_tasks) == len(spec.nodes)
 
     # All nodes should have passed verification.
     assert result.all_passed
@@ -76,6 +82,8 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
 
 
 def test_execute_dag_blocks_downstream_on_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(orch, "PATHS", HelixPaths(repo_root=tmp_path.resolve()))
+    monkeypatch.setattr(orch, "try_load_dag_state", lambda _dag_id: None)
     repo = tmp_path / "demo-repo"
     src = repo / "src" / "components"
     src.mkdir(parents=True)
@@ -88,7 +96,7 @@ def test_execute_dag_blocks_downstream_on_failure(tmp_path: Path, monkeypatch) -
         dag_id="dag-with-failure",
     )
 
-    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec, **_kwargs) -> Any:  # type: ignore[override]
         if task.task_id == "header-style-refine":
             return DummyVerificationState(VerificationStatus.BLOCKED)
         return DummyVerificationState(VerificationStatus.PASSED)
@@ -97,6 +105,8 @@ def test_execute_dag_blocks_downstream_on_failure(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(orch, "run_verification_loop", fake_run_verification_loop)
 
     result = orch.execute_dag(spec)
+    # N1 and N2 should have attempted verification; N3 is blocked by predecessor.
+    # (execute_dag is sequential and will never run N3 if N2 is blocked.)
 
     # First node should pass, second fail, third be marked failed due to predecessor.
     node1 = result.node_states["N1-change-color"]

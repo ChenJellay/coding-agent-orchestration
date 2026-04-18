@@ -146,32 +146,6 @@ def snapshot_file(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         # New-file tasks should be able to start from an empty pre-state.
-        # region agent log
-        try:
-            import json as _json
-            import time as _time
-            from pathlib import Path as _Path
-
-            p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.open("a", encoding="utf-8").write(
-                _json.dumps(
-                    {
-                        "sessionId": "a3db40",
-                        "runId": "pre-fix",
-                        "hypothesisId": "H11",
-                        "location": "agenti_helix/verification/checkpointing.py:snapshot_file",
-                        "message": "snapshot_file missing; returning empty pre-state",
-                        "data": {"path": str(path)[-240:]},
-                        "timestamp": int(_time.time() * 1000),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        except Exception:
-            pass
-        # endregion agent log
         return ""
 
 

@@ -10,6 +10,7 @@ from agenti_helix.agents.models import IntentCompilerOutput as _IntentCompilerOu
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.chain_defaults import default_intent_compiler_chain
 from agenti_helix.runtime.chain_runtime import run_chain
+from agenti_helix.runtime.pipeline_presets import is_pipeline_preset
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
 from .orchestrator import DagNodeSpec, DagSpec, load_dag_spec, persist_dag_spec
@@ -101,20 +102,6 @@ def _run_intent_chain(macro_intent: str, repo_root: Path, *, feedback: str = "")
     raw = ctx.get("intent_compiler_output")
     return raw if isinstance(raw, dict) else {}
 
-# region agent log
-def _debug_write(payload: Dict[str, object]) -> None:
-    # Minimal NDJSON logger for debug-mode sessions; avoid secrets/PII.
-    try:
-        import json as _json  # local import to avoid global overhead
-        from pathlib import Path as _Path
-
-        p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.open("a", encoding="utf-8").write(_json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-# endregion agent log
-
 
 def compile_macro_intent_with_llm(
     macro_intent: str,
@@ -139,45 +126,10 @@ def compile_macro_intent_with_llm(
 
     for attempt in range(1, _MAX_COMPILE_RETRIES + 1):
         raw = _run_intent_chain(macro_intent, repo_root, feedback=last_error)
-        # region agent log
-        _debug_write(
-            {
-                "sessionId": "a3db40",
-                "runId": "pre-fix",
-                "hypothesisId": "H1",
-                "location": "agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-                "message": "Intent compiler raw output shape",
-                "data": {
-                    "attempt": attempt,
-                    "raw_type": type(raw).__name__,
-                    "raw_keys": sorted(list(raw.keys()))[:50] if isinstance(raw, dict) else [],
-                    "has_nodes": isinstance(raw, dict) and ("nodes" in raw),
-                    "has_edges": isinstance(raw, dict) and ("edges" in raw),
-                    "has_node_id": isinstance(raw, dict) and ("node_id" in raw),
-                    "has_target_file": isinstance(raw, dict) and ("target_file" in raw),
-                    "has_targetFile": isinstance(raw, dict) and ("targetFile" in raw),
-                },
-                "timestamp": __import__("time").time_ns() // 1_000_000,
-            }
-        )
-        # endregion agent log
         try:
             validated = _IntentCompilerOutputModel.model_validate(raw)
         except (ValidationError, Exception) as exc:
             last_error = f"Output failed Pydantic validation: {exc}"
-            # region agent log
-            _debug_write(
-                {
-                    "sessionId": "a3db40",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H2",
-                    "location": "agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-                    "message": "Intent compiler validation failed",
-                    "data": {"attempt": attempt, "error": str(exc)[:2000]},
-                    "timestamp": __import__("time").time_ns() // 1_000_000,
-                }
-            )
-            # endregion agent log
             log_event(
                 run_id="intent",
                 hypothesis_id="LLM",
@@ -247,10 +199,10 @@ def compile_macro_intent_with_llm(
     dag_nodes: Dict[str, DagNodeSpec] = {}
     for n in intent_nodes:
         resolved_target = _resolve_target_file(repo_root, n.target_file)
-        # Accept "patch", "build", or "custom". A bespoke `workflow` list is only honored
+        # Accept named presets plus "patch", "build", or "custom". A bespoke `workflow` list is only honored
         # when `pipeline_mode == "custom"` (explicit opt-in), otherwise we fall back to
         # the named preset and ignore any stray workflow list the LLM emitted.
-        if n.pipeline_mode in ("patch", "build", "custom"):
+        if n.pipeline_mode in ("patch", "build", "custom") or is_pipeline_preset(n.pipeline_mode):
             pipeline_mode = n.pipeline_mode
         else:
             pipeline_mode = "patch"

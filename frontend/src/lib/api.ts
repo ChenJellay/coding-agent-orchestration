@@ -332,7 +332,7 @@ export async function resumeDag(dag_id: string): Promise<{ ok: true }> {
   return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/resume`, {})
 }
 
-export type PipelineMode = 'patch' | 'build'
+export type PipelineMode = 'patch' | 'build' | 'product_eng' | 'diff_guard_patch' | 'secure_build_plus' | 'lint_type_gate'
 
 export async function startDagFromDashboard(params: {
   repo_path: string

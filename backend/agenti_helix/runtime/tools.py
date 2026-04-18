@@ -1,33 +1,18 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agenti_helix.api.task_context_store import load_task_context
 from agenti_helix.core.ast_parser import parse_file
 from agenti_helix.core.diff_builder import LinePatch, apply_line_patch_to_file
 from agenti_helix.core.repo_map import generate_repo_map, get_focused_files
 from agenti_helix.core.repo_scanner import detect_language
-
-
-# region agent log
-def _debug_write(payload: Dict[str, Any]) -> None:
-    try:
-        from pathlib import Path as _Path
-        import json as _json
-        import time as _time
-
-        # Workspace-root relative, debug-session specific.
-        ws = _Path(__file__).resolve().parents[3]
-        p = ws / ".cursor" / "debug-a3db40.log"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        payload.setdefault("sessionId", "a3db40")
-        payload.setdefault("timestamp", int(_time.time() * 1000))
-        p.open("a", encoding="utf-8").write(_json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-# endregion agent log
 
 
 def tool_get_focused_context(
@@ -222,31 +207,9 @@ def tool_build_ast_context(
     if target_files:
         result = tool_get_focused_context(repo_root=repo_root, target_files=target_files, depth=2)
         result["ast_repo_map_json"] = result["repo_map_json"]  # repo_files already carry exists: True
-        # region agent log
-        _debug_write(
-            {
-                "runId": "post-fix",
-                "hypothesisId": "V1",
-                "location": "agenti_helix/runtime/tools.py:tool_build_ast_context",
-                "message": "AST context built (focused)",
-                "data": {"target_files_count": len(target_files), "repo_files_count": len(result.get("repo_files") or [])},
-            }
-        )
-        # endregion agent log
         return result
     full = tool_build_repo_map_context(repo_root=repo_root)
     full["ast_repo_map_json"] = full["repo_map_json"]
-    # region agent log
-    _debug_write(
-        {
-            "runId": "post-fix",
-            "hypothesisId": "V1",
-            "location": "agenti_helix/runtime/tools.py:tool_build_ast_context",
-            "message": "AST context built (full)",
-            "data": {"repo_files_count": len(full.get("repo_files") or [])},
-        }
-    )
-    # endregion agent log
     return full
 
 
@@ -390,21 +353,6 @@ def tool_write_all_files(
         # Store the relative path so the verification loop can apply/rollback without guessing.
         result["snapshots_dir"] = str(snapshots_dir.relative_to(repo_root_path))
         (snapshots_dir / "snapshots.json").write_text(json.dumps(snapshots, indent=2), encoding="utf-8")
-        # region agent log
-        _debug_write(
-            {
-                "runId": "post-fix",
-                "hypothesisId": "V2",
-                "location": "agenti_helix/runtime/tools.py:tool_write_all_files",
-                "message": "Snapshots captured for manual sign-off",
-                "data": {
-                    "checkpoint_id_present": bool(checkpoint_id),
-                    "snapshots_dir": str(snapshots_dir),
-                    "files_count": len(manifest.get("files") or []),
-                },
-            }
-        )
-        # endregion agent log
     return result
 
 
@@ -468,6 +416,204 @@ def tool_load_rules(*, repo_root: str | Path) -> Dict[str, Any]:
     return {"repo_rules_text": "No repository rules file found. Apply general best practices."}
 
 
+def _strip_html_to_text(body: str) -> str:
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", body)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?i)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\\s*>", "\n\n", text)
+    text = re.sub(r"(?is)<.*?>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def tool_fetch_doc_content(
+    *,
+    task_id: str,
+    doc_url: Optional[str] = None,
+    timeout_seconds: int = 15,
+) -> Dict[str, Any]:
+    """Fetch task-linked documentation and return a text payload for doc_fetcher_v1."""
+    resolved_url = (doc_url or "").strip()
+    if not resolved_url:
+        ctx = load_task_context(task_id)
+        resolved_url = (ctx.doc_url or "").strip() if ctx else ""
+    if not resolved_url:
+        return {
+            "doc_url": "",
+            "doc_title": "",
+            "doc_content": "",
+            "notes": (load_task_context(task_id).notes if load_task_context(task_id) else None),
+            "fetch_error": "No doc_url stored for this task.",
+        }
+
+    req = urllib.request.Request(
+        resolved_url,
+        headers={"User-Agent": "agenti-helix/1.0 (+doc-fetcher)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read()
+            content_type = resp.headers.get("content-type", "")
+        body = raw.decode("utf-8", errors="replace")
+        title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+        title = _strip_html_to_text(title_match.group(1)) if title_match else ""
+        if "html" in content_type.lower():
+            content = _strip_html_to_text(body)
+        else:
+            content = body.strip()
+        ctx = load_task_context(task_id)
+        return {
+            "doc_url": resolved_url,
+            "doc_title": title,
+            "doc_content": content,
+            "notes": ctx.notes if ctx else None,
+        }
+    except Exception as exc:
+        ctx = load_task_context(task_id)
+        return {
+            "doc_url": resolved_url,
+            "doc_title": "",
+            "doc_content": "",
+            "notes": ctx.notes if ctx else None,
+            "fetch_error": str(exc),
+        }
+
+
+def tool_build_augmented_task_inputs(
+    *,
+    intent: str,
+    acceptance_criteria: str,
+    doc_fetcher_output: Optional[Dict[str, Any]] = None,
+    task_notes: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Merge optional doc/task context into the task intent and acceptance criteria."""
+    intent_parts = [intent.strip()]
+    criteria_parts = [acceptance_criteria.strip()]
+    if task_notes:
+        intent_parts.append(f"Task notes:\n{task_notes.strip()}")
+    if isinstance(doc_fetcher_output, dict) and not doc_fetcher_output.get("irrelevant", False):
+        constraints = [str(x).strip() for x in (doc_fetcher_output.get("key_constraints") or []) if str(x).strip()]
+        summary = str(doc_fetcher_output.get("task_relevance_summary") or "").strip()
+        examples = [
+            f"- {str(item.get('label') or 'Example')}: {str(item.get('snippet') or '').strip()}"
+            for item in (doc_fetcher_output.get("code_examples") or [])
+            if isinstance(item, dict) and str(item.get("snippet") or "").strip()
+        ]
+        if summary:
+            intent_parts.append(f"Documentation guidance:\n{summary}")
+        if constraints:
+            criteria_parts.append("Documentation constraints:\n- " + "\n- ".join(constraints))
+        if examples:
+            intent_parts.append("Relevant doc examples:\n" + "\n".join(examples[:4]))
+    merged_intent = "\n\n".join(part for part in intent_parts if part)
+    merged_acceptance = "\n\n".join(part for part in criteria_parts if part)
+    return {"intent": merged_intent, "acceptance_criteria": merged_acceptance}
+
+
+def tool_get_git_diff(
+    *,
+    repo_root: str | Path,
+    files_written: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return a unified git diff for the changed files, or a clear fallback message."""
+    repo_root_path = Path(repo_root).resolve()
+    args = [p for p in (files_written or []) if p]
+    cmd = ["git", "diff", "--"] + args if args else ["git", "diff"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root_path),
+            timeout=20,
+        )
+        diff_text = "\n".join(filter(None, [result.stdout, result.stderr])).strip()
+        return {"git_diff": diff_text or "No git diff detected."}
+    except Exception as exc:
+        return {"git_diff": f"Unable to collect git diff: {exc}"}
+
+
+def _pick_lint_command(repo_root_path: Path, changed_files: List[str]) -> List[str]:
+    package_json = repo_root_path / "package.json"
+    pyproject = repo_root_path / "pyproject.toml"
+    if package_json.exists():
+        return ["npx", "--yes", "eslint", "--format", "unix", *changed_files]
+    if pyproject.exists():
+        return ["python", "-m", "ruff", "check", *changed_files]
+    return []
+
+
+def tool_run_linter(
+    *,
+    repo_root: str | Path,
+    target_file: str,
+    changed_files: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    repo_root_path = Path(repo_root).resolve()
+    files = [p for p in (changed_files or []) if p] or [target_file]
+    cmd = _pick_lint_command(repo_root_path, files)
+    if not cmd:
+        return {"target_file": target_file, "language": tool_infer_language_from_target_file(target_file=target_file), "linter_raw_output": "Linter unsupported for this repository."}
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root_path),
+            timeout=60,
+        )
+        raw = "\n".join(filter(None, [result.stdout, result.stderr])).strip()
+        return {
+            "target_file": target_file,
+            "language": tool_infer_language_from_target_file(target_file=target_file),
+            "linter_raw_output": raw or "Lint completed successfully with no findings.",
+        }
+    except Exception as exc:
+        return {"target_file": target_file, "language": tool_infer_language_from_target_file(target_file=target_file), "linter_raw_output": f"Linter invocation failed: {exc}"}
+
+
+def _pick_typecheck_command(repo_root_path: Path, changed_files: List[str]) -> List[str]:
+    pyproject = repo_root_path / "pyproject.toml"
+    package_json = repo_root_path / "package.json"
+    if pyproject.exists():
+        return ["python", "-m", "mypy", *changed_files]
+    if package_json.exists():
+        return ["npx", "--yes", "tsc", "--noEmit", "--pretty", "false"]
+    return []
+
+
+def tool_run_typecheck(
+    *,
+    repo_root: str | Path,
+    target_file: str,
+    changed_files: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    repo_root_path = Path(repo_root).resolve()
+    files = [p for p in (changed_files or []) if p] or [target_file]
+    cmd = _pick_typecheck_command(repo_root_path, files)
+    if not cmd:
+        return {"target_file": target_file, "language": tool_infer_language_from_target_file(target_file=target_file), "type_checker_output": "Type checker unsupported for this repository."}
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root_path),
+            timeout=90,
+        )
+        raw = "\n".join(filter(None, [result.stdout, result.stderr])).strip()
+        return {
+            "target_file": target_file,
+            "language": tool_infer_language_from_target_file(target_file=target_file),
+            "type_checker_output": raw or "Found 0 errors.",
+        }
+    except Exception as exc:
+        return {"target_file": target_file, "language": tool_infer_language_from_target_file(target_file=target_file), "type_checker_output": f"Type checker invocation failed: {exc}"}
+
+
 def tool_map_evaluator_verdict(
     *,
     pass_tests: Optional[bool],
@@ -475,6 +621,9 @@ def tool_map_evaluator_verdict(
     feedback_for_coder: str = "",
     is_safe: bool = True,
     violations: Optional[List[str]] = None,
+    diff_validator_output: Optional[Dict[str, Any]] = None,
+    linter_output: Optional[Dict[str, Any]] = None,
+    type_checker_output: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Translate judge_evaluator_v1 + security_governor_v1 outputs into the
@@ -486,7 +635,18 @@ def tool_map_evaluator_verdict(
       None  — judge explicitly flagged no-test-infrastructure; treated as FAIL to avoid
               silently passing code with zero behavioral verification
     """
-    if not is_safe and violations:
+    validator_verdict = ""
+    validator_summary = ""
+    if isinstance(diff_validator_output, dict):
+        validator_verdict = str(diff_validator_output.get("verdict") or "").upper()
+        validator_summary = str(diff_validator_output.get("summary") or "").strip()
+    lint_summary = str((linter_output or {}).get("summary") or "").strip() if isinstance(linter_output, dict) else ""
+    type_summary = str((type_checker_output or {}).get("summary") or "").strip() if isinstance(type_checker_output, dict) else ""
+
+    if validator_verdict == "BLOCK":
+        verdict = "FAIL"
+        justification = validator_summary or "Diff validator blocked the change."
+    elif not is_safe and violations:
         verdict = "FAIL"
         justification = "Security violations: " + "; ".join(str(v) for v in violations[:5])
     elif pass_tests is True:
@@ -504,7 +664,53 @@ def tool_map_evaluator_verdict(
     else:
         verdict = "FAIL"
         justification = feedback_for_coder or evaluation_reasoning or "Tests failed."
+    extras = [part for part in [validator_summary if validator_verdict == "WARN" else "", lint_summary, type_summary] if part]
+    if extras:
+        justification = (justification + "\n\nAdditional checks:\n- " + "\n- ".join(extras)).strip()
     return {"verdict": verdict, "justification": justification, "problematic_lines": []}
+
+
+def tool_finalize_judge_verdict(
+    *,
+    base_judge_response: Optional[Dict[str, Any]] = None,
+    snippet_judge_response: Optional[Dict[str, Any]] = None,
+    diff_validator_output: Optional[Dict[str, Any]] = None,
+    governor_output: Optional[Dict[str, Any]] = None,
+    linter_output: Optional[Dict[str, Any]] = None,
+    type_checker_output: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Merge optional gate outputs into the final judge_response object."""
+    base = {}
+    if isinstance(base_judge_response, dict) and base_judge_response:
+        base = dict(base_judge_response)
+    if isinstance(snippet_judge_response, dict) and snippet_judge_response:
+        base = dict(snippet_judge_response)
+
+    verdict = str(base.get("verdict") or "FAIL").upper()
+    justification = str(base.get("justification") or "No verdict was produced.")
+    problematic_lines = list(base.get("problematic_lines") or [])
+
+    if isinstance(governor_output, dict) and not bool(governor_output.get("is_safe", True)):
+        violations = governor_output.get("violations") or []
+        verdict = "FAIL"
+        justification = "Security violations: " + "; ".join(str(v) for v in violations[:5])
+
+    if isinstance(diff_validator_output, dict):
+        diff_verdict = str(diff_validator_output.get("verdict") or "").upper()
+        diff_summary = str(diff_validator_output.get("summary") or "").strip()
+        if diff_verdict == "BLOCK":
+            verdict = "FAIL"
+            justification = diff_summary or "Diff validator blocked the change."
+        elif diff_verdict == "WARN" and diff_summary:
+            justification = f"{justification}\n\nDiff validation: {diff_summary}".strip()
+
+    for label, output in (("Lint", linter_output), ("Type checks", type_checker_output)):
+        if isinstance(output, dict):
+            summary = str(output.get("summary") or "").strip()
+            if summary:
+                justification = f"{justification}\n\n{label}: {summary}".strip()
+
+    return {"verdict": verdict, "justification": justification, "problematic_lines": problematic_lines}
 
 
 def tool_escalate_to_human(
@@ -721,7 +927,13 @@ TOOL_REGISTRY: Dict[str, Any] = {
     "write_all_files": tool_write_all_files,
     "run_tests": tool_run_tests,
     "load_rules": tool_load_rules,
+    "fetch_doc_content": tool_fetch_doc_content,
+    "build_augmented_task_inputs": tool_build_augmented_task_inputs,
+    "get_git_diff": tool_get_git_diff,
+    "run_linter": tool_run_linter,
+    "run_typecheck": tool_run_typecheck,
     "map_evaluator_verdict": tool_map_evaluator_verdict,
+    "finalize_judge_verdict": tool_finalize_judge_verdict,
     # Module rewriter tools
     "extract_module": tool_extract_module,
     "splice_module": tool_splice_module,

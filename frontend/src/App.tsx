@@ -388,6 +388,30 @@ function DashboardPage() {
                     desc: 'Full test-driven pipeline with context discovery, test coverage, and security audit. Best for new features and multi-file changes.',
                   },
                   {
+                    id: 'product_eng' as const,
+                    label: 'Product engineering',
+                    agents: 'doc_fetcher → librarian → sdet → coder_builder → governor → diff_validator → judge_evaluator',
+                    desc: 'Doc-first build pipeline for feature work that depends on external specs or product docs, with extra diff-scope protection.',
+                  },
+                  {
+                    id: 'diff_guard_patch' as const,
+                    label: 'Diff-guard patch',
+                    agents: 'coder_patch → diff_validator → judge',
+                    desc: 'Fast patch flow with an explicit diff-scope gate before the strict snippet judge.',
+                  },
+                  {
+                    id: 'secure_build_plus' as const,
+                    label: 'Secure build plus',
+                    agents: 'librarian → sdet → coder_builder → governor → diff_validator → judge_evaluator → judge',
+                    desc: 'Build pipeline with layered security and diff validation, plus a final strict judge pass.',
+                  },
+                  {
+                    id: 'lint_type_gate' as const,
+                    label: 'Lint and type gate',
+                    agents: 'librarian → sdet → coder_builder → linter → type_checker → judge_evaluator',
+                    desc: 'Build pipeline that surfaces lint and type-check findings directly into the verification verdict.',
+                  },
+                  {
                     id: 'orchestrator' as const,
                     label: 'Orchestrator decides',
                     agents: 'intent_compiler_v1 assigns pipeline per node',

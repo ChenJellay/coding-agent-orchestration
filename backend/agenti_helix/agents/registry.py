@@ -85,6 +85,20 @@ _AGENTS: Dict[str, AgentSpec] = {
         input_model=BaseModel,
         output_model=models.LibrarianOutput,
     ),
+    "code_searcher_v1": AgentSpec(
+        agent_id="code_searcher_v1",
+        description="Precision code search helper that returns ranked file and symbol matches.",
+        prompt_filename="code_searcher.md",
+        input_model=BaseModel,
+        output_model=models.CodeSearcherOutput,
+    ),
+    "doc_fetcher_v1": AgentSpec(
+        agent_id="doc_fetcher_v1",
+        description="Documentation context agent that distills external references into actionable constraints.",
+        prompt_filename="doc_fetcher.md",
+        input_model=BaseModel,
+        output_model=models.DocFetcherOutput,
+    ),
     "sdet_v1": AgentSpec(
         agent_id="sdet_v1",
         description="SDET: write tests first for a DAG task using provided context and framework standards.",
@@ -105,6 +119,27 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="security_governor.md",
         input_model=BaseModel,
         output_model=models.GovernorOutput,
+    ),
+    "diff_validator_v1": AgentSpec(
+        agent_id="diff_validator_v1",
+        description="Diff scope validator that catches out-of-scope changes and structural regressions.",
+        prompt_filename="diff_validator.md",
+        input_model=BaseModel,
+        output_model=models.DiffValidatorOutput,
+    ),
+    "linter_v1": AgentSpec(
+        agent_id="linter_v1",
+        description="Static analysis parser that turns raw linter output into prioritized findings.",
+        prompt_filename="linter.md",
+        input_model=BaseModel,
+        output_model=models.LinterOutput,
+    ),
+    "type_checker_v1": AgentSpec(
+        agent_id="type_checker_v1",
+        description="Type system validation parser for mypy and tsc outputs.",
+        prompt_filename="type_checker.md",
+        input_model=BaseModel,
+        output_model=models.TypeCheckerOutput,
     ),
     "judge_evaluator_v1": AgentSpec(
         agent_id="judge_evaluator_v1",
@@ -134,6 +169,13 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="memory_summarizer.md",
         input_model=BaseModel,
         output_model=models.MemorySummaryOutput,
+    ),
+    "memory_writer_v1": AgentSpec(
+        agent_id="memory_writer_v1",
+        description="Memory writer that converts resolved tasks into reusable episodic memory entries.",
+        prompt_filename="memory_writer.md",
+        input_model=BaseModel,
+        output_model=models.MemoryWriterOutput,
     ),
     "supreme_court_v1": AgentSpec(
         agent_id="supreme_court_v1",

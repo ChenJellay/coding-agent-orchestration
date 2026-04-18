@@ -166,29 +166,6 @@ def run_agent(
             if fb is not None:
                 data = fb
                 parse_exc = None
-                # region agent log
-                try:
-                    _p = "/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-18115f.log"
-                    import time as _time
-
-                    with open(_p, "a", encoding="utf-8") as _df:
-                        _df.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "18115f",
-                                    "timestamp": int(_time.time() * 1000),
-                                    "location": "agent_runtime.py:run_agent",
-                                    "message": "judge_v1_json_fallback_used",
-                                    "data": {"verdict": fb.get("verdict"), "agent_id": agent_id},
-                                    "hypothesisId": "H3",
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                except OSError:
-                    pass
-                # endregion
 
     if parse_exc is not None:
         if _llm_trace_enabled():

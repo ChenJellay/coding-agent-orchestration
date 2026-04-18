@@ -79,6 +79,95 @@ class ScribeOutput(BaseModel):
     semantic_trace_log: str = Field(description="A 2-3 sentence summary of how the agent solved the original intent")
 
 
+# ---------------------------------------------------------
+# 8. Supplemental workflow agents
+# ---------------------------------------------------------
+class DocExample(BaseModel):
+    label: str = Field(description="Short label for the referenced example")
+    snippet: str = Field(description="Verbatim code or text snippet extracted from the document")
+
+
+class DocFetcherOutput(BaseModel):
+    doc_url: str = Field(description="Echoed source URL")
+    doc_title: str = Field(description="Best-effort document title")
+    key_constraints: List[str] = Field(description="Task-relevant implementation constraints extracted from the document")
+    code_examples: List[DocExample] = Field(description="Relevant verbatim examples from the document")
+    task_relevance_summary: str = Field(description="Short explanation of how the document applies to the task")
+    irrelevant: bool = Field(description="True when the document did not materially help the task")
+
+
+class DiffValidationFinding(BaseModel):
+    type: str = Field(description="Finding category such as deletion, scope, or regression")
+    severity: str = Field(description="Severity level, typically info, warn, or error")
+    file: Optional[str] = Field(default=None, description="File associated with the finding, if any")
+    line_range: Optional[List[int]] = Field(default=None, description="Approximate affected line range")
+    description: str = Field(description="Human-readable summary of the issue")
+    recommendation: str = Field(description="Minimal corrective action")
+
+
+class DiffValidatorOutput(BaseModel):
+    verdict: str = Field(description='Expected values: "PASS", "WARN", or "BLOCK"')
+    files_changed: List[str] = Field(description="Files observed in the diff")
+    out_of_scope_files: List[str] = Field(description="Files that fall outside the allowed path set")
+    findings: List[DiffValidationFinding] = Field(description="Structured diff review findings")
+    rule_violations: List[str] = Field(description="Repository rule violations detected in the diff")
+    structural_regressions: List[str] = Field(description="Potential public API or contract regressions")
+    summary: str = Field(description="Overall diff validation summary")
+
+
+class StaticAnalysisFinding(BaseModel):
+    line_number: Optional[int] = Field(default=None, description="1-based line number of the finding, when available")
+    column: Optional[int] = Field(default=None, description="1-based column of the finding, when available")
+    rule_id: str = Field(description="Linter or compiler rule identifier")
+    severity: str = Field(description="Severity level: error, warning, or info")
+    message: str = Field(description="Raw finding message")
+    fix_hint: str = Field(description="Minimal actionable fix guidance")
+    blocks_acceptance: bool = Field(description="Whether this finding likely blocks the stated acceptance criteria")
+
+
+class LinterOutput(BaseModel):
+    target_file: str = Field(description="Echoed target file path")
+    language: str = Field(description="Echoed language identifier")
+    finding_count: int = Field(description="Total findings parsed from the linter output")
+    has_errors: bool = Field(description="True when at least one error-level finding is present")
+    findings: List[StaticAnalysisFinding] = Field(description="Structured linter findings")
+    summary: str = Field(description="Condensed linter summary")
+
+
+class TypeCheckFinding(BaseModel):
+    line_number: Optional[int] = Field(default=None, description="1-based line number of the finding, when available")
+    column: Optional[int] = Field(default=None, description="1-based column of the finding, when available")
+    error_code: str = Field(description="Type checker error code")
+    classification: str = Field(description="Normalized classification of the type issue")
+    message: str = Field(description="Raw type checker message")
+    in_dependency: bool = Field(description="True when the error originates in a non-target dependency file")
+    fix_instruction: str = Field(description="Concrete next action for resolving the type issue")
+    blocks_acceptance: bool = Field(description="Whether this finding likely blocks the stated acceptance criteria")
+
+
+class TypeCheckerOutput(BaseModel):
+    target_file: str = Field(description="Echoed target file path")
+    language: str = Field(description="Echoed language identifier")
+    type_health: str = Field(description='Overall status: "clean", "fixable", or "structural"')
+    error_count: int = Field(description="Total errors parsed from the type checker output")
+    findings: List[TypeCheckFinding] = Field(description="Structured type checker findings")
+    dependency_errors: List[str] = Field(description="Errors rooted in dependency files")
+    summary: str = Field(description="Condensed type-check summary")
+
+
+class SearchResult(BaseModel):
+    file_path: str = Field(description="Matching file path")
+    symbol: Optional[str] = Field(default=None, description="Most relevant symbol in the match, if any")
+    snippet: str = Field(description="Context snippet explaining the match")
+    relevance: str = Field(description="Short explanation of why this result is relevant")
+
+
+class CodeSearcherOutput(BaseModel):
+    search_strategy: str = Field(description="How the search narrowed the codebase")
+    results: List[SearchResult] = Field(description="Ranked search results with supporting snippets")
+    summary: str = Field(description="Condensed answer to the original search task")
+
+
 # =========================================================
 # Legacy schemas (used by currently-wired endpoints)
 # =========================================================
@@ -130,6 +219,7 @@ class IntentNodeSpec(BaseModel):
         description=(
             '"patch" — fast single-file line-patch (coder_patch_v1 + judge_v1). '
             '"build" — full TDD pipeline (librarian → sdet → coder_builder → governor → judge_evaluator). '
+            '"product_eng" / "diff_guard_patch" / "secure_build_plus" / "lint_type_gate" — named preset workflows. '
             '"custom" — bespoke workflow; populate `workflow` with the ordered agent_id list.'
         ),
     )
@@ -139,8 +229,9 @@ class IntentNodeSpec(BaseModel):
             "Optional ordered list of agent_ids composing a bespoke workflow for this node. "
             "When provided, the orchestrator builds coder+judge chains dynamically from this list "
             "(ignoring pipeline_mode presets). Agents are automatically split: coder-side agents "
-            "(context_librarian_v1, sdet_v1, coder_builder_v1, coder_patch_v1) produce the diff; "
-            "judge-side agents (security_governor_v1, judge_evaluator_v1, judge_v1) evaluate it."
+            "(doc_fetcher_v1, context_librarian_v1, sdet_v1, coder_builder_v1, coder_patch_v1) produce the diff; "
+            "judge-side agents (security_governor_v1, diff_validator_v1, linter_v1, type_checker_v1, "
+            "judge_evaluator_v1, judge_v1, scribe_v1, memory_writer_v1) evaluate or summarize it."
         ),
     )
 
@@ -230,4 +321,22 @@ class MemorySummaryOutput(BaseModel):
     key_constraints: List[str] = Field(
         description="Bullet list of constraints or facts the next attempt MUST respect (max 5)."
     )
+
+
+class MemoryWriterEpisode(BaseModel):
+    error_pattern: str = Field(description="Generalized problem pattern")
+    resolution_pattern: str = Field(description="Generalized fix pattern")
+    anti_patterns: List[str] = Field(description="Previously attempted approaches that should be avoided")
+    applicable_file_types: List[str] = Field(description="File types where this episode is relevant")
+    retrieval_key: List[str] = Field(description="Keywords for future retrieval")
+
+
+class MemoryWriterOutput(BaseModel):
+    task_id: str = Field(description="Echoed task id")
+    dag_id: str = Field(description="Echoed dag id")
+    target_file: str = Field(description="Echoed target file")
+    final_verdict: str = Field(description='Expected values: "PASS" or "ESCALATED"')
+    attempt_count: int = Field(description="Number of attempts that occurred before resolution")
+    episode: MemoryWriterEpisode = Field(description="Generalized episode to persist")
+    should_persist: bool = Field(description="Whether the episode is worth writing to memory")
 

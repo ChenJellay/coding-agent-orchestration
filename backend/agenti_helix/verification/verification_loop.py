@@ -13,6 +13,7 @@ from langgraph.graph import END, StateGraph
 
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.chain_runtime import run_chain
+from agenti_helix.runtime.pipeline_presets import is_pipeline_preset
 # master_orchestrator is imported lazily inside node_run_coder / node_call_judge
 # to break the verification_loop ↔ orchestrator circular dependency.
 
@@ -92,6 +93,7 @@ class VerificationState:
     # Populated after the first successful chain run so that retries skip those
     # expensive steps and only re-run the coder + write_files portion.
     cached_chain_context: Optional[Dict[str, Any]] = None
+    chain_artifacts: Dict[str, Any] = field(default_factory=dict)
 
 
 def _is_cancelled(cancel_token: Any | None) -> bool:
@@ -130,7 +132,7 @@ def _requires_manual_signoff(task: EditTaskSpec) -> bool:
     - build mode: also staged + rollback so code isn't written "for real" before review
     """
     mode = (getattr(task, "pipeline_mode", None) or "patch").lower()
-    return mode in ("patch", "build")
+    return mode in ("patch", "build") or is_pipeline_preset(mode)
 
 
 def _restore_paths_from_snapshots(*, repo_root: Path, snapshots: Dict[str, Any]) -> None:
@@ -249,6 +251,9 @@ def node_run_coder(state: VerificationState) -> VerificationState:
 
     # Keys produced by the librarian/SDET that are safe to reuse across coder retries.
     _CACHEABLE_CTX_KEYS = (
+        "doc_context",
+        "doc_fetcher_output",
+        "task_input",
         "ast_repo_map_ctx",
         "librarian_output",
         "file_contexts",
@@ -261,10 +266,19 @@ def node_run_coder(state: VerificationState) -> VerificationState:
         ctx: Dict[str, Any] = {
             "repo_root": repo_root,
             "intent": intent,
+            "task_input": {
+                "intent": intent,
+                "acceptance_criteria": state.task.acceptance_criteria,
+            },
             "target_file": state.task.target_file,
             "acceptance_criteria": state.task.acceptance_criteria,
             "repo_path": state.task.repo_path,
             "checkpoint_id": state.checkpoint.checkpoint_id if state.checkpoint else "",
+            "task_id": state.task.task_id,
+            "dag_id": state.dag_id or "",
+            "attempt_count": state.retry_count + 1,
+            "error_history": list(state.error_history),
+            "patch_summaries": [],
         }
         # §4.6 — Pre-seed the chain context with cached upstream outputs so that
         # steps marked `skip_if_present` are bypassed on retries.
@@ -525,16 +539,30 @@ def node_call_judge(state: VerificationState) -> VerificationState:
     original_snippet = state.original_content or ""
     from agenti_helix.orchestration.master_orchestrator import resolve_judge_chain  # noqa: PLC0415
     judge_chain = resolve_judge_chain(state.task)
+    allowed_paths = {state.task.target_file}
+    if isinstance(state.diff_json, dict):
+        allowed_paths.update(str(p) for p in (state.diff_json.get("files_written") or []) if p)
+        allowed_paths.update(str(p) for p in (state.diff_json.get("test_file_paths") or []) if p)
     ctx = {
         "repo_root": repo_root,
         "repo_path": state.task.repo_path,
         "target_file": state.task.target_file,
         "acceptance_criteria": state.task.acceptance_criteria,
+        "task_input": {
+            "intent": _build_coder_intent(state),
+            "acceptance_criteria": state.task.acceptance_criteria,
+        },
         "original_snippet": original_snippet,
         "static_check_logs": state.static_check_logs or {},
         # Passed so full-pipeline judge chain can access test file paths and diff metadata.
         "intent": _build_coder_intent(state),
         "diff_json": state.diff_json or {},
+        "allowed_paths": sorted(allowed_paths),
+        "task_id": state.task.task_id,
+        "dag_id": state.dag_id or "",
+        "attempt_count": state.retry_count + 1,
+        "error_history": list(state.error_history),
+        "patch_summaries": [str((state.diff_json or {}).get("diff_summary") or "")],
     }
     attempt_label = f"judge_attempt_{state.retry_count + 1}"
     try:
@@ -570,6 +598,17 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         return state
 
     state.judge_response = ctx.get("judge_response")
+    state.chain_artifacts = {
+        key: ctx[key]
+        for key in (
+            "diff_validator_output",
+            "linter_output",
+            "type_checker_output",
+            "scribe_output",
+            "memory_writer_output",
+        )
+        if key in ctx
+    }
 
     log_event(
         run_id=state.task.task_id,
@@ -607,6 +646,8 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
     if str(verdict).upper() == "PASS":
         post_judge_body = target_path.read_text()
         tool_logs_base = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
+        if state.chain_artifacts:
+            tool_logs_base["chain_artifacts"] = state.chain_artifacts
         if _requires_manual_signoff(state.task):
             # Build-mode may have written multiple files. If we have snapshots, stage a multi-file post_state_ref.
             snapshots_dir = None
