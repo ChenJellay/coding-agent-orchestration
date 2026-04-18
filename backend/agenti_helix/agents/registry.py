@@ -144,6 +144,13 @@ _AGENTS: Dict[str, AgentSpec] = {
         # Same shared local model as all other agents (QWEN_MODEL_PATH / default MLX HF id).
         backend_type="mlx_local",
     ),
+    "coder_module_v1": AgentSpec(
+        agent_id="coder_module_v1",
+        description="Module rewriter: rewrites an entire function/class module given full file context, avoiding line-number errors.",
+        prompt_filename="coder_module.md",
+        input_model=BaseModel,
+        output_model=models.CoderModuleOutput,
+    ),
 }
 
 

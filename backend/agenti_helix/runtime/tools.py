@@ -338,6 +338,188 @@ def tool_map_evaluator_verdict(
     return {"verdict": verdict, "justification": justification, "problematic_lines": []}
 
 
+def tool_extract_module(
+    *,
+    repo_root: str | Path,
+    target_file: str,
+) -> Dict[str, Any]:
+    """
+    Extract the primary exported function/class from target_file using tree-sitter.
+
+    Priority:
+      1. export_statement containing function_declaration / class_declaration / lexical_declaration
+      2. First function_declaration at root level
+      3. First lexical_declaration at root level with an uppercase-named arrow function
+      4. Full file fallback (full_file_used=True)
+
+    Returns module_content, module_start_line (1-based), module_end_line (1-based),
+    module_name, full_file_used.
+    """
+    repo_root_path = Path(repo_root).resolve()
+    target_path = repo_root_path / target_file
+
+    full_text = target_path.read_text(encoding="utf-8")
+    full_lines = full_text.splitlines(keepends=True)
+
+    def _full_file_result() -> Dict[str, Any]:
+        return {
+            "module_content": full_text,
+            "module_start_line": 1,
+            "module_end_line": len(full_lines),
+            "module_name": Path(target_file).stem,
+            "full_file_used": True,
+        }
+
+    try:
+        lang = detect_language(target_path)
+        if lang not in ("javascript", "typescript"):
+            return _full_file_result()
+
+        tree = parse_file(target_path, lang)
+        root = tree.root_node
+
+        # Priority 1: export_statement containing function/class/lexical declaration
+        for child in root.children:
+            if child.type == "export_statement":
+                for sub in child.children:
+                    if sub.type in ("function_declaration", "class_declaration", "lexical_declaration"):
+                        # Attempt to extract the name
+                        name = ""
+                        if sub.type == "function_declaration":
+                            for n in sub.children:
+                                if n.type == "identifier":
+                                    name = n.text.decode("utf-8") if isinstance(n.text, bytes) else n.text
+                                    break
+                        elif sub.type == "class_declaration":
+                            for n in sub.children:
+                                if n.type == "identifier":
+                                    name = n.text.decode("utf-8") if isinstance(n.text, bytes) else n.text
+                                    break
+                        elif sub.type == "lexical_declaration":
+                            for n in sub.children:
+                                if n.type == "variable_declarator":
+                                    for m in n.children:
+                                        if m.type == "identifier":
+                                            name = m.text.decode("utf-8") if isinstance(m.text, bytes) else m.text
+                                            break
+                                    if name:
+                                        break
+                        start_line = child.start_point[0] + 1
+                        end_line = child.end_point[0] + 1
+                        module_content = "".join(full_lines[start_line - 1:end_line])
+                        return {
+                            "module_content": module_content,
+                            "module_start_line": start_line,
+                            "module_end_line": end_line,
+                            "module_name": name or Path(target_file).stem,
+                            "full_file_used": False,
+                        }
+
+        # Priority 2: First function_declaration at root level
+        for child in root.children:
+            if child.type == "function_declaration":
+                name = ""
+                for n in child.children:
+                    if n.type == "identifier":
+                        name = n.text.decode("utf-8") if isinstance(n.text, bytes) else n.text
+                        break
+                start_line = child.start_point[0] + 1
+                end_line = child.end_point[0] + 1
+                module_content = "".join(full_lines[start_line - 1:end_line])
+                return {
+                    "module_content": module_content,
+                    "module_start_line": start_line,
+                    "module_end_line": end_line,
+                    "module_name": name or Path(target_file).stem,
+                    "full_file_used": False,
+                }
+
+        # Priority 3: First lexical_declaration with an uppercase-named arrow function
+        for child in root.children:
+            if child.type == "lexical_declaration":
+                for declarator in child.children:
+                    if declarator.type == "variable_declarator":
+                        var_name = ""
+                        has_arrow = False
+                        for n in declarator.children:
+                            if n.type == "identifier":
+                                var_name = n.text.decode("utf-8") if isinstance(n.text, bytes) else n.text
+                            if n.type == "arrow_function":
+                                has_arrow = True
+                        if has_arrow and var_name and var_name[0].isupper():
+                            start_line = child.start_point[0] + 1
+                            end_line = child.end_point[0] + 1
+                            module_content = "".join(full_lines[start_line - 1:end_line])
+                            return {
+                                "module_content": module_content,
+                                "module_start_line": start_line,
+                                "module_end_line": end_line,
+                                "module_name": var_name,
+                                "full_file_used": False,
+                            }
+
+        # Priority 4: Full file fallback
+        return _full_file_result()
+
+    except Exception:
+        return _full_file_result()
+
+
+def tool_splice_module(
+    *,
+    repo_root: str | Path,
+    target_file: str,
+    module_start_line: int,
+    module_end_line: int,
+    rewritten_module: str,
+) -> Dict[str, Any]:
+    """
+    Replace lines module_start_line..module_end_line (1-based, inclusive) in target_file
+    with rewritten_module, then run a tree-sitter syntax check.
+
+    Returns a diff_json-compatible dict with files_written, test_file_paths, diff_json_str,
+    and optionally syntax_error.
+    """
+    repo_root_path = Path(repo_root).resolve()
+    target_path = repo_root_path / target_file
+
+    orig_text = target_path.read_text(encoding="utf-8")
+    orig_lines = orig_text.splitlines(keepends=True)
+
+    # Ensure rewritten_module ends with a newline to avoid joining lines.
+    if rewritten_module and not rewritten_module.endswith("\n"):
+        rewritten_module = rewritten_module + "\n"
+
+    rewritten_lines = rewritten_module.splitlines(keepends=True)
+
+    new_lines = orig_lines[: module_start_line - 1] + rewritten_lines + orig_lines[module_end_line:]
+    new_text = "".join(new_lines)
+
+    target_path.write_text(new_text, encoding="utf-8")
+
+    # Syntax check for JS/TS via tree-sitter.
+    syntax_error: str | None = None
+    try:
+        lang = detect_language(target_path)
+        if lang in ("javascript", "typescript"):
+            parse_file(target_path, lang)
+    except Exception as exc:
+        syntax_error = str(exc)
+
+    result: Dict[str, Any] = {
+        "files_written": [target_file],
+        "test_file_paths": [],
+        "diff_summary": f"Spliced module into {target_file} (lines {module_start_line}–{module_end_line})",
+    }
+    result["diff_json_str"] = json.dumps(
+        {"files_written": [target_file], "test_file_paths": []},
+        indent=2,
+    )
+    if syntax_error:
+        result["syntax_error"] = syntax_error
+    return result
+
+
 def tool_escalate_to_human(
     *,
     reason: str,
@@ -372,6 +554,9 @@ TOOL_REGISTRY: Dict[str, Any] = {
     "run_tests": tool_run_tests,
     "load_rules": tool_load_rules,
     "map_evaluator_verdict": tool_map_evaluator_verdict,
+    # Module rewriter tools
+    "extract_module": tool_extract_module,
+    "splice_module": tool_splice_module,
     # Shared utilities
     "query_memory": tool_query_memory,
     "escalate_to_human": tool_escalate_to_human,

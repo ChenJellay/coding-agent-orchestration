@@ -278,6 +278,68 @@ def default_full_pipeline_judge_chain(task: Any | None = None) -> Dict[str, Any]
     }
 
 
+def default_module_rewriter_chain(task: Any | None = None) -> Dict[str, Any]:
+    """
+    Module-rewrite coder chain:
+      snapshot_target_file → extract_module → coder_module_v1 → splice_module (→ diff_json)
+
+    Extracts the primary function/class from target_file, rewrites it with the LLM,
+    then splices the result back in-place. Avoids line-number ambiguity.
+    """
+    return {
+        "steps": [
+            {
+                "type": "tool",
+                "id": "snapshot_file",
+                "output_key": "target_file_content",
+                "tool_name": "snapshot_target_file",
+                "input_bindings": {
+                    "repo_root": {"$ref": "repo_root"},
+                    "target_file": {"$ref": "target_file"},
+                },
+            },
+            {
+                "type": "tool",
+                "id": "extract_mod",
+                "output_key": "module_ctx",
+                "tool_name": "extract_module",
+                "input_bindings": {
+                    "repo_root": {"$ref": "repo_root"},
+                    "target_file": {"$ref": "target_file"},
+                },
+            },
+            {
+                "type": "agent",
+                "id": "coder_module",
+                "output_key": "coder_module_output",
+                "agent_id": "coder_module_v1",
+                "input_bindings": {
+                    "full_file_content": {"$ref": "target_file_content"},
+                    "module_content": {"$ref": "module_ctx.module_content"},
+                    "module_start_line": {"$ref": "module_ctx.module_start_line"},
+                    "module_end_line": {"$ref": "module_ctx.module_end_line"},
+                    "intent": {"$ref": "intent"},
+                    "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                },
+                "runtime": {"temperature": 0.0, "max_tokens": 4096},
+            },
+            {
+                "type": "tool",
+                "id": "splice_mod",
+                "output_key": "diff_json",
+                "tool_name": "splice_module",
+                "input_bindings": {
+                    "repo_root": {"$ref": "repo_root"},
+                    "target_file": {"$ref": "target_file"},
+                    "module_start_line": {"$ref": "module_ctx.module_start_line"},
+                    "module_end_line": {"$ref": "module_ctx.module_end_line"},
+                    "rewritten_module": {"$ref": "coder_module_output.rewritten_module"},
+                },
+            },
+        ]
+    }
+
+
 def default_intent_compiler_chain() -> Dict[str, Any]:
     """
     Default intent compilation chain:

@@ -172,6 +172,15 @@ class SnippetJudgeOutput(BaseModel):
     problematic_lines: List[int] = Field(description="1-based line numbers in edited snippet that are problematic")
 
 
+class CoderModuleOutput(BaseModel):
+    rewritten_module: str = Field(
+        description=(
+            "The complete rewritten module text. This is a drop-in replacement for the extracted "
+            "lines — do not include file-level imports or code outside the module."
+        )
+    )
+
+
 # ---------------------------------------------------------
 # 8. The Memory Summarizer
 # ---------------------------------------------------------
