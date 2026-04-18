@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from agenti_helix.runtime.chain_defaults import (
+    build_workflow_coder_chain,
+    build_workflow_judge_chain,
     default_coder_chain,
     default_judge_chain,
     default_full_pipeline_coder_chain,
@@ -17,11 +19,15 @@ def resolve_coder_chain(task: EditTaskSpec) -> Dict[str, Any]:
 
     Priority:
       1. Explicit `task.coder_chain` (user override via API).
-      2. `task.pipeline_mode == "build"` → full TDD pipeline.
-      3. Default → single-file patch chain.
+      2. Bespoke `task.workflow` — dynamic chain synthesized from agent_ids.
+      3. `task.pipeline_mode == "build"` → full TDD pipeline.
+      4. Default → single-file patch chain.
     """
     if task.coder_chain:
         return task.coder_chain
+    workflow = getattr(task, "workflow", None)
+    if workflow:
+        return build_workflow_coder_chain(list(workflow), task)
     if getattr(task, "pipeline_mode", "patch") == "build":
         return default_full_pipeline_coder_chain(task)
     return default_coder_chain(task)
@@ -33,11 +39,15 @@ def resolve_judge_chain(task: EditTaskSpec) -> Dict[str, Any]:
 
     Priority:
       1. Explicit `task.judge_chain` (user override via API).
-      2. `task.pipeline_mode == "build"` → full TDD judge pipeline.
-      3. Default → snippet-comparison judge chain.
+      2. Bespoke `task.workflow` — dynamic chain synthesized from agent_ids.
+      3. `task.pipeline_mode == "build"` → full TDD judge pipeline.
+      4. Default → snippet-comparison judge chain.
     """
     if task.judge_chain:
         return task.judge_chain
+    workflow = getattr(task, "workflow", None)
+    if workflow:
+        return build_workflow_judge_chain(list(workflow), task)
     if getattr(task, "pipeline_mode", "patch") == "build":
         return default_full_pipeline_judge_chain(task)
     return default_judge_chain(task)

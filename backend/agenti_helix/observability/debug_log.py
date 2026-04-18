@@ -30,6 +30,11 @@ def log_event(
     if os.environ.get("AGENTI_HELIX_DISABLE_LOGGING", "").strip().lower() in {"1", "true", "yes"}:
         return
 
+    # UI policy (2026-04): Only persist LLM I/O traces. System action logs are no longer recorded.
+    kind = (data or {}).get("kind") if isinstance(data, dict) else None
+    if kind != "llm_trace":
+        return
+
     payload: Dict[str, Any] = {
         "sessionId": _SESSION_ID,
         "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",

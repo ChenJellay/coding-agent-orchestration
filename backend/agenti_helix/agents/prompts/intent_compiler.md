@@ -10,7 +10,29 @@ Use for: cosmetic changes, small bug fixes, single-function edits, config tweaks
 Agents: `context_librarian_v1` → `sdet_v1` → `coder_builder_v1` → `security_governor_v1` → `judge_evaluator_v1`
 Use for: new features, multi-file changes, logic-heavy tasks, anything requiring new test coverage, security-sensitive edits.
 
+**"custom"** — Bespoke workflow you compose from the agent roster below.
+Populate the `workflow` field with an ordered list of agent_ids. The orchestrator
+automatically splits the list into coder-side (produces the diff) and judge-side
+(evaluates it) and synthesizes chains dynamically. Use this whenever the task
+does not map cleanly to "patch" or "build" — e.g. "code change but no new tests
+needed", or "full context gathering + quick line patch + security audit".
+
+### Agent roster
+
+Coder-side agents (produce or contribute to the diff):
+- `context_librarian_v1` — scouts the repo map and returns the exact files/symbols required. Always add this first when any downstream agent needs loaded file contexts.
+- `sdet_v1` — writes tests first (TDD). Depends on `context_librarian_v1`.
+- `coder_builder_v1` — multi-file implementation. Depends on `context_librarian_v1`. Pair with `sdet_v1` when new tests are wanted.
+- `coder_patch_v1` — single-file line patch. Standalone; does not need the librarian.
+
+Judge-side agents (evaluate the diff):
+- `security_governor_v1` — lint/security audit against repo rules.
+- `judge_evaluator_v1` — runs tests and judges pass/fail against acceptance criteria. Use when tests were written.
+- `judge_v1` — strict snippet-comparison judge. Cheap, local, no test execution. Use for patch-style edits.
+
 ## Rules
+
+**Scope constraint:** Your DAG must contain ONLY the tasks explicitly required by the macro intent above. Do not add tasks for files, features, buttons, integrations, or modifications to files not mentioned by the user. Err on the side of fewer, more targeted tasks. If in doubt, leave it out.
 
 Tasks must be granular and actionable (e.g., "Create API route", not "Build backend").
 
@@ -55,7 +77,16 @@ After your `<think>...</think>` block, output the following JSON and nothing els
       "description": "short description",
       "target_file": "path/relative/to/repo",
       "acceptance_criteria": "clear, testable criteria",
-      "pipeline_mode": "patch"
+      "pipeline_mode": "patch",
+      "workflow": null
+    }},
+    {{
+      "node_id": "N2",
+      "description": "example bespoke node",
+      "target_file": "path/relative/to/repo",
+      "acceptance_criteria": "clear, testable criteria",
+      "pipeline_mode": "custom",
+      "workflow": ["context_librarian_v1", "coder_patch_v1", "security_governor_v1", "judge_v1"]
     }}
   ],
   "edges": [

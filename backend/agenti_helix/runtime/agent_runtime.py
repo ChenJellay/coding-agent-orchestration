@@ -106,26 +106,28 @@ def run_agent(
 
     backend = get_default_inference_backend(inference_backend_cfg)
 
-    # Build a progress callback that writes llm_progress events to the event log
-    # every N tokens so the frontend can show live generation status.
-    def _on_progress(token_count: int, tps: float, snippet: str) -> None:
-        if not _llm_trace_enabled():
-            return
+    # Emit a start event immediately so the UI shows the agent is running
+    # before the (potentially multi-minute) inference begins.
+    if _llm_trace_enabled():
         log_event(
             run_id=run_id_log,
             hypothesis_id=hyp_log,
             location=loc_log,
-            message="LLM inference in progress",
+            message="LLM inference started",
             data={
-                "kind": "llm_progress",
+                "kind": "llm_trace",
                 "agent_id": agent_id,
-                "token_count": token_count,
-                "tokens_per_second": round(tps, 1),
-                "partial_tail": snippet,
+                "status": "started",
+                "max_tokens": max_tokens,
             },
             trace_id=trace_id,
             dag_id=dag_id,
         )
+
+    # Progress callback — intentionally uses kind="llm_progress" (not "llm_trace")
+    # so it is filtered out by the log policy and does not create per-token entries.
+    def _on_progress(token_count: int, tps: float, snippet: str) -> None:
+        pass
 
     raw = backend.generate(prompt, max_tokens=max_tokens, temperature=temperature, on_progress=_on_progress)
 

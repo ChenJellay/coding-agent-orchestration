@@ -99,6 +99,19 @@ def run_chain(
         if not isinstance(input_bindings, dict):
             raise ValueError(f"Invalid step.input_bindings at index={idx}")
 
+        # Skip this step if its output is already present in the context (cache hit).
+        # Callers mark expensive upstream steps (e.g. context_librarian, sdet) with
+        # `"skip_if_present": true` so that coder retries bypass them.
+        if step.get("skip_if_present") and output_key in ctx:
+            log_event(
+                run_id=run_id,
+                hypothesis_id=hypothesis_id,
+                location=f"{location_prefix}:{step_id}",
+                message="Step skipped (output already in context)",
+                data={"output_key": output_key, "step_index": idx},
+            )
+            continue
+
         bound_inputs = _resolve_binding(input_bindings, ctx)
 
         if step_type == "tool":

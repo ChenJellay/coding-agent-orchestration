@@ -30,6 +30,7 @@ import {
   type TriageItem,
   type RepoMapResponse,
   type RulesResponse,
+  removeDagFromWorkflow,
   rerunTask,
   updateAgentPrompt,
   mergeTask,
@@ -144,6 +145,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 }
 
 function DashboardPage() {
+  const navigate = useNavigate()
   const REPO_PRESETS = useMemo(
     () => [
       { label: 'demo-repo', value: '../demo-repo' },
@@ -211,6 +213,7 @@ function DashboardPage() {
       BLOCKED: 0,
       VERIFYING: 0,
       READY_FOR_REVIEW: 0,
+      COMPLETE: 0,
     }
     for (const f of features ?? []) base[f.column] = (base[f.column] ?? 0) + 1
     return base
@@ -515,10 +518,25 @@ function DashboardPage() {
               ) : (
                 blockedItems.map((it) => {
                   const t = severityTone(it.severity)
+                  const href = it.node_id
+                    ? `/features/${encodeURIComponent(it.feature_id)}/nodes/${encodeURIComponent(it.node_id)}`
+                    : `/features/${encodeURIComponent(it.feature_id)}`
                   return (
                     <div
                       key={`${it.feature_id}:${it.dag_id}:${it.summary}`}
-                      style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', padding: 10 }}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => navigate(href)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') navigate(href)
+                      }}
+                      style={{
+                        border: '1px solid var(--border)',
+                        borderRadius: 12,
+                        background: 'var(--bg)',
+                        padding: 10,
+                        cursor: 'pointer',
+                      }}
                     >
                       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
                         <div style={{ fontWeight: 650, fontSize: 12 }}>{it.title}</div>
@@ -878,6 +896,7 @@ const KANBAN_COLUMNS: Array<{ id: FeatureColumn; label: string; help: string }> 
   { id: 'BLOCKED', label: 'Blocked', help: 'Human needed' },
   { id: 'VERIFYING', label: 'Verifying', help: 'Judges running' },
   { id: 'READY_FOR_REVIEW', label: 'Ready for Review', help: 'Awaiting sign-off' },
+  { id: 'COMPLETE', label: 'Complete', help: 'Merged to main' },
 ]
 
 function formatEta(seconds: number | null): string {
@@ -889,6 +908,26 @@ function formatEta(seconds: number | null): string {
 
 function FeatureCard({ feature }: { feature: Feature }) {
   const navigate = useNavigate()
+  const [removing, setRemoving] = useState(false)
+
+  async function removeFromWorkflow(e: React.MouseEvent) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (removing) return
+    const ok = window.confirm('Are you sure you want to abort? This removes the DAG from the workflow.')
+    if (!ok) return
+    setRemoving(true)
+    try {
+      await removeDagFromWorkflow(feature.dag_id)
+      // These pages poll, but we force immediate feedback.
+      window.location.reload()
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
   return (
     <div
       role="button"
@@ -898,6 +937,7 @@ function FeatureCard({ feature }: { feature: Feature }) {
         if (e.key === 'Enter' || e.key === ' ') navigate(`/features/${encodeURIComponent(feature.feature_id)}`)
       }}
       style={{
+        position: 'relative',
         border: '1px solid var(--border)',
         borderRadius: 12,
         background: 'var(--panel)',
@@ -909,6 +949,35 @@ function FeatureCard({ feature }: { feature: Feature }) {
         cursor: 'pointer',
       }}
     >
+      <button
+        type="button"
+        aria-label="Remove DAG from workflow"
+        title="Remove from workflow"
+        disabled={removing}
+        onClick={(e) => {
+          void removeFromWorkflow(e)
+        }}
+        style={{
+          position: 'absolute',
+          top: 8,
+          right: 8,
+          zIndex: 2,
+          width: 28,
+          height: 28,
+          borderRadius: 8,
+          border: '1px solid var(--border)',
+          background: removing ? 'var(--bg-muted)' : 'var(--bg)',
+          color: 'var(--muted)',
+          fontSize: 16,
+          lineHeight: 1,
+          cursor: removing ? 'default' : 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        ×
+      </button>
       <div style={{ fontWeight: 650, letterSpacing: '-0.01em', fontSize: 13 }}>{feature.title}</div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', color: 'var(--muted)', fontSize: 12 }}>
         <span className="pill">Conf {Math.round(feature.confidence * 100)}%</span>
@@ -1183,7 +1252,6 @@ function TaskInterventionPage() {
   const navigate = useNavigate()
 
   const [feature, setFeature] = useState<FeatureDetails | null>(null)
-  const [events, setEvents] = useState<EventLog[] | null>(null)
   const [checkpoints, setCheckpoints] = useState<Checkpoint[] | null>(null)
   const [guidance, setGuidance] = useState('')
   const [docUrl, setDocUrl] = useState('')
@@ -1204,18 +1272,6 @@ function TaskInterventionPage() {
         setFeature(f)
 
         const taskId = f.dag.nodes?.[nodeId!]?.task?.task_id
-        // Show both node-level orchestration events (runId=featureId, hypothesisId=nodeId)
-        // and the underlying execution events emitted by the verification loop (runId=taskId).
-        const [evNode, evTask] = await Promise.all([
-          fetchEvents({ runId: featureId, hypothesisId: nodeId, limit: 2000 }),
-          taskId ? fetchEvents({ runId: taskId, limit: 5000 }) : Promise.resolve([]),
-        ])
-        if (!cancelled) {
-          const merged = [...(evNode ?? []), ...(evTask ?? [])].sort(
-            (a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0),
-          )
-          setEvents(merged)
-        }
 
         if (taskId) {
           const cps = await fetchCheckpoints({ task_id: taskId, limit: 50 })
@@ -1375,41 +1431,19 @@ function TaskInterventionPage() {
         </div>
       ) : null}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr 360px', gap: 12, alignItems: 'start' }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+          gap: 12,
+          alignItems: 'start',
+        }}
+      >
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Agent briefing</div>
           <div style={{ color: 'var(--muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>{briefing}</div>
           <div style={{ marginTop: 10, color: 'var(--muted)', fontSize: 12 }}>
             Last checkpoint: {latestCp ? `${latestCp.checkpoint_id} · ${latestCp.status}` : '—'}
-          </div>
-        </section>
-
-        <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
-          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Execution logs</div>
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 8,
-              maxHeight: 520,
-              overflow: 'auto',
-              paddingRight: 2,
-            }}
-          >
-            {(events ?? []).length === 0 ? (
-              <div style={{ color: 'var(--muted)', fontSize: 12 }}>{events ? 'No events.' : 'Loading…'}</div>
-            ) : null}
-            {(events ?? []).slice(-80).map((e, idx) => (
-              <div key={`${e.timestamp ?? idx}:${idx}`} style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', padding: 10 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                  <div style={{ fontWeight: 650, fontSize: 12 }}>{e.message ?? 'Event'}</div>
-                  <div style={{ color: 'var(--muted)', fontSize: 12 }}>{formatTs(e.timestamp ?? null)}</div>
-                </div>
-                {e.location ? (
-                  <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{e.location}</div>
-                ) : null}
-              </div>
-            ))}
           </div>
         </section>
 
@@ -1432,6 +1466,7 @@ function TaskInterventionPage() {
               padding: 10,
               color: 'var(--text)',
               font: 'inherit',
+              minWidth: 0,
             }}
           />
           <div style={{ marginTop: 10, color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Doc link (optional)</div>
@@ -1447,6 +1482,7 @@ function TaskInterventionPage() {
               padding: 10,
               color: 'var(--text)',
               font: 'inherit',
+              minWidth: 0,
             }}
           />
           <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
@@ -1490,6 +1526,12 @@ function SignoffTripanePage() {
   const [memoryError, setMemoryError] = useState<string | null>(null)
   const [mergeCandidate, setMergeCandidate] = useState<Checkpoint | null>(null)
   const [pendingSignoff, setPendingSignoff] = useState<{ checkpoint: Checkpoint; nodeId: string } | null>(null)
+  const [celebrate, setCelebrate] = useState(false)
+
+  function triggerCelebration() {
+    setCelebrate(true)
+    window.setTimeout(() => setCelebrate(false), 950)
+  }
 
   useEffect(() => {
     if (!featureId) return
@@ -1613,6 +1655,7 @@ function SignoffTripanePage() {
         target_branch: 'main',
         commit_message: 'Merge verified checkpoint',
       })
+      triggerCelebration()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1622,6 +1665,41 @@ function SignoffTripanePage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {celebrate ? (
+        <div className="celebrationBurst" aria-hidden="true">
+          {[
+            { dx: -180, dy: -120, r: '120deg', c: '#22c55e' },
+            { dx: -140, dy: -40, r: '-80deg', c: '#60a5fa' },
+            { dx: -90, dy: -160, r: '160deg', c: '#f97316' },
+            { dx: -30, dy: -110, r: '20deg', c: '#e879f9' },
+            { dx: 30, dy: -130, r: '-30deg', c: '#fbbf24' },
+            { dx: 80, dy: -150, r: '210deg', c: '#34d399' },
+            { dx: 140, dy: -60, r: '60deg', c: '#a78bfa' },
+            { dx: 190, dy: -120, r: '-150deg', c: '#38bdf8' },
+            { dx: -170, dy: 40, r: '-10deg', c: '#fb7185' },
+            { dx: -90, dy: 80, r: '95deg', c: '#fde047' },
+            { dx: -10, dy: 110, r: '-120deg', c: '#4ade80' },
+            { dx: 70, dy: 90, r: '35deg', c: '#f472b6' },
+            { dx: 150, dy: 60, r: '-60deg', c: '#93c5fd' },
+            { dx: 210, dy: 30, r: '140deg', c: '#fb923c' },
+          ].map((p, i) => (
+            <span
+              key={i}
+              className="celebrationBurst__piece"
+              style={
+                {
+                  '--x': '50vw',
+                  '--y': '18vh',
+                  '--dx': `${p.dx}px`,
+                  '--dy': `${p.dy}px`,
+                  '--r': p.r,
+                  '--c': p.c,
+                } as React.CSSProperties
+              }
+            />
+          ))}
+        </div>
+      ) : null}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <PageTitle title="Sign-Off" subtitle={feature?.dag.macro_intent ?? (featureId ? `Feature ${featureId}` : '—')} />
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -1889,6 +1967,7 @@ function SignoffDiffBlock({
 function TriageInboxPage() {
   const [items, setItems] = useState<TriageItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const navigate = useNavigate()
 
   useEffect(() => {
     let cancelled = false
@@ -1922,7 +2001,32 @@ function TriageInboxPage() {
           <div style={{ color: 'var(--muted)', fontSize: 12, padding: 10 }}>{items ? 'No blocked items.' : 'Loading…'}</div>
         ) : null}
         {(items ?? []).map((it) => (
-          <div key={`${it.feature_id}:${it.summary}`} style={{ padding: 10, borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div
+            key={`${it.feature_id}:${it.summary}`}
+            role="button"
+            tabIndex={0}
+            onClick={() => {
+              const href = it.node_id
+                ? `/features/${encodeURIComponent(it.feature_id)}/nodes/${encodeURIComponent(it.node_id)}`
+                : `/features/${encodeURIComponent(it.feature_id)}`
+              navigate(href)
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return
+              const href = it.node_id
+                ? `/features/${encodeURIComponent(it.feature_id)}/nodes/${encodeURIComponent(it.node_id)}`
+                : `/features/${encodeURIComponent(it.feature_id)}`
+              navigate(href)
+            }}
+            style={{
+              padding: 10,
+              borderBottom: '1px solid var(--border)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 6,
+              cursor: 'pointer',
+            }}
+          >
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ fontWeight: 650, fontSize: 13 }}>{it.title}</div>
               <span className="pill">{it.severity}</span>
@@ -2223,7 +2327,10 @@ function FeaturesKanbanPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <PageTitle title="Features" subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review" />
+      <PageTitle
+        title="Features"
+        subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review → Complete"
+      />
 
       {error ? <ErrorBox title="Failed to load features from API. Is the API server running?" error={error} /> : null}
 

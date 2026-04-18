@@ -124,7 +124,7 @@ def _list_checkpoints() -> List[Dict[str, Any]]:
     return items
 
 
-FeatureColumn = Literal["SCOPING", "ORCHESTRATING", "BLOCKED", "VERIFYING", "READY_FOR_REVIEW"]
+FeatureColumn = Literal["SCOPING", "ORCHESTRATING", "BLOCKED", "VERIFYING", "READY_FOR_REVIEW", "COMPLETE"]
 
 
 def _node_status_counts(state: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -150,6 +150,16 @@ def _feature_column_from_state(
 ) -> FeatureColumn:
     if spec is None:
         return "SCOPING"
+
+    # If a merge has been performed for this feature, treat it as COMPLETE.
+    # The merge endpoint logs: "Merged to main" (with optional simulated note).
+    if any(
+        (e.get("runId") == dag_id)
+        and isinstance(e.get("message"), str)
+        and str(e.get("message")).startswith("Merged to main")
+        for e in events
+    ):
+        return "COMPLETE"
 
     if state is None:
         return "ORCHESTRATING"
@@ -240,6 +250,7 @@ def _derive_features(limit: int = 200) -> List[Dict[str, Any]]:
         "BLOCKED": 2,
         "VERIFYING": 3,
         "READY_FOR_REVIEW": 4,
+        "COMPLETE": 5,
     }
 
     def _state_mtime(dag_id: str) -> float:
@@ -274,6 +285,14 @@ def _derive_triage(limit: int = 200) -> List[Dict[str, Any]]:
         rid = str(f["dag_id"])
         latest = (by_run.get(rid) or [])[:25]
         latest_msg = next((e for e in latest if isinstance(e.get("message"), str)), None)
+        # Try to surface the most relevant node/task pointer so the UI can deep-link.
+        # Prefer a recent event that is tied to a specific node (hypothesisId == node_id).
+        node_event = next((e for e in latest if isinstance(e.get("hypothesisId"), str) and e.get("hypothesisId")), None)
+        node_id = str(node_event.get("hypothesisId")) if node_event else None
+        task_id: Optional[str] = None
+        data = node_event.get("data") if isinstance(node_event, dict) else None
+        if isinstance(data, dict) and isinstance(data.get("task_id"), str):
+            task_id = str(data.get("task_id"))
         items.append(
             {
                 "feature_id": f["feature_id"],
@@ -282,6 +301,8 @@ def _derive_triage(limit: int = 200) -> List[Dict[str, Any]]:
                 "severity": "HIGH",
                 "summary": latest_msg.get("message") if latest_msg else "Blocked (details unavailable)",
                 "timestamp": latest_msg.get("timestamp") if latest_msg else None,
+                "node_id": node_id,
+                "task_id": task_id,
             }
         )
     items.sort(key=lambda x: (x.get("timestamp") or 0), reverse=True)
@@ -306,7 +327,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         # D1: Include Authorization header in CORS to allow Bearer token from browser.
         allow_headers=["Content-Type", "Authorization"],
     )

@@ -39,6 +39,9 @@ class EditTaskSpec:
     # Execution pipeline hint: "patch" (fast, single-file) or "build" (full TDD pipeline).
     # Used by master_orchestrator.resolve_coder_chain / resolve_judge_chain when chains are not explicit.
     pipeline_mode: str = "patch"
+    # Optional bespoke workflow — ordered list of agent_ids. When set, master_orchestrator
+    # synthesizes coder+judge chains dynamically, ignoring `pipeline_mode` presets.
+    workflow: Optional[List[str]] = None
 
 
 @dataclass
@@ -139,7 +142,37 @@ def snapshot_file(path: Path) -> str:
 
     Returns the file contents which can be used as a pre/post state reference.
     """
-    return path.read_text()
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # New-file tasks should be able to start from an empty pre-state.
+        # region agent log
+        try:
+            import json as _json
+            import time as _time
+            from pathlib import Path as _Path
+
+            p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.open("a", encoding="utf-8").write(
+                _json.dumps(
+                    {
+                        "sessionId": "a3db40",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H11",
+                        "location": "agenti_helix/verification/checkpointing.py:snapshot_file",
+                        "message": "snapshot_file missing; returning empty pre-state",
+                        "data": {"path": str(path)[-240:]},
+                        "timestamp": int(_time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        except Exception:
+            pass
+        # endregion agent log
+        return ""
 
 
 def restore_file_from_snapshot(path: Path, snapshot: str) -> None:
@@ -152,15 +185,41 @@ def apply_signed_off_checkpoint(*, task: EditTaskSpec, checkpoint: Checkpoint, s
     Materialize judge-approved content from a staged checkpoint onto disk.
 
     Expects ``PASSED_PENDING_SIGNOFF`` with ``post_state_ref`` holding the full proposed file body
-    (patch pipeline). Idempotent if the file already matches ``post_state_ref``.
+    (patch pipeline), or a JSON reference for multi-file build pipeline outputs.
     """
     if checkpoint.status is not VerificationStatus.PASSED_PENDING_SIGNOFF:
         raise ValueError(f"Checkpoint must be PASSED_PENDING_SIGNOFF, got {checkpoint.status!r}")
     if not checkpoint.post_state_ref:
         raise ValueError("Checkpoint has no post_state_ref to apply")
 
-    target_path = Path(task.repo_path).resolve() / task.target_file
-    target_path.write_text(checkpoint.post_state_ref, encoding="utf-8")
+    repo_root = Path(task.repo_path).resolve()
+
+    # Build pipeline: multi-file sign-off applies all post snapshots captured by write_all_files.
+    try:
+        ref = json.loads(checkpoint.post_state_ref)
+    except Exception:
+        ref = None
+    if isinstance(ref, dict) and ref.get("kind") == "multi_file" and isinstance(ref.get("snapshots_dir"), str):
+        snapshots_dir = (repo_root / str(ref["snapshots_dir"])).resolve()
+        snapshots_path = snapshots_dir / "snapshots.json"
+        if not snapshots_path.exists():
+            raise ValueError(f"Missing snapshots.json at {snapshots_path}")
+        snapshots = json.loads(snapshots_path.read_text(encoding="utf-8"))
+        post = snapshots.get("post") if isinstance(snapshots, dict) else None
+        if not isinstance(post, dict) or not post:
+            raise ValueError("snapshots.json missing 'post' map")
+        for rel_path, content in post.items():
+            if not isinstance(rel_path, str) or not rel_path:
+                continue
+            if not isinstance(content, str):
+                continue
+            p = (repo_root / rel_path).resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+    else:
+        # Patch pipeline: single target_file apply.
+        target_path = repo_root / task.target_file
+        target_path.write_text(checkpoint.post_state_ref, encoding="utf-8")
 
     logs = dict(checkpoint.tool_logs or {})
     logs["manual_signoff"] = {"signed_by": signed_by or "anonymous", "applied_at": time.time()}

@@ -37,7 +37,7 @@ class SdetOutput(BaseModel):
 
 
 class CoderOutput(BaseModel):
-    implementation_logic: str = Field(description="Step-by-step logic used to solve the task")
+    implementation_logic: str = Field(description="Brief 1-3 sentence summary of what was implemented and why. All extended reasoning must appear in the preceding <think> block, not here.")
     modified_files: List[CodeFile] = Field(description="The actual feature code files to be updated")
     missing_context: Optional[str] = Field(
         description="If the Librarian missed a file, flag it here. Otherwise, leave null."
@@ -58,9 +58,15 @@ class GovernorOutput(BaseModel):
 # ---------------------------------------------------------
 class JudgeOutput(BaseModel):
     evaluation_reasoning: str = Field(description="Analysis of the terminal test logs against the acceptance criteria")
-    pass_tests: bool = Field(description="True if the code works perfectly, False if it needs revision")
+    pass_tests: Optional[bool] = Field(
+        description=(
+            "True if tests ran and passed (or code-only review approved). "
+            "False if tests ran and failed. "
+            "null if tests could not be executed at all (e.g. no test runner) — signals human review required."
+        )
+    )
     feedback_for_coder: str = Field(
-        description="If pass_tests is false, highly specific instructions on how to fix the code"
+        description="If pass_tests is false or null, highly specific instructions on how to fix the code"
     )
 
 
@@ -123,7 +129,18 @@ class IntentNodeSpec(BaseModel):
         default="patch",
         description=(
             '"patch" — fast single-file line-patch (coder_patch_v1 + judge_v1). '
-            '"build" — full TDD pipeline (librarian → sdet → coder_builder → governor → judge_evaluator).'
+            '"build" — full TDD pipeline (librarian → sdet → coder_builder → governor → judge_evaluator). '
+            '"custom" — bespoke workflow; populate `workflow` with the ordered agent_id list.'
+        ),
+    )
+    workflow: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional ordered list of agent_ids composing a bespoke workflow for this node. "
+            "When provided, the orchestrator builds coder+judge chains dynamically from this list "
+            "(ignoring pipeline_mode presets). Agents are automatically split: coder-side agents "
+            "(context_librarian_v1, sdet_v1, coder_builder_v1, coder_patch_v1) produce the diff; "
+            "judge-side agents (security_governor_v1, judge_evaluator_v1, judge_v1) evaluate it."
         ),
     )
 
@@ -169,7 +186,19 @@ class SnippetJudgeInput(BaseModel):
 class SnippetJudgeOutput(BaseModel):
     verdict: str = Field(description='Expected values: "PASS" or "FAIL"')
     justification: str = Field(description="Short justification string")
-    problematic_lines: List[int] = Field(description="1-based line numbers in edited snippet that are problematic")
+    problematic_lines: List[int] = Field(description="Up to 5 specific 1-based line numbers where the error originates. Never enumerate every line — only the lines the coder must fix.")
+
+
+# ---------------------------------------------------------
+# Module Rewriter
+# ---------------------------------------------------------
+class CoderModuleOutput(BaseModel):
+    rewritten_module: str = Field(
+        description=(
+            "The complete rewritten module text. This is a drop-in replacement for the extracted "
+            "lines — do not include file-level imports or code outside the module."
+        )
+    )
 
 
 # ---------------------------------------------------------

@@ -4,6 +4,8 @@ Rules:
 
 Be surgically precise. Do not retrieve files unless they are absolutely necessary for the task.
 
+Each entry in the Repository Map includes an `exists` field. If `exists` is `false` (or the field is absent), the file does not currently exist on disk and must be **created from scratch** — do not assume it has any existing content. Always include it in `required_files` so the coder receives an explicit empty-file signal.
+
 If the task requires creating a new file, specify the exact path where it should be created based on the project's architecture.
 
 First, reason step-by-step inside `<think>...</think>` tags — trace the dependency graph and identify exactly what the coder will need.

@@ -4,6 +4,7 @@ export type FeatureColumn =
   | 'BLOCKED'
   | 'VERIFYING'
   | 'READY_FOR_REVIEW'
+  | 'COMPLETE'
 
 export type Feature = {
   feature_id: string
@@ -40,7 +41,7 @@ export type FeatureDetails = {
     dag_id: string
     nodes: Record<
       string,
-      { node_id: string; status: string; attempts: number; verification_status: string | null }
+      { node_id: string; status: string; attempts: number; verification_status: string | null; verification_cycle?: number }
     >
   } | null
   metrics: {
@@ -58,6 +59,8 @@ export type TriageItem = {
   severity: 'HIGH' | 'MEDIUM' | 'LOW'
   summary: string
   timestamp: number | null
+  node_id?: string | null
+  task_id?: string | null
 }
 
 export type TriageResponse = { items: TriageItem[] }
@@ -138,6 +141,25 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
     throw new Error(`HTTP ${res.status} PUT ${path}${text ? `: ${text}` : ''}`)
   }
   return (await res.json()) as T
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'DELETE',
+    headers: { ..._authHeaders() },
+  })
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
+    }
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} DELETE ${path}${text ? `: ${text}` : ''}`)
+  }
+  return (await res.json()) as T
+}
+
+export async function removeDagFromWorkflow(dagId: string): Promise<{ ok: true; removed_spec?: boolean; removed_state?: boolean }> {
+  return await deleteJson(`/api/dags/${encodeURIComponent(dagId)}`)
 }
 
 export async function fetchFeatures(): Promise<Feature[]> {

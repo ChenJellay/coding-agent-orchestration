@@ -49,7 +49,18 @@ Then, AFTER the closing `</think>` tag, output a single JSON object in the follo
 3. NEVER select a wide range (e.g. 7 lines) and provide fewer replacement lines. This DESTROYS the surrounding code.
 4. PREFER the smallest possible range. To change a single value on line 7, use startLine=7, endLine=7.
 5. Verify: after applying your patch, the file must remain syntactically valid. Never replace only structural lines such as `return (` or `);` unless your replacement lines preserve a complete valid component tree.
-6. **JSON string escaping**: Each entry in `replacementLines` is a JSON string. Every literal double-quote character inside that string MUST be written as backslash-quote (`\"`). Example for JSX/JS: use `style={{ color: \"yellow\" }}` inside the JSON string, not raw `"` characters that would break JSON.
+5a. **Structural-context check**: Before choosing a line range, identify the syntactic context of each candidate line. A line inside a CSS/style object (`style={{ ... }}`) or inside a JSX attribute value can only hold CSS properties — never JSX elements or prose text. To insert a new sibling JSX element (e.g., `<p>`, `<span>`), the `startLine` must be immediately after the closing tag of a JSX element (`</h1>`, `</button>`, etc.), not inside a style block or attribute.
+5b. **Never repeat a rejected patch**: If previous-attempt feedback is included in the intent, read it before choosing your line range. If the feedback says your previous patch was placed in the wrong structural context (e.g., "inside the `style` prop"), you MUST choose a completely different `startLine`/`endLine`. Producing the exact same patch again will always fail for the same reason.
+6. **One element = one line**: Each entry in `replacementLines` is exactly ONE line of source code. NEVER pack multiple lines into one string using `\n`. A three-line replacement MUST be three separate array elements. Correct example:
+   ```
+   "replacementLines": [
+     "      <p>First line</p>",
+     "      <p>Second line</p>",
+     "      <p>Third line</p>"
+   ]
+   ```
+   WRONG (do NOT do this): `"replacementLines": ["      <p>First</p>\n      <p>Second</p>"]`
+7. **JSON string escaping**: Every literal double-quote character inside a replacement string MUST be written as `\"`. For JSX attribute values use `style={{ color: \"yellow\" }}`, not raw `"` that would break JSON. Triple-quote (`"""`) is NEVER valid here.
 
 **ESCALATION PROTOCOL**: If the intent is ambiguous, contradictory, requires access to files not in the repo map, or you genuinely cannot determine a safe minimal change, you MUST signal for human review instead of guessing. In that case, output:
 {{

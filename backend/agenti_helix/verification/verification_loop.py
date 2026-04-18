@@ -33,6 +33,33 @@ from .checkpointing import (
 from .config import DEFAULT_CONFIG
 
 
+def _normalize_repo_relative_path(raw: str) -> str:
+    """Normalize a repo-relative path for comparisons (slashes, ./, leading /)."""
+    s = str(raw).strip().replace("\\", "/")
+    if s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/")
+
+
+def _supreme_court_allowed_paths(*, repo_root: Path, task_target_file: str, patch_file_path: str) -> List[str]:
+    """
+    Paths the Supreme Court may patch. Includes the task target plus the SC-chosen file;
+    the latter may be a new file not yet in the scanned repo map.
+    """
+    out: List[str] = []
+    root = repo_root.resolve()
+    for p in (_normalize_repo_relative_path(task_target_file), _normalize_repo_relative_path(patch_file_path)):
+        if p and p not in out:
+            out.append(p)
+    for p in out:
+        resolved = (repo_root / p).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Supreme Court patch path outside repo: {p!r}") from exc
+    return out
+
+
 @dataclass
 class VerificationState:
     """Mutable state that flows through the LangGraph verification loop."""
@@ -60,6 +87,11 @@ class VerificationState:
     # §4.5 — Hybrid escalation
     human_escalation_requested: bool = False
     human_escalation_reason: str = ""
+
+    # §4.6 — Upstream context cache (librarian + SDET outputs).
+    # Populated after the first successful chain run so that retries skip those
+    # expensive steps and only re-run the coder + write_files portion.
+    cached_chain_context: Optional[Dict[str, Any]] = None
 
 
 def _is_cancelled(cancel_token: Any | None) -> bool:
@@ -90,9 +122,41 @@ def _text_fingerprint(text: str) -> Dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
 
 
-def _patch_pipeline(task: EditTaskSpec) -> bool:
-    """Line-patch verification requires staging + manual sign-off before workspace is final."""
-    return (getattr(task, "pipeline_mode", None) or "patch") == "patch"
+def _requires_manual_signoff(task: EditTaskSpec) -> bool:
+    """
+    Whether the workspace should be rolled back and require explicit sign-off to apply changes.
+
+    - patch mode: always staged + rollback (historical behavior)
+    - build mode: also staged + rollback so code isn't written "for real" before review
+    """
+    mode = (getattr(task, "pipeline_mode", None) or "patch").lower()
+    return mode in ("patch", "build")
+
+
+def _restore_paths_from_snapshots(*, repo_root: Path, snapshots: Dict[str, Any]) -> None:
+    pre = snapshots.get("pre") if isinstance(snapshots, dict) else None
+    pre_meta = snapshots.get("pre_meta") if isinstance(snapshots, dict) else None
+    if not isinstance(pre, dict):
+        return
+    for rel_path, prior in pre.items():
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        p = (repo_root / rel_path).resolve()
+        try:
+            # Only delete a file on rollback if we have explicit evidence it did not exist pre-run.
+            existed_pre = None
+            if isinstance(pre_meta, dict):
+                m = pre_meta.get(rel_path)
+                if isinstance(m, dict):
+                    existed_pre = m.get("existed")
+            if prior is None:
+                if existed_pre is False and p.exists():
+                    p.unlink()
+            elif isinstance(prior, str):
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(prior, encoding="utf-8")
+        except Exception:
+            continue
 
 
 def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
@@ -134,6 +198,24 @@ def _build_coder_intent(state: VerificationState) -> str:
     intent = state.task.intent
     parts: List[str] = [intent]
 
+    # §4.x — Repo reality injection (prevents language/tooling hallucinations).
+    repo_root = Path(state.task.repo_path).resolve()
+    has_tsconfig = any(repo_root.glob("tsconfig*.json"))
+    has_any_ts = any(repo_root.rglob("*.ts")) or any(repo_root.rglob("*.tsx"))
+    has_package_json = (repo_root / "package.json").exists()
+    # For demo-repo: default to JS-only when there's no TS signal.
+    if not has_tsconfig and not has_any_ts:
+        parts.append(
+            "\n\nRepository facts (ground truth):\n"
+            "- This repo is JavaScript-first. Do NOT create or reference TypeScript files (.ts/.tsx) and do NOT add tsconfig.\n"
+            "- Prefer .js/.jsx for React components and tests.\n"
+            f"- package.json present: {bool(has_package_json)} (if false, avoid inventing new test runner config files).\n"
+            "- For visual elements (icons, illustrations, images): use the simplest self-contained approach — an emoji character"
+            " (e.g. 🦆) or a short Unicode symbol inside a <span> or <div>. Only use inline SVG when the acceptance criteria"
+            " explicitly says 'SVG required'. Never hand-draw complex SVG shapes with many <path> coordinates; they produce"
+            " excessive tokens and break JSON output.\n"
+        )
+
     # §4.3 — Prefer compressed context when available; fall back to raw feedback.
     if state.compressed_context:
         parts.append(f"\n\nCompressed context from previous attempts:\n{state.compressed_context}")
@@ -165,16 +247,31 @@ def node_run_coder(state: VerificationState) -> VerificationState:
     repo_root = Path(state.task.repo_path).resolve()
     intent = _build_coder_intent(state)
 
+    # Keys produced by the librarian/SDET that are safe to reuse across coder retries.
+    _CACHEABLE_CTX_KEYS = (
+        "ast_repo_map_ctx",
+        "librarian_output",
+        "file_contexts",
+        "sdet_output",
+    )
+
     try:
         from agenti_helix.orchestration.master_orchestrator import resolve_coder_chain  # noqa: PLC0415
         coder_chain = resolve_coder_chain(state.task)
-        ctx = {
+        ctx: Dict[str, Any] = {
             "repo_root": repo_root,
             "intent": intent,
             "target_file": state.task.target_file,
             "acceptance_criteria": state.task.acceptance_criteria,
             "repo_path": state.task.repo_path,
+            "checkpoint_id": state.checkpoint.checkpoint_id if state.checkpoint else "",
         }
+        # §4.6 — Pre-seed the chain context with cached upstream outputs so that
+        # steps marked `skip_if_present` are bypassed on retries.
+        if state.cached_chain_context:
+            for key in _CACHEABLE_CTX_KEYS:
+                if key in state.cached_chain_context:
+                    ctx[key] = state.cached_chain_context[key]
         ctx = run_chain(
             chain_spec=coder_chain,
             initial_context=ctx,
@@ -183,6 +280,12 @@ def node_run_coder(state: VerificationState) -> VerificationState:
             hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
             location_prefix="agenti_helix/verification/verification_loop.py:node_run_coder",
         )
+        # §4.6 — Save upstream outputs after the first run so retries can skip them.
+        if state.cached_chain_context is None:
+            state.cached_chain_context = {
+                key: ctx[key] for key in _CACHEABLE_CTX_KEYS if key in ctx
+            }
+
         # §4.5 — Check if the coder requested human escalation via patch output field.
         coder_patch = ctx.get("coder_patch") or {}
         if isinstance(coder_patch, dict) and coder_patch.get("escalate_to_human"):
@@ -430,7 +533,7 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         "original_snippet": original_snippet,
         "static_check_logs": state.static_check_logs or {},
         # Passed so full-pipeline judge chain can access test file paths and diff metadata.
-        "intent": state.task.intent,
+        "intent": _build_coder_intent(state),
         "diff_json": state.diff_json or {},
     }
     attempt_label = f"judge_attempt_{state.retry_count + 1}"
@@ -504,16 +607,51 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
     if str(verdict).upper() == "PASS":
         post_judge_body = target_path.read_text()
         tool_logs_base = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
-        if _patch_pipeline(state.task):
+        if _requires_manual_signoff(state.task):
+            # Build-mode may have written multiple files. If we have snapshots, stage a multi-file post_state_ref.
+            snapshots_dir = None
+            if isinstance(state.diff_json, dict):
+                snapshots_dir = state.diff_json.get("snapshots_dir")
+            if isinstance(snapshots_dir, str) and snapshots_dir:
+                try:
+                    sd = (repo_root / snapshots_dir).resolve()
+                    snapshots_json = json.loads((sd / "snapshots.json").read_text(encoding="utf-8"))
+                    post_ref = json.dumps({"kind": "multi_file", "snapshots_dir": snapshots_dir}, indent=2)
+                    record_post_state(
+                        state.checkpoint,
+                        post_state_ref=post_ref,
+                        diff=json.dumps(state.diff_json or {}, indent=2),
+                        tool_logs={**tool_logs_base, "snapshots_dir": snapshots_dir, "post_kind": "multi_file"},
+                        status=VerificationStatus.PASSED_PENDING_SIGNOFF,
+                    )
+                    # Roll back all files to their pre-snapshots so workspace stays clean until sign-off.
+                    _restore_paths_from_snapshots(repo_root=repo_root, snapshots=snapshots_json)
+                except Exception:
+                    # Fall back to single-file staging when snapshot application fails.
+                    record_post_state(
+                        state.checkpoint,
+                        post_state_ref=post_judge_body,
+                        diff=json.dumps(state.diff_json or {}, indent=2),
+                        tool_logs=tool_logs_base,
+                        status=VerificationStatus.PASSED_PENDING_SIGNOFF,
+                    )
+            else:
+                record_post_state(
+                    state.checkpoint,
+                    post_state_ref=post_judge_body,
+                    diff=json.dumps(state.diff_json or {}, indent=2),
+                    tool_logs=tool_logs_base,
+                    status=VerificationStatus.PASSED_PENDING_SIGNOFF,
+                )
             record_post_state(
+                # no-op; record_post_state already persisted above
                 state.checkpoint,
-                post_state_ref=post_judge_body,
-                diff=json.dumps(state.diff_json or {}, indent=2),
-                tool_logs=tool_logs_base,
+                post_state_ref=state.checkpoint.post_state_ref or post_judge_body,
+                diff=state.checkpoint.diff,
+                tool_logs=state.checkpoint.tool_logs,
                 status=VerificationStatus.PASSED_PENDING_SIGNOFF,
             )
-            # Roll back only the workspace file — do not call ``rollback_to_checkpoint`` here because
-            # that resets checkpoint metadata to RUNNING for retry flows.
+            # Ensure the original target_file is also restored (snapshots may not include it).
             pre_body = state.original_content if state.original_content is not None else state.checkpoint.pre_state_ref
             restore_file_from_snapshot(target_path, pre_body)
             log_event(
@@ -618,6 +756,13 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
         "Judge reported a failure.",
         f"Justification: {justification}",
     ]
+    # Include the rejected patch so the coder can see exactly what it tried and
+    # avoid producing the same line range again on retry.
+    if state.diff_json:
+        feedback_lines.append(
+            f"\nYour rejected patch:\n{json.dumps(state.diff_json, indent=2)}\n"
+            "You MUST choose different startLine/endLine values — do NOT repeat this patch."
+        )
     state.feedback = "\n".join(feedback_lines)
     log_event(
         run_id=state.task.task_id,
@@ -745,16 +890,22 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
 
         # Apply the SC-arbitrated patch.
         sc_patch = {
-            "filePath": result["filePath"],
+            "filePath": _normalize_repo_relative_path(str(result["filePath"])),
             "startLine": result["startLine"],
             "endLine": result["endLine"],
             "replacementLines": result["replacementLines"],
         }
         from agenti_helix.runtime.tools import tool_apply_line_patch_and_validate
+
+        allowed_paths = _supreme_court_allowed_paths(
+            repo_root=repo_root,
+            task_target_file=state.task.target_file,
+            patch_file_path=str(sc_patch["filePath"]),
+        )
         apply_result = tool_apply_line_patch_and_validate(
             repo_root=str(repo_root),
             patch=sc_patch,
-            allowed_paths=[state.task.target_file],
+            allowed_paths=allowed_paths,
         )
         if not apply_result.get("ok"):
             raise ValueError(f"SC patch failed to apply: {apply_result.get('error')}")
@@ -773,11 +924,18 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
         )
 
     except Exception as exc:
-        # SC failed — transition to BLOCKED.
+        # SC failed — roll back the workspace to the pre-checkpoint state before
+        # recording BLOCKED.  Without this, any patch the coder applied during the
+        # retry loop stays on disk, leaving the file in a broken intermediate state.
         state.supreme_court_invoked = True
+        rollback_to_checkpoint(
+            state.task,
+            state.checkpoint,
+            original_content=state.original_content,
+        )
         record_post_state(
             state.checkpoint,
-            post_state_ref=target_path.read_text(),
+            post_state_ref=target_path.read_text() if target_path.exists() else "",
             diff=json.dumps(state.diff_json or {}, indent=2),
             tool_logs={
                 "judge": state.judge_response,
@@ -791,7 +949,7 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
             run_id=state.task.task_id,
             hypothesis_id="supreme_court",
             location="agenti_helix/verification/verification_loop.py:node_supreme_court",
-            message="Supreme Court failed to resolve; BLOCKED",
+            message="Supreme Court failed to resolve; workspace rolled back; BLOCKED",
             data={"task_id": state.task.task_id, "error": str(exc)},
             trace_id=state.trace_id,
             dag_id=state.dag_id,

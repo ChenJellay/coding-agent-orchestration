@@ -40,6 +40,19 @@ _JOBS: Dict[str, JobRecord] = {}
 _JOB_INDEX_BY_TASK_KEY: Dict[str, str] = {}
 _LOCK = threading.Lock()
 
+# region agent log
+def _debug_write(payload: Dict[str, Any]) -> None:
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        p = _Path(__file__).resolve().parents[3] / ".cursor" / "debug-a3db40.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.open("a", encoding="utf-8").write(_json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+# endregion agent log
+
 
 def create_job(*, meta: Optional[Dict[str, Any]] = None) -> JobRecord:
     job_id = f"job_{uuid.uuid4().hex}"
@@ -86,6 +99,19 @@ def start_background_job(
 
     def _runner() -> None:
         try:
+            # region agent log
+            _debug_write(
+                {
+                    "sessionId": "a3db40",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H6",
+                    "location": "agenti_helix/api/job_registry.py:start_background_job",
+                    "message": "Background job runner started",
+                    "data": {"job_id": rec.job_id, "task_key": task_key, "meta": rec.meta},
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
+            # endregion agent log
             target(rec.cancel_token)
         except TaskCancelledError:
             _mark_finished(rec, status="CANCELLED")
@@ -93,6 +119,20 @@ def start_background_job(
             _mark_finished(rec, status="FAILED", error=str(exc))
         else:
             _mark_finished(rec, status="SUCCEEDED")
+        finally:
+            # region agent log
+            _debug_write(
+                {
+                    "sessionId": "a3db40",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H7",
+                    "location": "agenti_helix/api/job_registry.py:start_background_job",
+                    "message": "Background job runner finished",
+                    "data": {"job_id": rec.job_id, "status": rec.status, "error": rec.error},
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
+            # endregion agent log
 
         if task_key:
             with _LOCK:
