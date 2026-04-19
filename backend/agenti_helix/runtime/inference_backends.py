@@ -32,6 +32,11 @@ def _mlx_stream_progress_interval() -> int:
     return int(os.environ.get("AGENTI_HELIX_MLX_PROGRESS_INTERVAL", "50"))
 
 
+def _mlx_enable_thinking() -> bool:
+    """When True, use Qwen chat template with reasoning enabled and preserve `<redacted_thinking>` in output."""
+    return os.environ.get("AGENTI_HELIX_ENABLE_THINKING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _openai_max_tokens_default() -> int:
     return int(os.environ.get("OPENAI_MAX_TOKENS", "8192"))
 
@@ -48,28 +53,29 @@ def strip_think_blocks(text: str) -> str:
     return _THINK_RE.sub("", text).strip()
 
 
-def _apply_no_think_template(prompt: str, tokenizer: Any) -> str:
-    """Wrap the rendered prompt in a chat template with thinking disabled.
-
-    Qwen3 / Qwen3.5 support ``enable_thinking=False`` in apply_chat_template,
-    which injects an empty ``<think>\\n\\n</think>\\n\\n`` prefix into the
-    assistant turn.  This tells the model to skip extended reasoning and emit
-    the answer directly.
-
-    Falls back to the original prompt string if the tokenizer does not support
-    this parameter (e.g., older tokenizer versions, non-Qwen models).
-    """
+def _apply_qwen_chat_template(prompt: str, tokenizer: Any, *, enable_thinking: bool) -> str:
+    """Qwen3/3.5 chat template (``enable_thinking`` on/off); tokenizer fallback if unsupported."""
     try:
         messages = [{"role": "user", "content": prompt}]
         formatted: str = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
         )
         return formatted
-    except (TypeError, AttributeError):
-        # Tokenizer doesn't support enable_thinking — use raw prompt.
+    except TypeError:
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            formatted2: str = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return formatted2
+        except (TypeError, AttributeError):
+            return prompt
+    except AttributeError:
         return prompt
 
 
@@ -176,7 +182,8 @@ class MLXLocalInferenceBackend:
         timeout = _mlx_inference_timeout()
 
         # Apply no-think template so Qwen3/3.5 skips the <think>…</think> block.
-        formatted_prompt = _apply_no_think_template(prompt, tokenizer)
+        use_thinking = _mlx_enable_thinking()
+        formatted_prompt = _apply_qwen_chat_template(prompt, tokenizer, enable_thinking=use_thinking)
 
         make_sampler = getattr(mlx_lm, "make_sampler", None)
         sampler_kwargs: dict[str, Any] = {}
@@ -213,6 +220,8 @@ class MLXLocalInferenceBackend:
                     on_progress(n, response.generation_tps, snippet)
 
             raw = "".join(chunks)
+            if use_thinking:
+                return raw.strip()
             return strip_think_blocks(raw)
 
         # Run the streaming loop in a background thread so the caller's thread

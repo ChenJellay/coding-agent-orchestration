@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from json import JSONDecoder
+from pathlib import Path
 from typing import Any, Dict, List
 
 try:
@@ -19,7 +21,7 @@ except ImportError:
 # Qwen3 and similar reasoning models emit a <think>…</think> block before
 # the actual answer.  We strip these so the JSON extractor sees only the
 # final structured output.  Handles multiline and multiple blocks.
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_RE = re.compile(r"<redacted_thinking>.*?</redacted_thinking>", re.DOTALL)
 
 
 def strip_thinking_blocks(raw: str) -> str:
@@ -108,6 +110,40 @@ def _parse_json_fragment_loose(fragment: str) -> Dict[str, Any]:
     raise json.JSONDecodeError("Unable to parse JSON fragment", fragment, 0)
 
 
+# Shown when judge JSON cannot be parsed and justification cannot be recovered — must not imply the coder broke JSON.
+JUDGE_JSON_FALLBACK_CANON_MSG = (
+    "Judge model output failed strict JSON parse (often unescaped double-quotes in the judge's justification field). "
+    "The verdict was still recovered by the runtime parser; inspect judge raw_output if needed. "
+    "This is not a failure of the coder's patch JSON."
+)
+
+
+def _extract_judge_justification_loose(cleaned: str) -> str:
+    """
+    When ``justification`` contains raw ``"`` characters, strict JSON parsers fail.  We take the substring
+    between the opening ``"`` after ``justification`` and the ``problematic_lines`` key — the same span a
+    human reader would use — then decode escapes when possible.
+    """
+    pl_key = '"problematic_lines"'
+    pl_idx = cleaned.find(pl_key)
+    if pl_idx == -1:
+        return ""
+    jm = re.search(r'"justification"\s*:\s*"', cleaned, re.DOTALL)
+    if not jm:
+        return ""
+    val_start = jm.end()
+    if val_start >= pl_idx:
+        return ""
+    segment = cleaned[val_start:pl_idx].rstrip()
+    segment = re.sub(r'",\s*$', "", segment)
+    if not segment:
+        return ""
+    try:
+        return json.loads('"' + segment + '"')
+    except json.JSONDecodeError:
+        return segment
+
+
 def try_fallback_snippet_judge_dict(raw: str) -> Dict[str, Any] | None:
     """
     Recover ``SnippetJudgeOutput`` fields when strict JSON parsing fails — commonly
@@ -131,7 +167,9 @@ def try_fallback_snippet_judge_dict(raw: str) -> Dict[str, Any] | None:
         except (json.JSONDecodeError, TypeError, ValueError):
             problematic_lines = []
 
-    justification = ""
+    justification = _extract_judge_justification_loose(cleaned)
+    recover_method = "loose_slice" if justification else ""
+
     jm = re.search(
         r'"justification"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"problematic_lines"',
         cleaned,
@@ -141,14 +179,39 @@ def try_fallback_snippet_judge_dict(raw: str) -> Dict[str, Any] | None:
         try:
             inner = jm.group(1)
             justification = json.loads('"' + inner + '"')
+            recover_method = "strict_regex"
         except (json.JSONDecodeError, ValueError):
-            justification = ""
+            if not justification:
+                recover_method = ""
 
     if not justification:
-        justification = (
-            "Recovered verdict via regex fallback; the model JSON was not parseable "
-            "(often unescaped double-quotes inside justification). See LLM raw_output for details."
-        )
+        justification = JUDGE_JSON_FALLBACK_CANON_MSG
+        recover_method = "canned"
+
+    # #region agent log
+    try:
+        _p = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-9274ce.log")
+        _line = json.dumps(
+            {
+                "sessionId": "9274ce",
+                "timestamp": int(time.time() * 1000),
+                "location": "json_utils.py:try_fallback_snippet_judge_dict",
+                "message": "judge JSON fallback used",
+                "hypothesisId": "H1",
+                "data": {
+                    "verdict": verdict,
+                    "recover_method": recover_method,
+                    "justification_len": len(justification),
+                },
+                "runId": "judge_fallback",
+            }
+        ) + "\n"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        with _p.open("a", encoding="utf-8") as _f:
+            _f.write(_line)
+    except Exception:
+        pass
+    # #endregion
 
     return {
         "verdict": verdict,
@@ -231,4 +294,49 @@ def extract_first_json_object(raw: str) -> Dict[str, Any]:
 
     fragment = cleaned[start : end + 1]
     return _parse_json_fragment_loose(fragment)
+
+
+def extract_json_dict_prefer_markdown_fences(raw: str) -> Dict[str, Any]:
+    """
+    Prefer a JSON object inside ```json ... ``` / ``` ... ``` fences (last fence wins).
+
+    Some agents (e.g. ``supreme_court_v1``) emit long prose and then a fenced JSON block.
+    ``extract_first_json_object`` can mis-parse when the first ``{`` in the text is not the
+    start of the final answer object. Fences delimit the intended payload reliably.
+    """
+    cleaned = strip_thinking_blocks(raw)
+    cleaned = strip_model_chat_suffixes(cleaned)
+
+    payloads: List[str] = []
+    i = 0
+    while i < len(cleaned):
+        m = re.search(r"```(?:json)?\s*", cleaned[i:], re.IGNORECASE)
+        if not m:
+            break
+        abs_start = i + m.end()
+        close = cleaned.find("```", abs_start)
+        if close == -1:
+            break
+        payloads.append(cleaned[abs_start:close].strip())
+        i = close + 3
+
+    for p in reversed(payloads):
+        if "{" not in p:
+            continue
+        start = p.find("{")
+        tail = p[start:].strip()
+        try:
+            obj, _end = JSONDecoder().raw_decode(tail, 0)
+            if isinstance(obj, dict) and obj:
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            loose = _parse_json_fragment_loose(tail)
+            if isinstance(loose, dict) and loose:
+                return loose
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+    return extract_first_json_object(cleaned)
 

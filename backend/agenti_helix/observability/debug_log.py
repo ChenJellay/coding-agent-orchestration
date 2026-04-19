@@ -28,10 +28,62 @@ def log_event(
     dag_id: Optional[str] = None,
 ) -> None:
     if os.environ.get("AGENTI_HELIX_DISABLE_LOGGING", "").strip().lower() in {"1", "true", "yes"}:
+        # #region agent log
+        try:
+            _p = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-9274ce.log")
+            _kind = (data or {}).get("kind") if isinstance(data, dict) else None
+            _line = json.dumps(
+                {
+                    "sessionId": "9274ce",
+                    "timestamp": int(time.time() * 1000),
+                    "location": "debug_log.py:log_event",
+                    "message": message,
+                    "hypothesisId": "H3",
+                    "data": {
+                        "log_path": str(_LOG_PATH),
+                        "kind": _kind,
+                        "skip_reason": "AGENTI_HELIX_DISABLE_LOGGING",
+                        "will_append": False,
+                    },
+                    "runId": run_id,
+                }
+            ) + "\n"
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            with _p.open("a", encoding="utf-8") as _f:
+                _f.write(_line)
+        except Exception:
+            pass
+        # #endregion
         return
 
     # UI policy (2026-04): Only persist LLM I/O traces. System action logs are no longer recorded.
     kind = (data or {}).get("kind") if isinstance(data, dict) else None
+    # #region agent log
+    try:
+        _p = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-9274ce.log")
+        _skip = None if kind == "llm_trace" else "not_llm_trace"
+        _line = json.dumps(
+            {
+                "sessionId": "9274ce",
+                "timestamp": int(time.time() * 1000),
+                "location": "debug_log.py:log_event",
+                "message": message,
+                "hypothesisId": "H1",
+                "data": {
+                    "log_path": str(_LOG_PATH),
+                    "kind": kind,
+                    "skip_reason": _skip,
+                    "will_append": _skip is None,
+                },
+                "runId": run_id,
+            }
+        ) + "\n"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        with _p.open("a", encoding="utf-8") as _f:
+            _f.write(_line)
+    except Exception:
+        pass
+    # #endregion
     if kind != "llm_trace":
         return
 

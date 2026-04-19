@@ -21,7 +21,7 @@ First, reason step-by-step inside `<think>...</think>` tags. Then, after `</thin
   "problematic_lines": [1, 2, 3]
 }}
 
-**JSON string rules (critical):** `justification` is a JSON string value. It must NOT contain raw double-quote characters (`"`). When you mention code or attribute names that use double quotes, either use single quotes in prose (e.g. `color: 'yellow'`) or escape every double-quote as `\\"`. Triple-quote `"""` is forbidden inside the JSON object.
+**JSON string rules (critical):** `justification` is a JSON string value. It must NOT contain raw double-quote characters (`"`). When you mention code or attribute names that use double quotes, either use single quotes in prose (e.g. `color: 'yellow'`) or escape every double-quote as `\\"`. Triple-quote `"""` is forbidden inside the JSON object. Do not paste JSON or code samples that contain unescaped `"` inside this field — paraphrase or use single-quoted tokens instead.
 
 Acceptance criteria:
 """{acceptance_criteria}"""

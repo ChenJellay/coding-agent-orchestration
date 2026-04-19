@@ -15,6 +15,9 @@ class VerificationConfig:
     # §4.3 — Context pruning: cap raw error history before summarization kicks in.
     max_error_history_chars: int = 4_000
 
+    # Max chars of post-patch file text injected into coder retry feedback (before rollback).
+    max_post_patch_feedback_chars: int = 12_000
+
     # §4.4 — Supreme Court: invoke frontier-model arbitration on the last retry before BLOCKED.
     supreme_court_enabled: bool = True
 

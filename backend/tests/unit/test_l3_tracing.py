@@ -30,6 +30,7 @@ def test_log_event_emits_trace_and_dag_id(tmp_path):
         hypothesis_id="h1",
         location="test",
         message="hello",
+        data={"kind": "llm_trace"},
         trace_id="trace-abc",
         dag_id="dag-xyz",
     )
@@ -60,6 +61,7 @@ def test_log_event_without_optional_fields(tmp_path):
         hypothesis_id="h2",
         location="test",
         message="bare event",
+        data={"kind": "llm_trace"},
     )
 
     lines = [json.loads(l) for l in log_file.read_text().splitlines() if l.strip()]

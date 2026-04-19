@@ -15,6 +15,8 @@ Your task:
 2. Draft a fresh, minimal patch that directly addresses the root cause.
 3. If the conflict is genuinely irresolvable (e.g., the intent is ambiguous, contradictory, or requires human clarification), set `resolved: false` and explain clearly.
 
+**Pipeline noise:** `error_history` may mention that the **judge model's** JSON failed strict parsing (e.g. unescaped quotes in the judge's `justification`) and was recovered by the runtime. That is an ingestion detail about the judge's reply format — it does **not** mean the coder's patch JSON was invalid or that the repository code cannot be fixed. Do **not** set `resolved: false` **only** because those recovery messages appear. Escalate only when the requirements themselves are ambiguous, contradictory, or need a human product decision that no patch can infer.
+
 ## Creating a new file
 
 If the target file does not exist yet, you can create it with this patch convention:
@@ -42,7 +44,7 @@ Full error history:
 
 ---
 
-After your `</think>` tag, your response MUST be a single JSON object with no additional text, no explanations, and no code fences:
+After your `</think>` tag, output **only** the JSON object (no prose before it). If you use a markdown code fence, put **only** the JSON inside the fence. The object must include `resolved` and `reasoning`, and when `resolved` is true also `filePath`, `startLine`, `endLine`, `replacementLines`, and `compromise_summary`:
 
 If you CAN resolve the deadlock:
 {{

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
@@ -10,11 +12,15 @@ from agenti_helix.agents.registry import get_agent
 from agenti_helix.api.job_registry import TaskCancelledError
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.inference_backends import get_default_inference_backend
-from agenti_helix.runtime.json_utils import extract_first_json_object, try_fallback_snippet_judge_dict
+from agenti_helix.runtime.json_utils import (
+    extract_first_json_object,
+    extract_json_dict_prefer_markdown_fences,
+    try_fallback_snippet_judge_dict,
+)
 
 import re
 
-_THINK_EXTRACT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_THINK_EXTRACT_RE = re.compile(r"<redacted_thinking>(.*?)</redacted_thinking>", re.DOTALL)
 
 
 def _extract_thinking(raw: str) -> str | None:
@@ -106,6 +112,30 @@ def run_agent(
 
     backend = get_default_inference_backend(inference_backend_cfg)
 
+    # #region agent log
+    try:
+        _p = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-9274ce.log")
+        _line = json.dumps(
+            {
+                "sessionId": "9274ce",
+                "timestamp": int(time.time() * 1000),
+                "location": "agent_runtime.py:run_agent",
+                "message": "run_agent entry",
+                "hypothesisId": "H4",
+                "data": {
+                    "agent_id": agent_id,
+                    "llm_trace_enabled": _llm_trace_enabled(),
+                },
+                "runId": run_id_log,
+            }
+        ) + "\n"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        with _p.open("a", encoding="utf-8") as _f:
+            _f.write(_line)
+    except Exception:
+        pass
+    # #endregion
+
     # Emit a start event immediately so the UI shows the agent is running
     # before the (potentially multi-minute) inference begins.
     if _llm_trace_enabled():
@@ -158,7 +188,10 @@ def run_agent(
     data: Dict[str, Any] | None = None
     parse_exc: Exception | None = None
     try:
-        data = extract_first_json_object(raw)
+        if agent_id == "supreme_court_v1":
+            data = extract_json_dict_prefer_markdown_fences(raw)
+        else:
+            data = extract_first_json_object(raw)
     except Exception as exc:
         parse_exc = exc
         if agent_id == "judge_v1":

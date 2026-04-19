@@ -787,6 +787,15 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
             )
         return state
 
+    # Capture post-patch file text before rollback so the next coder attempt can see
+    # the actual broken (or judge-rejected) workspace outcome, not only the JSON patch.
+    post_patch_body = ""
+    if target_path.exists():
+        try:
+            post_patch_body = target_path.read_text(encoding="utf-8")
+        except OSError:
+            post_patch_body = ""
+
     rollback_to_checkpoint(
         state.task,
         state.checkpoint,
@@ -797,12 +806,26 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
         "Judge reported a failure.",
         f"Justification: {justification}",
     ]
+    if state.judge_response:
+        feedback_lines.append(
+            "\nStructured judge output (verbatim):\n"
+            + json.dumps(state.judge_response, ensure_ascii=False, indent=2)
+        )
     # Include the rejected patch so the coder can see exactly what it tried and
     # avoid producing the same line range again on retry.
     if state.diff_json:
         feedback_lines.append(
             f"\nYour rejected patch:\n{json.dumps(state.diff_json, indent=2)}\n"
             "You MUST choose different startLine/endLine values — do NOT repeat this patch."
+        )
+    if post_patch_body.strip():
+        cap = cfg.max_post_patch_feedback_chars
+        excerpt = post_patch_body if len(post_patch_body) <= cap else post_patch_body[:cap] + "\n… [truncated]"
+        feedback_lines.append(
+            "\nFull target file content immediately AFTER your patch was applied (before rollback). "
+            "The numbered target file in the prompt is the clean pre-image; use this block to diagnose "
+            "wrong-line replacements and syntax breakage.\n"
+            f"```text\n{excerpt}\n```"
         )
     state.feedback = "\n".join(feedback_lines)
     log_event(
@@ -854,7 +877,15 @@ def node_summarize_context(state: VerificationState) -> VerificationState:
         )
 
         compressed = result.get("compressed_summary") or result.get("output") or raw_history
-        state.compressed_context = str(compressed)
+        keys = result.get("key_constraints")
+        if isinstance(keys, list) and keys:
+            bullets = "\n".join(f"- {c}" for c in keys[:8] if str(c).strip())
+            if bullets:
+                state.compressed_context = f"{compressed}\n\nConstraints the next attempt must respect:\n{bullets}"
+            else:
+                state.compressed_context = str(compressed)
+        else:
+            state.compressed_context = str(compressed)
         log_event(
             run_id=state.task.task_id,
             hypothesis_id=attempt_label,
@@ -913,7 +944,7 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
                 "rejection_reasons": rejection_summary,
                 "error_history": "\n".join(state.error_history),
             },
-            runtime={"temperature": 0.1},
+            runtime={"temperature": 0.1, "max_tokens": 8192},
             cancel_token=state.cancel_token,
             observe={
                 "run_id": state.task.task_id,

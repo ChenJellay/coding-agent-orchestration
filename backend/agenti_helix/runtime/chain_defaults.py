@@ -45,9 +45,8 @@ def default_coder_chain(task: Any | None = None) -> Dict[str, Any]:
                     "target_file": {"$ref": "target_file"},
                     "target_file_content": {"$ref": "target_file_content"},
                 },
-                # Patch output is a small JSON object (startLine/endLine/replacementLines).
-                # Cap at 1024 tokens to prevent runaway generation.
-                "runtime": {"temperature": 0.0, "max_tokens": 1024},
+                # Patch JSON can span many replacementLines for a full component block; keep a generous cap.
+                "runtime": {"temperature": 0.0, "max_tokens": 3072},
             },
             {
                 "type": "tool",
@@ -459,7 +458,7 @@ def _block_coder_patch() -> List[Dict[str, Any]]:
                 "target_file": {"$ref": "target_file"},
                 "target_file_content": {"$ref": "target_file_content"},
             },
-            max_tokens=1024,
+            max_tokens=3072,
         ),
         _tool_step("apply_patch", "apply_line_patch_and_validate", "diff_json", {
             "repo_root": {"$ref": "repo_root"},
