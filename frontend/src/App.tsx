@@ -1,12 +1,10 @@
 import { NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import './App.css'
 import { LlmTracePanel } from './LlmTracePanel'
 import {
-  abortTask,
   fetchAgentDetail,
   fetchAgents,
-  fetchMemory,
   fetchCheckpoints,
   fetchCompute,
   fetchHealth,
@@ -18,10 +16,10 @@ import {
   fetchFeatures,
   editDagIntent,
   fetchTriage,
+  deleteFeature,
   type AgentDetail,
   type AgentSummary,
   type HealthResponse,
-  type MemoryResponse,
   type Checkpoint,
   type EventLog,
   type Feature,
@@ -30,7 +28,6 @@ import {
   type TriageItem,
   type RepoMapResponse,
   type RulesResponse,
-  rerunTask,
   updateAgentPrompt,
   mergeTask,
   applyNodeSignoff,
@@ -211,6 +208,7 @@ function DashboardPage() {
       BLOCKED: 0,
       VERIFYING: 0,
       READY_FOR_REVIEW: 0,
+      SUCCESSFUL_COMMIT: 0,
     }
     for (const f of features ?? []) base[f.column] = (base[f.column] ?? 0) + 1
     return base
@@ -223,12 +221,6 @@ function DashboardPage() {
   const blockedItems = useMemo(() => {
     return [...(triage ?? [])].slice(0, 10)
   }, [triage])
-
-  function severityTone(sev: TriageItem['severity']): { border: string; text: string; bg: string } {
-    if (sev === 'HIGH') return { border: 'rgba(220, 38, 38, 0.35)', text: 'rgba(220, 38, 38, 1)', bg: 'rgba(220, 38, 38, 0.12)' }
-    if (sev === 'MEDIUM') return { border: 'rgba(187, 128, 9, 0.35)', text: 'rgba(187, 128, 9, 1)', bg: 'rgba(187, 128, 9, 0.12)' }
-    return { border: 'rgba(46, 160, 67, 0.35)', text: 'rgba(46, 160, 67, 1)', bg: 'rgba(46, 160, 67, 0.12)' }
-  }
 
   async function handleRunCommand() {
     const trimmedRepo = repoPath.trim()
@@ -385,6 +377,30 @@ function DashboardPage() {
                     desc: 'Full test-driven pipeline with context discovery, test coverage, and security audit. Best for new features and multi-file changes.',
                   },
                   {
+                    id: 'product_eng' as const,
+                    label: 'Product engineering (doc-first)',
+                    agents: 'doc_fetcher → librarian → sdet → builder | governor → diff_validator → judge_evaluator',
+                    desc: 'Fetches optional doc URL (task context or .agenti_helix/doc_url), then runs the full TDD stack with a diff scope gate before evaluation.',
+                  },
+                  {
+                    id: 'diff_guard_patch' as const,
+                    label: 'Quick patch + diff gate',
+                    agents: 'coder_patch_v1 → diff_validator_v1 → judge_v1',
+                    desc: 'Fast single-file patch with a git-diff scope check before the snippet judge. Uses the same sign-off semantics as Quick patch.',
+                  },
+                  {
+                    id: 'secure_build_plus' as const,
+                    label: 'Secure full build',
+                    agents: 'full TDD coder | governor → diff_validator → judge_evaluator',
+                    desc: 'Same multi-file TDD coder as Full build, with an extra diff-validator gate between security review and evaluation.',
+                  },
+                  {
+                    id: 'lint_type_gate' as const,
+                    label: 'Lint + type gate (build)',
+                    agents: 'full TDD coder | linter → type_checker → judge_evaluator',
+                    desc: 'Full TDD implementation with static analysis agents surfacing eslint/ruff and mypy/tsc signals into the evaluator.',
+                  },
+                  {
                     id: 'orchestrator' as const,
                     label: 'Orchestrator decides',
                     agents: 'intent_compiler_v1 assigns pipeline per node',
@@ -451,7 +467,9 @@ function DashboardPage() {
           <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em' }}>
             {trustScore == null ? '—' : `${Math.round(trustScore * 100)}%`}
           </div>
-          <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>Avg confidence across in-flight DAGs</div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>
+            Avg of DAG scores: weighted by node status (running and sign-off earn partial credit; failures reduce it).
+          </div>
         </div>
         <div style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>In-flight DAGs</div>
@@ -473,6 +491,20 @@ function DashboardPage() {
           <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em' }}>{counts.READY_FOR_REVIEW}</div>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>Awaiting sign-off</div>
         </div>
+        <div
+          style={{
+            border: '1px solid rgba(22, 163, 74, 0.35)',
+            borderRadius: 14,
+            background: 'rgba(22, 163, 74, 0.08)',
+            padding: 12,
+          }}
+        >
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Successful commits</div>
+          <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: 'rgba(22, 163, 74, 1)' }}>
+            {counts.SUCCESSFUL_COMMIT}
+          </div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>Signed off (all nodes passed)</div>
+        </div>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12, alignItems: 'start' }}>
@@ -487,7 +519,7 @@ function DashboardPage() {
               <div style={{ color: 'var(--muted)', fontSize: 12 }}>No in-flight features found.</div>
             ) : null}
             {topFeatures.map((f) => (
-              <FeatureCard key={f.feature_id} feature={f} />
+              <FeatureCard key={f.feature_id} feature={f} onDeleted={() => void loadAll()} />
             ))}
             {!features ? <div style={{ color: 'var(--muted)', fontSize: 12 }}>Loading…</div> : null}
           </div>
@@ -513,27 +545,9 @@ function DashboardPage() {
               ) : blockedItems.length === 0 ? (
                 <div style={{ color: 'var(--muted)', fontSize: 12 }}>No blocked items.</div>
               ) : (
-                blockedItems.map((it) => {
-                  const t = severityTone(it.severity)
-                  return (
-                    <div
-                      key={`${it.feature_id}:${it.dag_id}:${it.summary}`}
-                      style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', padding: 10 }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
-                        <div style={{ fontWeight: 650, fontSize: 12 }}>{it.title}</div>
-                        <span
-                          className="pill"
-                          style={{ borderColor: t.border, background: t.bg, color: t.text }}
-                        >
-                          {it.severity}
-                        </span>
-                      </div>
-                      <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 6 }}>{it.summary}</div>
-                      <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)', marginTop: 6 }}>{it.dag_id}</div>
-                    </div>
-                  )
-                })
+                blockedItems.map((it) => (
+                  <TriageTaskCard key={`${it.feature_id}:${it.dag_id}:${it.summary}`} item={it} onDeleted={() => void loadAll()} />
+                ))
               )}
             </div>
 
@@ -878,6 +892,7 @@ const KANBAN_COLUMNS: Array<{ id: FeatureColumn; label: string; help: string }> 
   { id: 'BLOCKED', label: 'Blocked', help: 'Human needed' },
   { id: 'VERIFYING', label: 'Verifying', help: 'Judges running' },
   { id: 'READY_FOR_REVIEW', label: 'Ready for Review', help: 'Awaiting sign-off' },
+  { id: 'SUCCESSFUL_COMMIT', label: 'Successful commits', help: 'Signed off — all nodes passed verification' },
 ]
 
 function formatEta(seconds: number | null): string {
@@ -887,8 +902,38 @@ function formatEta(seconds: number | null): string {
   return `${m}m`
 }
 
-function FeatureCard({ feature }: { feature: Feature }) {
+function triageSeverityTone(sev: TriageItem['severity']): { border: string; text: string; bg: string } {
+  if (sev === 'HIGH') return { border: 'rgba(220, 38, 38, 0.35)', text: 'rgba(220, 38, 38, 1)', bg: 'rgba(220, 38, 38, 0.12)' }
+  if (sev === 'MEDIUM') return { border: 'rgba(187, 128, 9, 0.35)', text: 'rgba(187, 128, 9, 1)', bg: 'rgba(187, 128, 9, 0.12)' }
+  return { border: 'rgba(46, 160, 67, 0.35)', text: 'rgba(46, 160, 67, 1)', bg: 'rgba(46, 160, 67, 0.12)' }
+}
+
+function FeatureCard({ feature, onDeleted }: { feature: Feature; onDeleted?: () => void }) {
   const navigate = useNavigate()
+  const success = feature.column === 'SUCCESSFUL_COMMIT'
+  const [removing, setRemoving] = useState(false)
+
+  async function handleRemove(e: React.MouseEvent) {
+    e.stopPropagation()
+    e.preventDefault()
+    if (
+      !window.confirm(
+        `Remove DAG "${feature.title}" (${feature.dag_id}) from the system? This deletes the DAG, its state, and related checkpoints. This cannot be undone.`,
+      )
+    ) {
+      return
+    }
+    setRemoving(true)
+    try {
+      await deleteFeature(feature.feature_id)
+      onDeleted?.()
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
   return (
     <div
       role="button"
@@ -898,10 +943,12 @@ function FeatureCard({ feature }: { feature: Feature }) {
         if (e.key === 'Enter' || e.key === ' ') navigate(`/features/${encodeURIComponent(feature.feature_id)}`)
       }}
       style={{
-        border: '1px solid var(--border)',
+        position: 'relative',
+        border: success ? '1px solid rgba(22, 163, 74, 0.55)' : '1px solid var(--border)',
         borderRadius: 12,
-        background: 'var(--panel)',
+        background: success ? 'rgba(22, 163, 74, 0.11)' : 'var(--panel)',
         padding: 12,
+        paddingTop: 14,
         display: 'flex',
         flexDirection: 'column',
         gap: 8,
@@ -909,7 +956,36 @@ function FeatureCard({ feature }: { feature: Feature }) {
         cursor: 'pointer',
       }}
     >
-      <div style={{ fontWeight: 650, letterSpacing: '-0.01em', fontSize: 13 }}>{feature.title}</div>
+      <button
+        type="button"
+        title="Remove DAG from system"
+        aria-label="Remove DAG from system"
+        disabled={removing}
+        onClick={handleRemove}
+        style={{
+          position: 'absolute',
+          top: 6,
+          right: 6,
+          zIndex: 2,
+          width: 28,
+          height: 28,
+          borderRadius: 8,
+          border: '1px solid var(--border)',
+          background: 'var(--bg)',
+          color: 'var(--muted)',
+          fontSize: 18,
+          lineHeight: 1,
+          cursor: removing ? 'wait' : 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 0,
+          opacity: removing ? 0.6 : 1,
+        }}
+      >
+        ×
+      </button>
+      <div style={{ fontWeight: 650, letterSpacing: '-0.01em', fontSize: 13, paddingRight: 32 }}>{feature.title}</div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', color: 'var(--muted)', fontSize: 12 }}>
         <span className="pill">Conf {Math.round(feature.confidence * 100)}%</span>
         <span className="pill">ETA {formatEta(feature.eta_seconds)}</span>
@@ -918,12 +994,13 @@ function FeatureCard({ feature }: { feature: Feature }) {
         <span>Passed: {feature.node_status_counts.PASSED_VERIFICATION ?? 0}</span>
         <span>Failed: {feature.node_status_counts.FAILED ?? 0}</span>
       </div>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12 }}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12 }} onClick={(e) => e.stopPropagation()}>
         <a
           className="pill"
           href={`/features/${encodeURIComponent(feature.feature_id)}`}
           onClick={(e) => {
             e.preventDefault()
+            e.stopPropagation()
             navigate(`/features/${encodeURIComponent(feature.feature_id)}`)
           }}
         >
@@ -934,12 +1011,98 @@ function FeatureCard({ feature }: { feature: Feature }) {
           href={`/features/${encodeURIComponent(feature.feature_id)}/signoff`}
           onClick={(e) => {
             e.preventDefault()
+            e.stopPropagation()
             navigate(`/features/${encodeURIComponent(feature.feature_id)}/signoff`)
           }}
         >
           Review & Merge
         </a>
       </div>
+    </div>
+  )
+}
+
+function TriageTaskCard({ item, onDeleted }: { item: TriageItem; onDeleted?: () => void }) {
+  const navigate = useNavigate()
+  const [removing, setRemoving] = useState(false)
+  const t = triageSeverityTone(item.severity)
+
+  async function handleRemove(e: React.MouseEvent) {
+    e.stopPropagation()
+    e.preventDefault()
+    if (
+      !window.confirm(
+        `Remove DAG "${item.title}" (${item.dag_id}) from the system? This deletes the DAG, its state, and related checkpoints. This cannot be undone.`,
+      )
+    ) {
+      return
+    }
+    setRemoving(true)
+    try {
+      await deleteFeature(item.feature_id)
+      onDeleted?.()
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => navigate(`/features/${encodeURIComponent(item.feature_id)}`)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') navigate(`/features/${encodeURIComponent(item.feature_id)}`)
+      }}
+      style={{
+        position: 'relative',
+        border: '1px solid var(--border)',
+        borderRadius: 12,
+        background: 'var(--bg)',
+        padding: 10,
+        paddingTop: 12,
+        cursor: 'pointer',
+      }}
+    >
+      <button
+        type="button"
+        title="Remove DAG from system"
+        aria-label="Remove DAG from system"
+        disabled={removing}
+        onClick={handleRemove}
+        style={{
+          position: 'absolute',
+          top: 6,
+          right: 6,
+          zIndex: 2,
+          width: 28,
+          height: 28,
+          borderRadius: 8,
+          border: '1px solid var(--border)',
+          background: 'var(--panel)',
+          color: 'var(--muted)',
+          fontSize: 18,
+          lineHeight: 1,
+          cursor: removing ? 'wait' : 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 0,
+          opacity: removing ? 0.6 : 1,
+        }}
+      >
+        ×
+      </button>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, paddingRight: 32 }}>
+        <div style={{ fontWeight: 650, fontSize: 12, minWidth: 0, flex: 1 }}>{item.title}</div>
+        <span className="pill" style={{ flexShrink: 0, borderColor: t.border, background: t.bg, color: t.text }}>
+          {item.severity}
+        </span>
+      </div>
+      <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 6 }}>{item.summary}</div>
+      <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)', marginTop: 6 }}>{item.dag_id}</div>
     </div>
   )
 }
@@ -1183,7 +1346,6 @@ function TaskInterventionPage() {
   const navigate = useNavigate()
 
   const [feature, setFeature] = useState<FeatureDetails | null>(null)
-  const [events, setEvents] = useState<EventLog[] | null>(null)
   const [checkpoints, setCheckpoints] = useState<Checkpoint[] | null>(null)
   const [guidance, setGuidance] = useState('')
   const [docUrl, setDocUrl] = useState('')
@@ -1204,18 +1366,6 @@ function TaskInterventionPage() {
         setFeature(f)
 
         const taskId = f.dag.nodes?.[nodeId!]?.task?.task_id
-        // Show both node-level orchestration events (runId=featureId, hypothesisId=nodeId)
-        // and the underlying execution events emitted by the verification loop (runId=taskId).
-        const [evNode, evTask] = await Promise.all([
-          fetchEvents({ runId: featureId, hypothesisId: nodeId, limit: 2000 }),
-          taskId ? fetchEvents({ runId: taskId, limit: 5000 }) : Promise.resolve([]),
-        ])
-        if (!cancelled) {
-          const merged = [...(evNode ?? []), ...(evTask ?? [])].sort(
-            (a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0),
-          )
-          setEvents(merged)
-        }
 
         if (taskId) {
           const cps = await fetchCheckpoints({ task_id: taskId, limit: 50 })
@@ -1241,61 +1391,6 @@ function TaskInterventionPage() {
   const briefing =
     extractBriefingFromCheckpoint(latestCp) ??
     (error ? null : 'No agent briefing available yet (v1 derives from judge/coder failure logs).')
-
-  async function handleRerunFromCheckpoint() {
-    if (!featureId || !nodeId) return
-    if (!task) {
-      setError('Task not loaded yet.')
-      return
-    }
-    if (!latestCp) {
-      setError('No checkpoint found to rerun from.')
-      return
-    }
-    setError(null)
-    setActionNote(null)
-    setBusy(true)
-    try {
-      const res = await rerunTask({
-        task_id: task.task_id,
-        checkpoint_id: latestCp.checkpoint_id,
-        guidance: guidance.trim() || undefined,
-        feature_id: featureId,
-        node_id: nodeId,
-      })
-      setActionNote(`Re-run scheduled${res.reRunId ? `: ${res.reRunId}` : '.'}`)
-      setRefreshTick((t) => t + 1)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleAbortTask() {
-    if (!featureId || !nodeId) return
-    if (!task) {
-      setError('Task not loaded yet.')
-      return
-    }
-    setError(null)
-    setActionNote(null)
-    setBusy(true)
-    try {
-      await abortTask({
-        task_id: task.task_id,
-        feature_id: featureId,
-        node_id: nodeId,
-        abort_reason: 'Aborted by user',
-      })
-      setActionNote('Abort requested.')
-      setRefreshTick((t) => t + 1)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
 
   async function handleApplyAndRerun() {
     if (!featureId || !nodeId) return
@@ -1343,28 +1438,6 @@ function TaskInterventionPage() {
           >
             Back to DAG
           </a>
-          <a
-            className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
-              void handleRerunFromCheckpoint()
-            }}
-          >
-            {busy ? 'Rerun in progress…' : 'Re-run from checkpoint'}
-          </a>
-          <a
-            className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
-              void handleAbortTask()
-            }}
-          >
-            {busy ? 'Aborting…' : 'Abort task'}
-          </a>
         </div>
       </div>
 
@@ -1375,41 +1448,12 @@ function TaskInterventionPage() {
         </div>
       ) : null}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr 360px', gap: 12, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 380px) 1fr', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Agent briefing</div>
           <div style={{ color: 'var(--muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>{briefing}</div>
           <div style={{ marginTop: 10, color: 'var(--muted)', fontSize: 12 }}>
             Last checkpoint: {latestCp ? `${latestCp.checkpoint_id} · ${latestCp.status}` : '—'}
-          </div>
-        </section>
-
-        <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
-          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Execution logs</div>
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 8,
-              maxHeight: 520,
-              overflow: 'auto',
-              paddingRight: 2,
-            }}
-          >
-            {(events ?? []).length === 0 ? (
-              <div style={{ color: 'var(--muted)', fontSize: 12 }}>{events ? 'No events.' : 'Loading…'}</div>
-            ) : null}
-            {(events ?? []).slice(-80).map((e, idx) => (
-              <div key={`${e.timestamp ?? idx}:${idx}`} style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', padding: 10 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                  <div style={{ fontWeight: 650, fontSize: 12 }}>{e.message ?? 'Event'}</div>
-                  <div style={{ color: 'var(--muted)', fontSize: 12 }}>{formatTs(e.timestamp ?? null)}</div>
-                </div>
-                {e.location ? (
-                  <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{e.location}</div>
-                ) : null}
-              </div>
-            ))}
           </div>
         </section>
 
@@ -1485,11 +1529,18 @@ function SignoffTripanePage() {
   const [editMode, setEditMode] = useState(false)
   const [macroIntentDraft, setMacroIntentDraft] = useState('')
   const [actionError, setActionError] = useState<string | null>(null)
-  const [showMemory, setShowMemory] = useState(false)
-  const [memory, setMemory] = useState<MemoryResponse | null>(null)
-  const [memoryError, setMemoryError] = useState<string | null>(null)
   const [mergeCandidate, setMergeCandidate] = useState<Checkpoint | null>(null)
   const [pendingSignoff, setPendingSignoff] = useState<{ checkpoint: Checkpoint; nodeId: string } | null>(null)
+  const [mergeCelebration, setMergeCelebration] = useState(false)
+  const mergeCelebrationTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (mergeCelebrationTimerRef.current != null) {
+        window.clearTimeout(mergeCelebrationTimerRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!featureId) return
@@ -1548,25 +1599,11 @@ function SignoffTripanePage() {
     }
   }
 
-  async function handleViewMemory() {
-    if (!featureId) return
-    setMemoryError(null)
-    setMemory(null)
-    setShowMemory(true)
-    setBusy(true)
-    try {
-      const res = await fetchMemory({ runId: featureId })
-      setMemory(res)
-    } catch (e) {
-      setMemoryError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
   async function handleApplySignoff() {
     if (!featureId || !pendingSignoff) {
-      setActionError('No judge-approved change is waiting for sign-off (patch pipeline).')
+      setActionError(
+        'No staged judge-approved checkpoint found for sign-off. Ensure the node is AWAITING_SIGNOFF and the latest checkpoint is PASSED_PENDING_SIGNOFF (refresh the page).',
+      )
       return
     }
     setActionError(null)
@@ -1579,19 +1616,12 @@ function SignoffTripanePage() {
         checkpoint_id: pendingSignoff.checkpoint.checkpoint_id,
       })
       await resumeDag(featureId)
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleResumeDagOnly() {
-    if (!featureId) return
-    setActionError(null)
-    setBusy(true)
-    try {
-      await resumeDag(featureId)
+      const [f, ev] = await Promise.all([
+        fetchFeature(featureId),
+        fetchEvents({ runId: featureId, limit: 5000 }),
+      ])
+      setFeature(f)
+      setEvents(ev)
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1613,6 +1643,12 @@ function SignoffTripanePage() {
         target_branch: 'main',
         commit_message: 'Merge verified checkpoint',
       })
+      setMergeCelebration(true)
+      if (mergeCelebrationTimerRef.current != null) window.clearTimeout(mergeCelebrationTimerRef.current)
+      mergeCelebrationTimerRef.current = window.setTimeout(() => {
+        setMergeCelebration(false)
+        mergeCelebrationTimerRef.current = null
+      }, 2800)
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1622,9 +1658,31 @@ function SignoffTripanePage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {mergeCelebration ? (
+        <div className="merge-celebration-overlay" aria-live="polite">
+          <div className="merge-celebration-burst" aria-hidden="true">
+            {Array.from({ length: 14 }, (_, i) => (
+              <span
+                key={i}
+                className="merge-celebration-particle"
+                style={
+                  {
+                    ['--rot']: `${i * 26}deg`,
+                    animationDelay: `${i * 32}ms`,
+                  } as CSSProperties & { ['--rot']: string }
+                }
+              />
+            ))}
+          </div>
+          <div className="merge-celebration-card">
+            <div className="merge-celebration-title">Merged</div>
+            <div className="merge-celebration-sub">Verified changes are written to your repo files.</div>
+          </div>
+        </div>
+      ) : null}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <PageTitle title="Sign-Off" subtitle={feature?.dag.macro_intent ?? (featureId ? `Feature ${featureId}` : '—')} />
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           <a
             className="pill"
             href={`/features/${encodeURIComponent(featureId ?? '')}`}
@@ -1641,43 +1699,10 @@ function SignoffTripanePage() {
             onClick={(e) => {
               e.preventDefault()
               if (busy) return
-              void handleEditIntent()
-            }}
-          >
-            Edit intent
-          </a>
-          <a
-            className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
-              void handleViewMemory()
-            }}
-          >
-            View episodic memory
-          </a>
-          <a
-            className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
               void handleApplySignoff()
             }}
           >
-            {busy ? 'Working…' : 'Apply sign-off & resume DAG'}
-          </a>
-          <a
-            className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
-              void handleResumeDagOnly()
-            }}
-          >
-            Resume DAG only
+            {busy ? 'Working…' : 'Sign off on changes'}
           </a>
           <a
             className="pill"
@@ -1688,9 +1713,9 @@ function SignoffTripanePage() {
               void handleMergeToMain()
             }}
             style={{
-              borderColor: 'rgba(220, 38, 38, 0.55)',
-              color: 'rgba(220, 38, 38, 1)',
-              background: 'rgba(220, 38, 38, 0.10)',
+              borderColor: 'rgba(22, 163, 74, 0.55)',
+              color: 'rgba(22, 163, 74, 1)',
+              background: 'rgba(22, 163, 74, 0.12)',
             }}
           >
             Merge to main
@@ -1699,6 +1724,7 @@ function SignoffTripanePage() {
       </div>
 
       {error ? <ErrorBox title="Failed to load sign-off view" error={error} /> : null}
+      {actionError ? <ErrorBox title="Sign-off or merge" error={actionError} /> : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
@@ -1723,9 +1749,6 @@ function SignoffTripanePage() {
                   whiteSpace: 'pre-wrap',
                 }}
               />
-              {actionError ? (
-                <ErrorBox error={actionError} />
-              ) : null}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <a
                   className="pill"
@@ -1756,6 +1779,21 @@ function SignoffTripanePage() {
           )}
           <div style={{ fontWeight: 650, fontSize: 13, margin: '14px 0 8px' }}>Acceptance criteria</div>
           <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: 12, color: 'var(--muted)' }}>{acceptance || '—'}</pre>
+          {!editMode ? (
+            <div style={{ marginTop: 12 }}>
+              <a
+                className="pill"
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault()
+                  if (busy) return
+                  void handleEditIntent()
+                }}
+              >
+                Edit intent
+              </a>
+            </div>
+          ) : null}
         </section>
 
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
@@ -1789,34 +1827,13 @@ function SignoffTripanePage() {
         </section>
       </div>
 
-      {showMemory ? (
-        <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
-          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Episodic memory</div>
-          {memoryError ? (
-            <ErrorBox error={memoryError} />
-          ) : null}
-          {memory ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <div style={{ color: 'var(--muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>{memory.summary}</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {(memory.items ?? []).slice(-10).map((it, idx) => (
-                  <div key={`${it.timestamp ?? idx}:${idx}`} style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', padding: 10 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                      <div style={{ fontWeight: 650, fontSize: 12 }}>{it.message ?? 'Event'}</div>
-                      <div style={{ color: 'var(--muted)', fontSize: 12 }}>{formatTs(it.timestamp ?? null)}</div>
-                    </div>
-                    {it.location ? <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)', marginTop: 4 }}>{it.location}</div> : null}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div style={{ color: 'var(--muted)', fontSize: 12 }}>{'Loading…'}</div>
-          )}
-        </section>
-      ) : null}
     </div>
   )
+}
+
+function _checkpointIsPendingSignoff(c: Checkpoint): boolean {
+  const s = String(c.status ?? '').trim()
+  return s === 'PASSED_PENDING_SIGNOFF'
 }
 
 function SignoffDiffBlock({
@@ -1843,15 +1860,36 @@ function SignoffDiffBlock({
           onPendingSignoff?.(null)
           return
         }
-        const latestPerNode: Array<{ nodeId: string; cp: Checkpoint }> = []
+
+        const awaitingIds = new Set(
+          feature?.state?.nodes
+            ? Object.entries(feature.state.nodes)
+                .filter(([, sn]) => (sn as { status?: string })?.status === 'AWAITING_SIGNOFF')
+                .map(([id]) => id)
+            : [],
+        )
+
+        const ordered: typeof nodeEntries = []
+        if (awaitingIds.size > 0) {
+          for (const [nodeId, n] of nodeEntries) {
+            if (awaitingIds.has(nodeId)) ordered.push([nodeId, n])
+          }
+          for (const [nodeId, n] of nodeEntries) {
+            if (!awaitingIds.has(nodeId)) ordered.push([nodeId, n])
+          }
+        } else {
+          ordered.push(...nodeEntries)
+        }
+
         let pending: { checkpoint: Checkpoint; nodeId: string } | null = null
         let mergeEligible: Checkpoint | null = null
+        const latestPerNode: Array<{ nodeId: string; cp: Checkpoint }> = []
 
-        for (const [nodeId, n] of nodeEntries.slice(0, 12)) {
-          const cps = await fetchCheckpoints({ task_id: n.task.task_id, limit: 8 })
+        for (const [nodeId, n] of ordered.slice(0, 12)) {
+          const cps = await fetchCheckpoints({ task_id: n.task.task_id, limit: 24 })
           if (cps[0]) latestPerNode.push({ nodeId, cp: cps[0] })
           for (const c of cps) {
-            if (c.status === 'PASSED_PENDING_SIGNOFF' && !pending) {
+            if (_checkpointIsPendingSignoff(c) && !pending) {
               pending = { checkpoint: c, nodeId }
             }
             if (c.status === 'PASSED' && !mergeEligible) {
@@ -1876,7 +1914,7 @@ function SignoffDiffBlock({
     return () => {
       cancelled = true
     }
-  }, [feature?.feature_id, feature?.dag.nodes, onLatestCheckpoint, onPendingSignoff])
+  }, [feature?.feature_id, feature?.state, feature?.dag.nodes, onLatestCheckpoint, onPendingSignoff])
 
   if (error) return <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 10 }}>{error}</div>
   return (
@@ -1889,6 +1927,16 @@ function SignoffDiffBlock({
 function TriageInboxPage() {
   const [items, setItems] = useState<TriageItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const reloadTriage = useCallback(async () => {
+    try {
+      setError(null)
+      const res = await fetchTriage()
+      setItems(res.items)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -1903,8 +1951,10 @@ function TriageInboxPage() {
       }
     }
 
-    load()
-    const t = window.setInterval(load, 2500)
+    void load()
+    const t = window.setInterval(() => {
+      if (!cancelled) void load()
+    }, 2500)
     return () => {
       cancelled = true
       window.clearInterval(t)
@@ -1917,19 +1967,22 @@ function TriageInboxPage() {
 
       {error ? <ErrorBox title="Failed to load triage" error={error} /> : null}
 
-      <div style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 8 }}>
+      <div
+        style={{
+          border: '1px solid var(--border)',
+          borderRadius: 14,
+          background: 'var(--panel)',
+          padding: 8,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+        }}
+      >
         {(items ?? []).length === 0 ? (
           <div style={{ color: 'var(--muted)', fontSize: 12, padding: 10 }}>{items ? 'No blocked items.' : 'Loading…'}</div>
         ) : null}
         {(items ?? []).map((it) => (
-          <div key={`${it.feature_id}:${it.summary}`} style={{ padding: 10, borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ fontWeight: 650, fontSize: 13 }}>{it.title}</div>
-              <span className="pill">{it.severity}</span>
-            </div>
-            <div style={{ color: 'var(--muted)', fontSize: 12 }}>{it.summary}</div>
-            <div style={{ color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{it.dag_id}</div>
-          </div>
+          <TriageTaskCard key={`${it.feature_id}:${it.dag_id}:${it.summary}`} item={it} onDeleted={() => void reloadTriage()} />
         ))}
       </div>
     </div>
@@ -2183,6 +2236,16 @@ function FeaturesKanbanPage() {
   const [searchParams] = useSearchParams()
   const searchQuery = (searchParams.get('q') ?? '').toLowerCase().trim()
 
+  const reloadFeatures = useCallback(async () => {
+    try {
+      setError(null)
+      const data = await fetchFeatures()
+      setFeatures(data)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
   useEffect(() => {
     let cancelled = false
 
@@ -2196,8 +2259,10 @@ function FeaturesKanbanPage() {
       }
     }
 
-    load()
-    const t = window.setInterval(load, 2500)
+    void load()
+    const t = window.setInterval(() => {
+      if (!cancelled) void load()
+    }, 2500)
     return () => {
       cancelled = true
       window.clearInterval(t)
@@ -2223,7 +2288,10 @@ function FeaturesKanbanPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <PageTitle title="Features" subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review" />
+      <PageTitle
+        title="Features"
+        subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review → Successful commits"
+      />
 
       {error ? <ErrorBox title="Failed to load features from API. Is the API server running?" error={error} /> : null}
 
@@ -2236,7 +2304,7 @@ function FeaturesKanbanPage() {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 6 }}>
               {(grouped[col.id] ?? []).map((f) => (
-                <FeatureCard key={f.feature_id} feature={f} />
+                <FeatureCard key={f.feature_id} feature={f} onDeleted={() => void reloadFeatures()} />
               ))}
               {features && (grouped[col.id] ?? []).length === 0 ? <div style={{ color: 'var(--muted)', fontSize: 12, padding: 6 }}>No items</div> : null}
               {!features && !error ? <div style={{ color: 'var(--muted)', fontSize: 12, padding: 6 }}>Loading…</div> : null}

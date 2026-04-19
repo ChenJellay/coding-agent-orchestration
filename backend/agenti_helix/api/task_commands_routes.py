@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from agenti_helix.api.auth import Role, require_editor
 from agenti_helix.api.errors import raise_http_error
+from agenti_helix.runtime.pipeline_presets import PIPELINE_MODES
 from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
 from agenti_helix.api.job_registry import CancelToken, start_background_job
 from agenti_helix.api.paths import PATHS, iter_jsonl, read_json
@@ -28,6 +30,7 @@ from agenti_helix.verification.checkpointing import (
     VerificationStatus,
     apply_signed_off_checkpoint,
     load_checkpoint,
+    materialize_passed_checkpoint_to_workspace,
     rollback_to_checkpoint,
 )
 from agenti_helix.verification.verification_loop import run_verification_loop
@@ -35,6 +38,60 @@ from agenti_helix.api.git_ops import real_git_commit
 
 
 router = APIRouter()
+
+
+def _repo_rel_path(*, repo_root: Path, task_repo: Path, rel_or_abs: str) -> str:
+    """Express ``rel_or_abs`` as a path relative to ``repo_root`` for git staging."""
+    rel_or_abs = rel_or_abs.strip().replace("\\", "/").lstrip("/")
+    if not rel_or_abs:
+        return ""
+    p = Path(rel_or_abs)
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(repo_root).as_posix()
+        except ValueError:
+            return rel_or_abs
+    try:
+        return (task_repo / rel_or_abs).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return rel_or_abs
+
+
+def _merge_stage_paths(*, repo_root: Path, task: EditTaskSpec, checkpoint: Checkpoint) -> List[str]:
+    """Paths relative to the git root to include in a merge commit (primary file + diff metadata)."""
+    task_repo = Path(task.repo_path).resolve()
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        raw = raw.strip()
+        if not raw:
+            return
+        rel = _repo_rel_path(repo_root=repo_root, task_repo=task_repo, rel_or_abs=raw)
+        if rel and rel not in seen:
+            seen.add(rel)
+            ordered.append(rel)
+
+    if task.target_file:
+        add(str(task.target_file))
+
+    if checkpoint.diff:
+        try:
+            d = json.loads(checkpoint.diff)
+            if isinstance(d, dict):
+                fp = d.get("filePath")
+                if isinstance(fp, str):
+                    add(fp)
+                for key in ("files_written", "test_file_paths"):
+                    lst = d.get(key)
+                    if isinstance(lst, list):
+                        for item in lst:
+                            if isinstance(item, str):
+                                add(item)
+        except Exception:
+            pass
+
+    return ordered
 
 
 def _ensure_dag_state_initialized(*, dag_id: str) -> Dict[str, Any]:
@@ -256,8 +313,7 @@ class ExecuteDagFromDashboardRequestBody(BaseModel):
         default=None,
         description=(
             "Override pipeline for all DAG nodes: "
-            '"patch" (fast single-file, coder_patch_v1 + judge_v1) or '
-            '"build" (full TDD pipeline: librarian → sdet → coder_builder → governor → judge_evaluator). '
+            '"patch", "build", "product_eng", "diff_guard_patch", "secure_build_plus", "lint_type_gate". '
             "When null, the orchestrator assigns pipeline_mode per node (requires use_llm=true)."
         ),
     )
@@ -461,7 +517,7 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     UI entrypoint for starting a new DAG from:
       - a selected local repository (`repo_path`)
       - a command (`macro_intent`)
-      - optional `pipeline_mode` override ("patch" | "build")
+      - optional `pipeline_mode` override (see ExecuteDagFromDashboardRequestBody)
 
     When `pipeline_mode` is "build", the full TDD pipeline
     (librarian → sdet → coder_builder → governor → judge_evaluator) runs per node.
@@ -474,7 +530,13 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     _macro_intent = body.macro_intent
     _repo_path = body.repo_path
     _use_llm = body.use_llm
-    _pipeline_mode = body.pipeline_mode
+    _pipeline_mode = body.pipeline_mode.strip() if isinstance(body.pipeline_mode, str) else body.pipeline_mode
+    if _pipeline_mode is not None and _pipeline_mode not in PIPELINE_MODES:
+        raise_http_error(
+            code="invalid_pipeline_mode",
+            message=f"Unknown pipeline_mode={body.pipeline_mode!r}. Valid modes: {sorted(PIPELINE_MODES)}",
+            status_code=400,
+        )
 
     def _compile_and_execute(_cancel_token: object) -> None:
         """Compile the DAG spec (possibly via LLM) and execute it — all in the background."""
@@ -701,26 +763,34 @@ def merge_task_to_main(body: MergeRequestBody, _role: Role = Depends(require_edi
     if checkpoint.status != VerificationStatus.PASSED:
         raise_http_error(code="checkpoint_not_verified", message="Checkpoint is not in PASSED state", status_code=409)
 
-    # §4.6 — Real git commit (or simulation when AGENTI_HELIX_GIT_COMMIT_ENABLED is unset).
-    repo_path = str(PATHS.repo_root) if hasattr(PATHS, "repo_root") else str(PATHS.agenti_root.parent)
-    # Derive target files from the checkpoint diff when available.
-    target_files: List[str] = []
-    if checkpoint.diff:
-        try:
-            diff_obj = json.loads(checkpoint.diff)
-            if diff_obj.get("filePath"):
-                target_files = [diff_obj["filePath"]]
-        except Exception:
-            pass
+    try:
+        materialize_passed_checkpoint_to_workspace(task=ref.task, checkpoint=checkpoint)
+    except ValueError as exc:
+        raise_http_error(code="checkpoint_materialize_failed", message=str(exc), status_code=409)
 
-    commit_result = real_git_commit(
-        repo_path=repo_path,
-        target_files=target_files,
-        commit_message=body.commit_message or f"feat(agenti): {ref.task.intent[:80] if hasattr(ref.task, 'intent') else body.task_id}",
-        trace_id=getattr(checkpoint, "trace_id", None),
-        dag_id=ref.dag_id,
-        intent_summary=getattr(ref.task, "intent", None) if hasattr(ref, "task") else None,
-    )
+    # §4.6 — Real git commit (or simulation when AGENTI_HELIX_GIT_COMMIT_ENABLED is unset).
+    repo_root_path = PATHS.repo_root.resolve()
+    target_files = _merge_stage_paths(repo_root=repo_root_path, task=ref.task, checkpoint=checkpoint)
+    if not target_files:
+        raise_http_error(
+            code="merge_no_target_files",
+            message="Could not resolve target file paths for merge (missing task.target_file).",
+            status_code=500,
+        )
+
+    try:
+        commit_result = real_git_commit(
+            repo_path=str(repo_root_path),
+            target_files=target_files,
+            commit_message=body.commit_message
+            or f"feat(agenti): {ref.task.intent[:80] if hasattr(ref.task, 'intent') else body.task_id}",
+            trace_id=getattr(checkpoint, "trace_id", None),
+            dag_id=ref.dag_id,
+            intent_summary=getattr(ref.task, "intent", None) if hasattr(ref, "task") else None,
+            target_branch=body.target_branch or "main",
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        raise_http_error(code="merge_commit_failed", message=str(exc), status_code=500)
 
     merges_dir = PATHS.agenti_root / "merges"
     merges_dir.mkdir(parents=True, exist_ok=True)

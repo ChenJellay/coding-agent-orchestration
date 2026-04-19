@@ -17,6 +17,7 @@ from agenti_helix.api.response_caches import (
     CACHE_AVAILABLE as _CACHE_AVAILABLE,
     FEATURES_CACHE as _FEATURES_CACHE,
     TRIAGE_CACHE as _TRIAGE_CACHE,
+    invalidate_features_and_triage_caches,
 )
 from agenti_helix.api.task_commands_routes import router as task_commands_router
 from agenti_helix.core.repo_map import generate_repo_map
@@ -124,7 +125,14 @@ def _list_checkpoints() -> List[Dict[str, Any]]:
     return items
 
 
-FeatureColumn = Literal["SCOPING", "ORCHESTRATING", "BLOCKED", "VERIFYING", "READY_FOR_REVIEW"]
+FeatureColumn = Literal[
+    "SCOPING",
+    "ORCHESTRATING",
+    "BLOCKED",
+    "VERIFYING",
+    "READY_FOR_REVIEW",
+    "SUCCESSFUL_COMMIT",
+]
 
 
 def _node_status_counts(state: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -178,26 +186,47 @@ def _feature_column_from_state(
         if any(s in {"RUNNING"} for s in statuses):
             return "VERIFYING"
 
-    # AWAITING_SIGNOFF = judge approved, workspace staged, waiting for human sign-off.
-    # This is "done verifying" — show it as READY_FOR_REVIEW, not VERIFYING.
-    if any(s == "AWAITING_SIGNOFF" for s in statuses):
-        return "READY_FOR_REVIEW"
-
+    # All nodes passed verification (human sign-off applied for patch pipeline, or direct pass for build).
     if statuses and all(s == "PASSED_VERIFICATION" for s in statuses):
+        return "SUCCESSFUL_COMMIT"
+
+    # AWAITING_SIGNOFF = judge approved, workspace staged, waiting for human sign-off.
+    if any(s == "AWAITING_SIGNOFF" for s in statuses):
         return "READY_FOR_REVIEW"
 
     return "ORCHESTRATING"
 
 
 def _confidence_score(counts: Dict[str, int]) -> float:
+    """Blend of DAG progress and outcomes (0–1).
+
+    Previously this was ``PASSED_VERIFICATION / total``, which is **0** for most of a run because
+    nodes spend time in ``RUNNING``, ``PENDING``, or ``AWAITING_SIGNOFF``. We now weight each
+    status so in-flight work earns partial credit, while ``FAILED`` / ``ESCALATED`` pull the score down.
+    """
     total = sum(counts.values())
     if total <= 0:
-        return 0.0
-    passed = counts.get("PASSED_VERIFICATION", 0)
-    failed = counts.get("FAILED", 0)
-    base = passed / total
-    penalty = 0.35 if failed > 0 else 0.0
-    return max(0.0, min(1.0, base - penalty))
+        return 0.42
+
+    weights = {
+        "PASSED_VERIFICATION": 1.0,
+        "AWAITING_SIGNOFF": 0.9,
+        "RUNNING": 0.48,
+        "PENDING": 0.1,
+        "FAILED": 0.0,
+        "ESCALATED": 0.05,
+    }
+    weighted = 0.0
+    for status, n in counts.items():
+        key = str(status)
+        w = weights.get(key, 0.2)
+        weighted += n * w
+
+    fail_n = counts.get("FAILED", 0) + counts.get("ESCALATED", 0)
+    fail_penalty = min(0.5, 0.45 * (fail_n / total))
+
+    score = (weighted / total) - fail_penalty
+    return max(0.06, min(1.0, score))
 
 
 def _eta_seconds(counts: Dict[str, int]) -> Optional[int]:
@@ -240,6 +269,7 @@ def _derive_features(limit: int = 200) -> List[Dict[str, Any]]:
         "BLOCKED": 2,
         "VERIFYING": 3,
         "READY_FOR_REVIEW": 4,
+        "SUCCESSFUL_COMMIT": 5,
     }
 
     def _state_mtime(dag_id: str) -> float:
@@ -288,6 +318,43 @@ def _derive_triage(limit: int = 200) -> List[Dict[str, Any]]:
     return items
 
 
+def _validate_feature_id_param(feature_id: str) -> None:
+    if not feature_id or not str(feature_id).strip():
+        raise HTTPException(status_code=400, detail="Invalid feature id")
+    if ".." in feature_id or "/" in feature_id or "\\" in feature_id:
+        raise HTTPException(status_code=400, detail="Invalid feature id")
+
+
+def _remove_dag_from_system(dag_id: str) -> None:
+    """Remove persisted DAG spec/state and best-effort cleanup of checkpoints and merge records."""
+    for suffix in (f"{dag_id}.json", f"{dag_id}_state.json"):
+        p = PATHS.dags_dir / suffix
+        if p.exists():
+            p.unlink()
+
+    task_prefix = f"{dag_id}:"
+    cdir = PATHS.checkpoints_dir
+    if cdir.exists():
+        for p in cdir.glob("*.json"):
+            try:
+                data = _try_read_json(p)
+                if isinstance(data, dict) and isinstance(data.get("task_id"), str):
+                    if data["task_id"].startswith(task_prefix):
+                        p.unlink()
+            except OSError:
+                continue
+
+    merges = PATHS.agenti_root / "merges"
+    if merges.exists():
+        for p in merges.glob("*.json"):
+            try:
+                data = _try_read_json(p)
+                if isinstance(data, dict) and data.get("dag_id") == dag_id:
+                    p.unlink()
+            except OSError:
+                continue
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Agenti-Helix API", version="0.1.0")
 
@@ -306,7 +373,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         # D1: Include Authorization header in CORS to allow Bearer token from browser.
         allow_headers=["Content-Type", "Authorization"],
     )
@@ -484,6 +551,18 @@ def create_app() -> FastAPI:
                 "column": _feature_column_from_state(feature_id, spec, state, events),
             },
         }
+
+    @app.delete("/api/features/{feature_id}")
+    def delete_feature(feature_id: str, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
+        """Remove DAG spec, execution state, and related checkpoints/merge records from disk."""
+        _validate_feature_id_param(feature_id)
+        spec_path = PATHS.dags_dir / f"{feature_id}.json"
+        state_path = PATHS.dags_dir / f"{feature_id}_state.json"
+        if not spec_path.exists() and not state_path.exists():
+            raise HTTPException(status_code=404, detail="Feature not found")
+        _remove_dag_from_system(feature_id)
+        invalidate_features_and_triage_caches()
+        return {"ok": True}
 
     @app.get("/api/triage")
     def get_triage(limit: int = Query(default=200, ge=1, le=2000)) -> Dict[str, Any]:

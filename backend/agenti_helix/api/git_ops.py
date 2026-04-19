@@ -15,6 +15,15 @@ def _git_enabled() -> bool:
     return os.environ.get("AGENTI_HELIX_GIT_COMMIT_ENABLED", "").lower() in ("1", "true", "yes")
 
 
+def _checkout_target_branch(repo: Any, branch_name: str) -> None:
+    """Switch the working tree to ``branch_name``, creating it if it does not exist."""
+    heads = {h.name for h in repo.heads}
+    if branch_name in heads:
+        repo.git.checkout(branch_name)
+    else:
+        repo.git.checkout("-b", branch_name)
+
+
 def real_git_commit(
     *,
     repo_path: str,
@@ -23,6 +32,7 @@ def real_git_commit(
     trace_id: Optional[str] = None,
     dag_id: Optional[str] = None,
     intent_summary: Optional[str] = None,
+    target_branch: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Stage `target_files` and create a git commit with embedded trace metadata.
 
@@ -46,9 +56,19 @@ def real_git_commit(
     except gitpython.InvalidGitRepositoryError as exc:
         raise RuntimeError(f"Not a git repository: {repo_root}") from exc
 
-    # Stage the target files.
+    work_tree = Path(repo.working_tree_dir or str(repo_root)).resolve()
+
+    branch = (target_branch or "").strip()
+    if branch:
+        _checkout_target_branch(repo, branch)
+
+    if not target_files:
+        raise ValueError("merge commit requires at least one target file path to stage")
+
+    # Stage the target files (paths are relative to the git working tree).
     for rel_path in target_files:
-        abs_path = repo_root / rel_path
+        norm = rel_path.replace("\\", "/").lstrip("/")
+        abs_path = work_tree / norm
         if not abs_path.exists():
             raise FileNotFoundError(f"Cannot stage non-existent file: {abs_path}")
         repo.index.add([str(abs_path)])

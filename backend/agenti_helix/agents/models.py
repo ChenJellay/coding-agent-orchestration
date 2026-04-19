@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
-from typing import Any, List, Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Any, Dict, List, Optional
 
 # NOTE
 # - The classes below implement the “full agent roster” schemas requested.
@@ -122,8 +122,8 @@ class IntentNodeSpec(BaseModel):
     pipeline_mode: str = Field(
         default="patch",
         description=(
-            '"patch" — fast single-file line-patch (coder_patch_v1 + judge_v1). '
-            '"build" — full TDD pipeline (librarian → sdet → coder_builder → governor → judge_evaluator).'
+            '"patch", "build", or named presets: "product_eng", "diff_guard_patch", '
+            '"secure_build_plus", "lint_type_gate".'
         ),
     )
 
@@ -201,4 +201,41 @@ class MemorySummaryOutput(BaseModel):
     key_constraints: List[str] = Field(
         description="Bullet list of constraints or facts the next attempt MUST respect (max 5)."
     )
+
+
+class DocFetcherOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    doc_url: str = ""
+    doc_title: str = ""
+    key_constraints: List[str] = Field(default_factory=list)
+    task_relevance_summary: str = ""
+    irrelevant: bool = False
+
+
+class DiffValidatorOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    verdict: str = "PASS"
+    summary: str = ""
+
+
+class LinterAgentOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    summary: str = ""
+    has_errors: bool = False
+
+
+class TypeCheckerAgentOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    summary: str = ""
+    type_health: str = "clean"
+
+
+class MemoryWriterOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    episode: Dict[str, Any] = Field(default_factory=dict)
 

@@ -92,7 +92,8 @@ def _text_fingerprint(text: str) -> Dict[str, Any]:
 
 def _patch_pipeline(task: EditTaskSpec) -> bool:
     """Line-patch verification requires staging + manual sign-off before workspace is final."""
-    return (getattr(task, "pipeline_mode", None) or "patch") == "patch"
+    mode = getattr(task, "pipeline_mode", None) or "patch"
+    return mode in ("patch", "diff_guard_patch")
 
 
 def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
@@ -174,6 +175,10 @@ def node_run_coder(state: VerificationState) -> VerificationState:
             "target_file": state.task.target_file,
             "acceptance_criteria": state.task.acceptance_criteria,
             "repo_path": state.task.repo_path,
+            "task_id": state.task.task_id,
+            "doc_url": getattr(state.task, "doc_url", "") or "",
+            "trace_id": state.trace_id,
+            "dag_id": state.dag_id,
         }
         ctx = run_chain(
             chain_spec=coder_chain,
@@ -432,6 +437,9 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         # Passed so full-pipeline judge chain can access test file paths and diff metadata.
         "intent": state.task.intent,
         "diff_json": state.diff_json or {},
+        "task_id": state.task.task_id,
+        "trace_id": state.trace_id,
+        "dag_id": state.dag_id,
     }
     attempt_label = f"judge_attempt_{state.retry_count + 1}"
     try:

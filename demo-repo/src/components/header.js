@@ -7,7 +7,7 @@ export default function Header() {
       <button
         style={{
           marginTop: "0.5rem",
-          backgroundColor: "green",
+          backgroundColor: "pink",
           color: "white",
           border: "none",
           borderRadius: "4px",

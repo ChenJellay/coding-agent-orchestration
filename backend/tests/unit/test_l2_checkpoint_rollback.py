@@ -18,6 +18,7 @@ from agenti_helix.verification.checkpointing import (
     Checkpoint,
     EditTaskSpec,
     VerificationStatus,
+    materialize_passed_checkpoint_to_workspace,
     rollback_to_checkpoint,
     save_checkpoint,
     load_checkpoint,
@@ -124,3 +125,37 @@ def test_rollback_persists_to_disk(tmp_path, monkeypatch):
     # Reload from disk and verify the status was persisted
     reloaded = load_checkpoint(cp.checkpoint_id)
     assert reloaded.status == VerificationStatus.RUNNING
+
+
+def test_materialize_passed_checkpoint_writes_verified_body(tmp_path):
+    repo = tmp_path / "mini"
+    target_rel = "src/app.js"
+    target_path = repo / target_rel
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("before", encoding="utf-8")
+
+    task = _make_task(str(repo), target_file=target_rel)
+    cp = Checkpoint(
+        checkpoint_id="cp-mat",
+        task_id=task.task_id,
+        status=VerificationStatus.PASSED,
+        pre_state_ref="before",
+        post_state_ref="after merge body",
+    )
+
+    written = materialize_passed_checkpoint_to_workspace(task=task, checkpoint=cp)
+    assert written.resolve() == target_path.resolve()
+    assert target_path.read_text(encoding="utf-8") == "after merge body"
+
+
+def test_materialize_raises_when_no_post_state(tmp_path):
+    task = _make_task(str(tmp_path))
+    cp = Checkpoint(
+        checkpoint_id="cp-empty",
+        task_id=task.task_id,
+        status=VerificationStatus.PASSED,
+        pre_state_ref="x",
+        post_state_ref=None,
+    )
+    with pytest.raises(ValueError, match="post_state_ref"):
+        materialize_passed_checkpoint_to_workspace(task=task, checkpoint=cp)

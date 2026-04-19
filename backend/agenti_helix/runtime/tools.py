@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
+from agenti_helix.api.task_context_store import load_task_context
 from agenti_helix.core.ast_parser import parse_file
 from agenti_helix.core.diff_builder import LinePatch, apply_line_patch_to_file
 from agenti_helix.core.repo_map import generate_repo_map, get_focused_files
@@ -338,6 +343,202 @@ def tool_map_evaluator_verdict(
     return {"verdict": verdict, "justification": justification, "problematic_lines": []}
 
 
+def _strip_html_to_text(raw_html: str) -> str:
+    """Very small HTML → text helper (no external deps)."""
+    s = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw_html)
+    s = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def tool_fetch_doc_content(
+    *,
+    repo_root: str | Path,
+    task_id: str = "",
+    doc_url: str = "",
+) -> Dict[str, Any]:
+    """
+    Resolve a documentation URL (task context API, explicit arg, or `.agenti_helix/doc_url`),
+    fetch it, and return stripped text plus a best-effort title.
+    """
+    url = (doc_url or "").strip()
+    if not url and task_id:
+        tc = load_task_context(task_id)
+        if tc and tc.doc_url:
+            url = tc.doc_url.strip()
+    if not url:
+        marker = Path(repo_root).resolve() / ".agenti_helix" / "doc_url"
+        if marker.exists():
+            line = marker.read_text(encoding="utf-8").strip().splitlines()
+            if line:
+                url = line[0].strip()
+    if not url:
+        return {
+            "doc_url": "",
+            "doc_content": "",
+            "doc_title": "",
+            "fetch_error": "No doc_url (set via task context API or .agenti_helix/doc_url).",
+        }
+    try:
+        req = Request(url, headers={"User-Agent": "agenti-helix-doc-fetch/1.0"})
+        with urlopen(req, timeout=20) as resp:  # noqa: S310 — bounded URL fetch for doc presets
+            body = resp.read(800_000).decode("utf-8", errors="replace")
+        title_m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+        title = _strip_html_to_text(title_m.group(1)) if title_m else ""
+        text = _strip_html_to_text(body)
+        return {"doc_url": url, "doc_content": text[:120_000], "doc_title": title or url, "fetch_error": ""}
+    except (URLError, OSError, ValueError) as exc:
+        return {
+            "doc_url": url,
+            "doc_content": "",
+            "doc_title": "",
+            "fetch_error": f"Fetch failed: {exc}",
+        }
+
+
+def tool_merge_doc_into_intent(*, intent: str, doc_fetcher_output: Dict[str, Any]) -> str:
+    """Append distilled doc constraints to the task intent for downstream agents."""
+    parts: List[str] = [intent]
+    summ = str(doc_fetcher_output.get("task_relevance_summary") or "").strip()
+    kc = doc_fetcher_output.get("key_constraints") or []
+    if isinstance(kc, list) and kc:
+        parts.append("\n\n## Documentation constraints\n" + "\n".join(f"- {c}" for c in kc[:12] if str(c).strip()))
+    if summ:
+        parts.append("\n\n## Doc relevance\n" + summ)
+    return "\n".join(parts).strip()
+
+
+def tool_get_git_unified_diff(*, repo_root: str | Path) -> Dict[str, Any]:
+    """Return `git diff` against HEAD for the working tree (best-effort)."""
+    repo = Path(repo_root).resolve()
+    try:
+        r = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 and not out:
+            out = (r.stderr or "").strip() or f"git diff failed (exit {r.returncode})"
+        return {"git_diff": out or "(empty diff)", "git_ok": r.returncode == 0}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {"git_diff": f"(git unavailable: {exc})", "git_ok": False}
+
+
+def tool_run_linter(*, repo_root: str | Path, target_file: str) -> Dict[str, Any]:
+    """Run a minimal linter for the target file; return raw stdout/stderr."""
+    root = Path(repo_root).resolve()
+    path = root / target_file
+    if not path.exists():
+        return {"raw_output": f"File not found: {target_file}", "supported": False}
+    suf = path.suffix.lower()
+    try:
+        if suf == ".py":
+            r = subprocess.run(
+                ["ruff", "check", str(path)],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return {
+                "raw_output": "\n".join(filter(None, [r.stdout, r.stderr])).strip() or "(no ruff output)",
+                "supported": True,
+            }
+        if suf in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            r = subprocess.run(
+                ["npx", "--yes", "eslint", str(path), "--max-warnings", "999"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            out = "\n".join(filter(None, [r.stdout, r.stderr])).strip()
+            if r.returncode == 127 or "command not found" in (out or "").lower():
+                return {"raw_output": "eslint not available (npx/eslint missing).", "supported": False}
+            return {"raw_output": out or "(eslint produced no output)", "supported": True}
+    except FileNotFoundError:
+        return {"raw_output": "Linter runner not installed for this file type.", "supported": False}
+    except subprocess.TimeoutExpired:
+        return {"raw_output": "Linter timed out.", "supported": True}
+    return {"raw_output": f"No default linter for suffix {suf!r}.", "supported": False}
+
+
+def tool_run_typecheck(*, repo_root: str | Path, target_file: str) -> Dict[str, Any]:
+    """Run mypy or tsc --noEmit when available."""
+    root = Path(repo_root).resolve()
+    path = root / target_file
+    if not path.exists():
+        return {"raw_output": f"File not found: {target_file}", "supported": False}
+    suf = path.suffix.lower()
+    try:
+        if suf == ".py":
+            r = subprocess.run(
+                ["python", "-m", "mypy", str(path), "--no-error-summary"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            out = "\n".join(filter(None, [r.stdout, r.stderr])).strip()
+            if "No module named mypy" in (out or "") or r.returncode == 1 and not out:
+                return {"raw_output": "mypy not installed.", "supported": False}
+            return {"raw_output": out or "(mypy produced no output)", "supported": True}
+        if suf in {".ts", ".tsx"}:
+            r = subprocess.run(
+                ["npx", "--yes", "tsc", "--noEmit", str(path)],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            out = "\n".join(filter(None, [r.stdout, r.stderr])).strip()
+            return {"raw_output": out or "(tsc produced no output)", "supported": True}
+    except FileNotFoundError:
+        return {"raw_output": "Type checker not installed for this file type.", "supported": False}
+    except subprocess.TimeoutExpired:
+        return {"raw_output": "Type check timed out.", "supported": True}
+    return {"raw_output": f"No default type checker for suffix {suf!r}.", "supported": False}
+
+
+def tool_apply_diff_validator_gate(diff_validator_output: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    If diff_validator verdict is BLOCK, emit a snippet-judge shaped verdict so the judge chain can short-circuit.
+    Otherwise return None so downstream judge steps still run.
+    """
+    dv = diff_validator_output or {}
+    v = str(dv.get("verdict") or "").upper()
+    if v == "BLOCK":
+        return {
+            "verdict": "FAIL",
+            "justification": str(dv.get("summary") or "Diff validator blocked this change."),
+            "problematic_lines": [],
+        }
+    return None
+
+
+def tool_overlay_terminal_logs(
+    *,
+    test_results: Optional[Dict[str, Any]] = None,
+    linter_out: Optional[Dict[str, Any]] = None,
+    type_out: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Merge test logs with linter/type agent summaries for judge_evaluator."""
+    base = dict(test_results or {})
+    tl = str(base.get("terminal_logs") or "")
+    extra_parts: List[str] = []
+    if linter_out:
+        extra_parts.append("Linter agent summary:\n" + str(linter_out.get("summary") or ""))
+    if type_out:
+        extra_parts.append("Type checker summary:\n" + str(type_out.get("summary") or ""))
+    merged = "\n\n---\n\n".join([tl] + [p for p in extra_parts if p.strip()]).strip()
+    base["terminal_logs"] = merged
+    return base
+
+
 def tool_escalate_to_human(
     *,
     reason: str,
@@ -372,6 +573,14 @@ TOOL_REGISTRY: Dict[str, Any] = {
     "run_tests": tool_run_tests,
     "load_rules": tool_load_rules,
     "map_evaluator_verdict": tool_map_evaluator_verdict,
+    # Pipeline preset helpers
+    "fetch_doc_content": tool_fetch_doc_content,
+    "merge_doc_into_intent": tool_merge_doc_into_intent,
+    "get_git_unified_diff": tool_get_git_unified_diff,
+    "run_linter": tool_run_linter,
+    "run_typecheck": tool_run_typecheck,
+    "apply_diff_validator_gate": tool_apply_diff_validator_gate,
+    "overlay_terminal_logs": tool_overlay_terminal_logs,
     # Shared utilities
     "query_memory": tool_query_memory,
     "escalate_to_human": tool_escalate_to_human,

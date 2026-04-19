@@ -4,6 +4,7 @@ export type FeatureColumn =
   | 'BLOCKED'
   | 'VERIFYING'
   | 'READY_FOR_REVIEW'
+  | 'SUCCESSFUL_COMMIT'
 
 export type Feature = {
   feature_id: string
@@ -108,6 +109,22 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T
 }
 
+function _httpErrorDetail(status: number, path: string, method: string, text: string): Error {
+  if (status === 401 || status === 403) {
+    return new Error(`Unauthorized (${status}): check VITE_API_KEY in frontend/.env.local`)
+  }
+  try {
+    const j = JSON.parse(text) as { error?: { message?: string; code?: string }; detail?: unknown }
+    const msg = j?.error?.message
+    if (typeof msg === 'string' && msg.trim()) {
+      return new Error(msg)
+    }
+  } catch {
+    /* use raw text */
+  }
+  return new Error(`HTTP ${status} ${method} ${path}${text ? `: ${text}` : ''}`)
+}
+
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
@@ -115,11 +132,8 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status} POST ${path}${text ? `: ${text}` : ''}`)
+    throw _httpErrorDetail(res.status, path, 'POST', text)
   }
   return (await res.json()) as T
 }
@@ -131,13 +145,27 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status} PUT ${path}${text ? `: ${text}` : ''}`)
+    throw _httpErrorDetail(res.status, path, 'PUT', text)
   }
   return (await res.json()) as T
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'DELETE',
+    headers: { ..._authHeaders() },
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw _httpErrorDetail(res.status, path, 'DELETE', text)
+  }
+  return (await res.json()) as T
+}
+
+/** Permanently removes DAG spec, state, and related checkpoints/merge records (editor role). */
+export async function deleteFeature(featureId: string): Promise<{ ok: true }> {
+  return await deleteJson<{ ok: true }>(`/api/features/${encodeURIComponent(featureId)}`)
 }
 
 export async function fetchFeatures(): Promise<Feature[]> {
@@ -288,7 +316,7 @@ export async function mergeTask(params: {
   checkpoint_id: string
   target_branch?: string
   commit_message?: string
-}): Promise<{ ok: true; mergeRef?: string }> {
+}): Promise<{ ok: true; mergeRef?: string; sha?: string | null; simulated?: boolean }> {
   return await postJson('/api/tasks/merge', params)
 }
 
@@ -310,7 +338,13 @@ export async function resumeDag(dag_id: string): Promise<{ ok: true }> {
   return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/resume`, {})
 }
 
-export type PipelineMode = 'patch' | 'build'
+export type PipelineMode =
+  | 'patch'
+  | 'build'
+  | 'product_eng'
+  | 'diff_guard_patch'
+  | 'secure_build_plus'
+  | 'lint_type_gate'
 
 export async function startDagFromDashboard(params: {
   repo_path: string

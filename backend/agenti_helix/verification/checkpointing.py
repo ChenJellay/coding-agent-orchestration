@@ -39,6 +39,8 @@ class EditTaskSpec:
     # Execution pipeline hint: "patch" (fast, single-file) or "build" (full TDD pipeline).
     # Used by master_orchestrator.resolve_coder_chain / resolve_judge_chain when chains are not explicit.
     pipeline_mode: str = "patch"
+    # Optional URL for doc_fetcher-first pipelines; may also be supplied via task context API.
+    doc_url: str = ""
 
 
 @dataclass
@@ -145,6 +147,21 @@ def snapshot_file(path: Path) -> str:
 def restore_file_from_snapshot(path: Path, snapshot: str) -> None:
     """Restore a file to a previous snapshot."""
     path.write_text(snapshot)
+
+
+def materialize_passed_checkpoint_to_workspace(*, task: EditTaskSpec, checkpoint: Checkpoint) -> Path:
+    """
+    Write the verified post-state from a PASSED checkpoint onto the task target file.
+
+    Used by the merge endpoint so disk always matches the checkpoint, including when the
+    patch pipeline left the workspace rolled back until sign-off.
+    """
+    if not checkpoint.post_state_ref:
+        raise ValueError("Checkpoint has no post_state_ref; cannot materialize verified content")
+    target_path = Path(task.repo_path).resolve() / task.target_file
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(checkpoint.post_state_ref, encoding="utf-8")
+    return target_path
 
 
 def apply_signed_off_checkpoint(*, task: EditTaskSpec, checkpoint: Checkpoint, signed_by: Optional[str] = None) -> None:

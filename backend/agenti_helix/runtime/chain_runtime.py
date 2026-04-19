@@ -99,6 +99,10 @@ def run_chain(
         if not isinstance(input_bindings, dict):
             raise ValueError(f"Invalid step.input_bindings at index={idx}")
 
+        skip_key = step.get("skip_if_nonempty_key")
+        if isinstance(skip_key, str) and skip_key.strip() and ctx.get(skip_key):
+            continue
+
         bound_inputs = _resolve_binding(input_bindings, ctx)
 
         if step_type == "tool":
