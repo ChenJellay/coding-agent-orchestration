@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import URLError
@@ -14,6 +16,54 @@ from agenti_helix.core.ast_parser import parse_file
 from agenti_helix.core.diff_builder import LinePatch, apply_line_patch_to_file
 from agenti_helix.core.repo_map import generate_repo_map, get_focused_files
 from agenti_helix.core.repo_scanner import detect_language
+
+# Cap per-file snapshots embedded in diff_json for judge / security prompts (tokens).
+_MAX_FILE_SNAPSHOT_CHARS = 80_000
+
+_JEST_CONFIG_FILENAMES = (
+    "jest.config.js",
+    "jest.config.mjs",
+    "jest.config.cjs",
+    "jest.config.ts",
+    "jest.config.cts",
+    "jest.config.json",
+)
+
+
+def _truncate_for_snapshot(text: str, max_chars: int = _MAX_FILE_SNAPSHOT_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n... [truncated by agenti_helix for prompt size]"
+
+
+def _norm_repo_rel_path(p: str) -> str:
+    """Stable key for deduping the same file listed under code + tests (or duplicated rows)."""
+    s = p.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _discover_jest_config(repo_root: Path) -> Path | None:
+    for name in _JEST_CONFIG_FILENAMES:
+        candidate = repo_root / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _js_tests_likely_need_jsdom(repo_root: Path, js_files: List[str]) -> bool:
+    """Heuristic: RTL/React/DOM-heavy tests need jsdom; plain node tests do not."""
+    hints = ("@testing-library", "react", "jsdom", "document.", "window.", "HTMLElement")
+    for rel in js_files:
+        try:
+            text = (repo_root / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        lower = text.lower()
+        if any(h.lower() in lower for h in hints):
+            return True
+    return False
 
 
 def tool_get_focused_context(
@@ -243,17 +293,41 @@ def tool_write_all_files(
         target.write_text(content, encoding="utf-8")
         test_file_paths.append(file_path)
 
+    # Same path may appear in both modified_files and test_files (model mistake); snapshot once.
+    snapshot_paths_ordered: List[str] = []
+    seen_paths: set[str] = set()
+    for rel in files_written + test_file_paths:
+        key = _norm_repo_rel_path(rel)
+        if not key or key in seen_paths:
+            continue
+        seen_paths.add(key)
+        snapshot_paths_ordered.append(rel)
+
+    file_snapshots: List[Dict[str, str]] = []
+    for rel in snapshot_paths_ordered:
+        try:
+            body = (repo_root_path / rel).read_text(encoding="utf-8")
+        except OSError:
+            body = ""
+        file_snapshots.append({"path": rel, "content": _truncate_for_snapshot(body)})
+
     result: Dict[str, Any] = {
         "files_written": files_written,
         "test_file_paths": test_file_paths,
+        "file_snapshots": file_snapshots,
         "diff_summary": (
             f"Wrote {len(files_written)} code file(s) and {len(test_file_paths)} test file(s): "
             + ", ".join(files_written + test_file_paths)
         ),
     }
     # Pre-serialise for template injection in security_governor / judge_evaluator prompts.
+    # Include file contents so auditors see real code, not only paths (metadata-only JSON caused false FAILs).
     result["diff_json_str"] = json.dumps(
-        {"files_written": files_written, "test_file_paths": test_file_paths},
+        {
+            "files_written": files_written,
+            "test_file_paths": test_file_paths,
+            "file_snapshots": file_snapshots,
+        },
         indent=2,
     )
     return result
@@ -274,6 +348,7 @@ def tool_run_tests(
     py_files = [p for p in paths if p.endswith(".py")]
     js_files = [p for p in paths if p.endswith((".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"))]
 
+    temp_jest_config: Path | None = None
     try:
         if py_files:
             cmd = (
@@ -282,7 +357,21 @@ def tool_run_tests(
                 + ["-v", "--tb=short", "--no-header"]
             )
         elif js_files:
-            cmd = ["npx", "--yes", "jest", "--no-coverage", "--passWithNoTests"] + js_files
+            jest_config = _discover_jest_config(repo_root_path)
+            if jest_config is None:
+                fd, tmp = tempfile.mkstemp(suffix=".cjs", prefix="agenti_helix_jest_")
+                os.close(fd)
+                temp_jest_config = Path(tmp)
+                env = "jsdom" if _js_tests_likely_need_jsdom(repo_root_path, js_files) else "node"
+                temp_jest_config.write_text(
+                    f"module.exports = {{ testEnvironment: '{env}' }};\n",
+                    encoding="utf-8",
+                )
+                jest_config = temp_jest_config
+            cmd = (
+                ["npx", "--yes", "jest", "--no-coverage", "--passWithNoTests", "--config", str(jest_config)]
+                + js_files
+            )
         else:
             return {"passed": False, "terminal_logs": f"Unsupported test file type(s): {paths}", "test_count": len(paths)}
 
@@ -305,6 +394,9 @@ def tool_run_tests(
         return {"passed": False, "terminal_logs": f"Test runner not found: {exc}", "test_count": len(paths)}
     except Exception as exc:
         return {"passed": False, "terminal_logs": f"Test execution error: {exc}", "test_count": len(paths)}
+    finally:
+        if temp_jest_config is not None:
+            temp_jest_config.unlink(missing_ok=True)
 
 
 def tool_load_rules(*, repo_root: str | Path) -> Dict[str, Any]:

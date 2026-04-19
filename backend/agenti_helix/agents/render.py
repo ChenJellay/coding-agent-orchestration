@@ -15,6 +15,13 @@ def load_prompt_template(filename: str) -> str:
 
 
 def render_prompt(template: str, variables: Dict[str, Any]) -> str:
+    """
+    Substitute ``{name}`` placeholders in *template* with *variables*.
+
+    The template must escape any **literal** braces as ``{{`` / ``}}`` (Python
+    ``str.format`` rules). Do not put bare ``{`` / ``}`` in the markdown except
+    for placeholders — otherwise you get ``ValueError: unmatched '{' in format spec``.
+    """
     try:
         return template.format(**variables).strip()
     except KeyError as e:

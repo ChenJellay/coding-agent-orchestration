@@ -14,6 +14,10 @@ Use for: new features, multi-file changes, logic-heavy tasks, anything requiring
 
 Tasks must be granular and actionable (e.g., "Create API route", not "Build backend").
 
+**Consistency:** `acceptance_criteria` must not contradict the macro intent. If the user asks to create a new file, add tests, or introduce new behaviour, your acceptance criteria must allow the files and changes required to satisfy that intent (do not forbid new files while also asking for a new file or for test coverage the repo does not yet have).
+
+**Acceptance criteria — keep them loose and outcome-focused:** Describe what the user should *observe* (UI, API response, file content goal), not how the code must be structured. Prefer one or two short sentences. Avoid micromanaging variable names, exact DOM structure, or implementation steps unless the user explicitly required them. Overly specific criteria invite brittle tests and false failures; the downstream judge will treat the **macro intent** as primary when criteria are ambiguous.
+
 Assign `pipeline_mode: "build"` when a task:
 - touches business logic or adds new behaviour
 - spans more than one file

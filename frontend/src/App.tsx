@@ -1156,48 +1156,156 @@ function extractBriefingFromCheckpoint(cp: Checkpoint | null): string | null {
   return null
 }
 
-function ExtractedDiff({ cp }: { cp: Checkpoint | null }) {
+function _normRelPath(p: string): string {
+  let s = p.replace(/\\/g, '/')
+  while (s.startsWith('./')) {
+    s = s.slice(2)
+  }
+  return s
+}
+
+function _dedupeSnapshotsByPath<T extends { path?: string }>(snapshots: T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const snap of snapshots) {
+    const raw = typeof snap.path === 'string' ? snap.path : ''
+    const key = raw ? _normRelPath(raw) : ''
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(snap)
+  }
+  return out
+}
+
+function _parseCheckpointDiffJson(cp: Checkpoint | null): unknown {
+  if (!cp?.diff) return null
+  try {
+    return JSON.parse(cp.diff) as unknown
+  } catch {
+    return null
+  }
+}
+
+function _isBuildPipelineDiffJson(d: unknown): d is {
+  file_snapshots?: Array<{ path?: string; content?: string }>
+  files_written?: string[]
+  test_file_paths?: string[]
+} {
+  if (!d || typeof d !== 'object') return false
+  const o = d as Record<string, unknown>
+  const fs = o.file_snapshots
+  const fw = o.files_written
+  const tp = o.test_file_paths
+  if (Array.isArray(fs) && fs.length > 0) return true
+  if (Array.isArray(fw) && fw.length > 0) return true
+  if (Array.isArray(tp) && tp.length > 0) return true
+  return false
+}
+
+const _diffPreBoxStyle: CSSProperties = {
+  margin: 0,
+  padding: 10,
+  borderRadius: 12,
+  border: '1px solid var(--border)',
+  background: 'var(--bg)',
+  overflow: 'auto',
+  maxHeight: 380,
+  fontSize: 12,
+}
+
+function ExtractedDiff({ cp, targetFile }: { cp: Checkpoint | null; targetFile?: string | null }) {
   if (!cp) {
     return <div style={{ color: 'var(--muted)', fontSize: 12 }}>No checkpoint found.</div>
   }
   const pre = cp.pre_state_ref ?? ''
   const post = cp.post_state_ref ?? ''
+  const toolLogs = cp.tool_logs as Record<string, unknown>
+  const gitUnifiedRaw = toolLogs['git_unified_diff']
+  const gitUnified = typeof gitUnifiedRaw === 'string' ? gitUnifiedRaw.trim() : ''
+  const parsedDiff = _parseCheckpointDiffJson(cp)
+  const buildPipeline = _isBuildPipelineDiffJson(parsedDiff)
+
+  if (!gitUnified && !buildPipeline) {
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Pre</div>
+          <pre style={_diffPreBoxStyle}>{pre}</pre>
+        </div>
+        <div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Post</div>
+          <pre style={_diffPreBoxStyle}>{post}</pre>
+        </div>
+      </div>
+    )
+  }
+
+  type FileSnap = { path?: string; content?: string }
+  const buildObj =
+    buildPipeline && parsedDiff && typeof parsedDiff === 'object'
+      ? (parsedDiff as { file_snapshots?: FileSnap[] })
+      : null
+  const snapshots: FileSnap[] = _dedupeSnapshotsByPath(
+    Array.isArray(buildObj?.file_snapshots) ? buildObj.file_snapshots : [],
+  )
+
+  // When git unified diff is present it already includes new/untracked files; rendering file_snapshots
+  // as well duplicates the same content (especially for TDD-added test files).
+  const showSnapshotFallback = buildPipeline && !gitUnified
+  const targetNorm = showSnapshotFallback && targetFile ? _normRelPath(targetFile) : ''
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-      <div>
-        <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Pre</div>
-        <pre
-          style={{
-            margin: 0,
-            padding: 10,
-            borderRadius: 12,
-            border: '1px solid var(--border)',
-            background: 'var(--bg)',
-            overflow: 'auto',
-            maxHeight: 380,
-            fontSize: 12,
-          }}
-        >
-          {pre}
-        </pre>
-      </div>
-      <div>
-        <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Post</div>
-        <pre
-          style={{
-            margin: 0,
-            padding: 10,
-            borderRadius: 12,
-            border: '1px solid var(--border)',
-            background: 'var(--bg)',
-            overflow: 'auto',
-            maxHeight: 380,
-            fontSize: 12,
-          }}
-        >
-          {post}
-        </pre>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {gitUnified ? (
+        <div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Unified diff (git)</div>
+          <pre style={{ ..._diffPreBoxStyle, maxHeight: 420 }}>{gitUnified}</pre>
+        </div>
+      ) : null}
+
+      {showSnapshotFallback ? (
+        <div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Files (checkpoint snapshots)</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {snapshots.length === 0 ? (
+              <div style={{ color: 'var(--muted)', fontSize: 12 }}>
+                Paths recorded in this checkpoint have no embedded snapshots (see unified diff above when available).
+              </div>
+            ) : (
+              snapshots.map((snap: FileSnap, idx: number) => {
+                const path = typeof snap.path === 'string' ? snap.path : ''
+                const content = typeof snap.content === 'string' ? snap.content : ''
+                const pathNorm = path ? _normRelPath(path) : ''
+                const isPrimary = Boolean(targetNorm && pathNorm && pathNorm === targetNorm)
+                if (isPrimary) {
+                  return (
+                    <div key={`${path}:${idx}`}>
+                      <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 6, fontFamily: 'var(--mono)' }}>{path}</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                        <div>
+                          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Pre</div>
+                          <pre style={_diffPreBoxStyle}>{pre}</pre>
+                        </div>
+                        <div>
+                          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Post</div>
+                          <pre style={_diffPreBoxStyle}>{content || post}</pre>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                }
+                return (
+                  <div key={`${path}:${idx}`}>
+                    <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 6, fontFamily: 'var(--mono)' }}>{path || '(unknown path)'}</div>
+                    <div style={{ color: 'var(--muted)', fontSize: 11, marginBottom: 6 }}>Post (new or auxiliary file)</div>
+                    <pre style={_diffPreBoxStyle}>{content}</pre>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -1511,7 +1619,7 @@ function TaskInterventionPage() {
 
       <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
         <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>Latest diff (checkpoint)</div>
-        <ExtractedDiff cp={latestCp} />
+        <ExtractedDiff cp={latestCp} targetFile={task?.target_file} />
       </section>
     </div>
   )
@@ -1846,6 +1954,7 @@ function SignoffDiffBlock({
   onPendingSignoff?: (pick: { checkpoint: Checkpoint; nodeId: string } | null) => void
 }) {
   const [cp, setCp] = useState<Checkpoint | null>(null)
+  const [displayTargetFile, setDisplayTargetFile] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -1856,6 +1965,7 @@ function SignoffDiffBlock({
         const nodeEntries = Object.entries(feature?.dag.nodes ?? {})
         if (nodeEntries.length === 0) {
           setCp(null)
+          setDisplayTargetFile(null)
           onLatestCheckpoint?.(null)
           onPendingSignoff?.(null)
           return
@@ -1900,9 +2010,15 @@ function SignoffDiffBlock({
 
         latestPerNode.sort((a, b) => (b.cp.updated_at ?? 0) - (a.cp.updated_at ?? 0))
         const display = pending?.checkpoint ?? latestPerNode[0]?.cp ?? null
+        const displayNodeId = pending?.nodeId ?? latestPerNode[0]?.nodeId ?? null
+        const tf =
+          displayNodeId && feature?.dag?.nodes?.[displayNodeId]
+            ? feature.dag.nodes[displayNodeId].task.target_file
+            : null
 
         if (!cancelled) {
           setCp(display)
+          setDisplayTargetFile(tf)
           onLatestCheckpoint?.(mergeEligible)
           onPendingSignoff?.(pending)
         }
@@ -1919,7 +2035,7 @@ function SignoffDiffBlock({
   if (error) return <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 10 }}>{error}</div>
   return (
     <div style={{ marginTop: 10 }}>
-      <ExtractedDiff cp={cp} />
+      <ExtractedDiff cp={cp} targetFile={displayTargetFile} />
     </div>
   )
 }

@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from agenti_helix.agents.registry import get_agent
 from agenti_helix.api.job_registry import TaskCancelledError
-from agenti_helix.observability.debug_log import log_event
+from agenti_helix.observability.debug_log import log_event, write_cursor_debug_ndjson
 from agenti_helix.runtime.inference_backends import get_default_inference_backend
 from agenti_helix.runtime.json_utils import extract_first_json_object, try_fallback_snippet_judge_dict
 
@@ -106,8 +106,8 @@ def run_agent(
 
     backend = get_default_inference_backend(inference_backend_cfg)
 
-    # Build a progress callback that writes llm_progress events to the event log
-    # every N tokens so the frontend can show live generation status.
+    # Optional: MLX only — on_progress fires every AGENTI_HELIX_MLX_PROGRESS_INTERVAL
+    # tokens (default 0 = disabled) and writes kind=llm_progress for live UI.
     def _on_progress(token_count: int, tps: float, snippet: str) -> None:
         if not _llm_trace_enabled():
             return
@@ -122,6 +122,27 @@ def run_agent(
                 "token_count": token_count,
                 "tokens_per_second": round(tps, 1),
                 "partial_tail": snippet,
+            },
+            trace_id=trace_id,
+            dag_id=dag_id,
+        )
+
+    if _llm_trace_enabled():
+        log_event(
+            run_id=run_id_log,
+            hypothesis_id=hyp_log,
+            location=loc_log,
+            message="LLM inference started",
+            data={
+                "kind": "llm_start",
+                "agent_id": agent_id,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "backend_type": str(
+                    inference_backend_cfg.get("backend_type")
+                    or os.environ.get("AGENTI_HELIX_BACKEND_TYPE")
+                    or "mlx_local"
+                ),
             },
             trace_id=trace_id,
             dag_id=dag_id,
@@ -164,31 +185,29 @@ def run_agent(
             if fb is not None:
                 data = fb
                 parse_exc = None
-                # region agent log
-                try:
-                    _p = "/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-18115f.log"
-                    import time as _time
-
-                    with open(_p, "a", encoding="utf-8") as _df:
-                        _df.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "18115f",
-                                    "timestamp": int(_time.time() * 1000),
-                                    "location": "agent_runtime.py:run_agent",
-                                    "message": "judge_v1_json_fallback_used",
-                                    "data": {"verdict": fb.get("verdict"), "agent_id": agent_id},
-                                    "hypothesisId": "H3",
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                except OSError:
-                    pass
-                # endregion
+                # #region agent log
+                write_cursor_debug_ndjson(
+                    location="agent_runtime.py:run_agent",
+                    message="judge_v1_json_fallback_used",
+                    hypothesis_id="H3",
+                    data={"verdict": fb.get("verdict"), "agent_id": agent_id},
+                    run_id=run_id_log,
+                )
+                # #endregion
 
     if parse_exc is not None:
+        # #region agent log
+        write_cursor_debug_ndjson(
+            location="agent_runtime.py:run_agent",
+            message="json_extract_failed",
+            hypothesis_id="H4",
+            data={
+                "agent_id": agent_id,
+                "error": str(parse_exc)[:500],
+            },
+            run_id=run_id_log,
+        )
+        # #endregion
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,
@@ -211,6 +230,15 @@ def run_agent(
         typed = output_model.model_validate(data)
         result = typed.model_dump()
     except Exception as exc:
+        # #region agent log
+        write_cursor_debug_ndjson(
+            location="agent_runtime.py:run_agent",
+            message="pydantic_validate_failed",
+            hypothesis_id="H5",
+            data={"agent_id": agent_id, "error": str(exc)[:500]},
+            run_id=run_id_log,
+        )
+        # #endregion
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,

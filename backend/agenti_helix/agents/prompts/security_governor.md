@@ -13,7 +13,7 @@ First, reason step-by-step inside `<think>...</think>` tags — methodically che
 Then, after `</think>`, output a single JSON object with your audit reasoning, the pass/fail result, and the list of violations.
 
 Inputs:
-- Coder_Output_Diff_(JSON):
+- Coder_Output_Diff_(JSON) — includes `file_snapshots` with the written source and test file contents (paths-only JSON is invalid for this audit):
 {diff_json}
 
 - Repo_Rules_Text_(lint_security_style):

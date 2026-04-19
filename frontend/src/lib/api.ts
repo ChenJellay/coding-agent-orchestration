@@ -41,7 +41,13 @@ export type FeatureDetails = {
     dag_id: string
     nodes: Record<
       string,
-      { node_id: string; status: string; attempts: number; verification_status: string | null }
+      {
+        node_id: string
+        status: string
+        attempts: number
+        verification_status: string | null
+        verification_cycle?: number
+      }
     >
   } | null
   metrics: {

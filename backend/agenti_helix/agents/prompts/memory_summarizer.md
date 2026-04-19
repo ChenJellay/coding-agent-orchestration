@@ -30,11 +30,11 @@ Attempt number: {attempt}
 
 ## Output Format
 
-First, reason step-by-step inside `<think>...</think>` tags — identify patterns across failures and distil actionable constraints.
+First, reason step-by-step inside `<redacted_thinking>...</redacted_thinking>` tags — identify patterns across failures and distil actionable constraints.
 
-Then, after `</think>`, respond with ONLY valid JSON — no markdown fences, no preamble:
+Then, after `</redacted_thinking>`, respond with ONLY valid JSON — no markdown fences, no preamble:
 
-{
+{{
   "compressed_summary": "...",
   "key_constraints": ["...", "..."]
-}
+}}

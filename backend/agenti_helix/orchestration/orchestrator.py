@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from agenti_helix.observability.debug_log import log_event
+from agenti_helix.observability.debug_log import log_event, write_cursor_debug_ndjson
 from agenti_helix.api.paths import PATHS
 from agenti_helix.api.task_lookup import try_load_dag_state
 from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
@@ -211,6 +211,23 @@ def _initial_node_states_from_disk(spec: DagSpec) -> Dict[str, DagNodeExecutionS
     return out
 
 
+def _requeue_retryable_nodes(
+    node_states: Dict[str, DagNodeExecutionState],
+) -> list[str]:
+    """
+    New ``execute_dag`` invocations should retry nodes that failed or escalated on a
+    prior run. Persisted ``*_state.json`` otherwise leaves them ``FAILED``, and the
+    main loop would skip them forever (instant no-op DAG completion).
+    """
+    reset_ids: list[str] = []
+    for node_id, ns in node_states.items():
+        if ns.status in (DagNodeStatus.FAILED, DagNodeStatus.ESCALATED):
+            ns.status = DagNodeStatus.PENDING
+            ns.verification_status = None
+            reset_ids.append(node_id)
+    return reset_ids
+
+
 def execute_dag(spec: DagSpec) -> DagExecutionResult:
     """
     Execute a DAG by routing each node through the verification loop.
@@ -224,6 +241,27 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
     trace_id = str(uuid.uuid4())
 
     node_states = _initial_node_states_from_disk(spec)
+    requeued = _requeue_retryable_nodes(node_states)
+    # #region agent log
+    write_cursor_debug_ndjson(
+        location="orchestrator.py:execute_dag",
+        message="requeue_retryable_nodes",
+        hypothesis_id="H1",
+        data={"dag_id": spec.dag_id, "requeued_node_ids": requeued},
+        run_id=spec.dag_id,
+    )
+    # #endregion
+    if requeued:
+        log_event(
+            run_id=spec.dag_id,
+            hypothesis_id="dag_requeue",
+            location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+            message="Re-queued failed/escalated nodes for retry (persisted state from prior run)",
+            data={"dag_id": spec.dag_id, "node_ids": requeued},
+            trace_id=trace_id,
+            dag_id=spec.dag_id,
+        )
+        persist_dag_execution_state(spec.dag_id, node_states)
 
     order = _topological_order(spec)
     predecessors: Dict[str, Set[str]] = {node_id: set() for node_id in spec.nodes}
@@ -248,10 +286,37 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         if node_state.status is DagNodeStatus.RUNNING:
             node_state.status = DagNodeStatus.PENDING
         if node_state.status in (DagNodeStatus.PASSED_VERIFICATION, DagNodeStatus.AWAITING_SIGNOFF):
+            # #region agent log
+            write_cursor_debug_ndjson(
+                location="orchestrator.py:execute_dag:skip",
+                message="node_skip_already_verified",
+                hypothesis_id="H2",
+                data={"node_id": node_id, "status": node_state.status.value},
+                run_id=spec.dag_id,
+            )
+            # #endregion
             continue
         if node_state.status is DagNodeStatus.FAILED:
+            # #region agent log
+            write_cursor_debug_ndjson(
+                location="orchestrator.py:execute_dag:skip",
+                message="node_skip_stale_failed",
+                hypothesis_id="H2",
+                data={"node_id": node_id, "status": node_state.status.value},
+                run_id=spec.dag_id,
+            )
+            # #endregion
             continue
         if node_state.status is not DagNodeStatus.PENDING:
+            # #region agent log
+            write_cursor_debug_ndjson(
+                location="orchestrator.py:execute_dag:skip",
+                message="node_skip_non_pending",
+                hypothesis_id="H2",
+                data={"node_id": node_id, "status": node_state.status.value},
+                run_id=spec.dag_id,
+            )
+            # #endregion
             continue
 
         preds = predecessors.get(node_id, set())

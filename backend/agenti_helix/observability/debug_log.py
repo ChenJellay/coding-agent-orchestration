@@ -7,6 +7,39 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# Cursor debug NDJSON (session-scoped; used during IDE-assisted debugging)
+CURSOR_DEBUG_NDJSON_PATH = Path(
+    "/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-1f6f94.log"
+)
+CURSOR_DEBUG_SESSION_ID = "1f6f94"
+
+
+def write_cursor_debug_ndjson(
+    *,
+    location: str,
+    message: str,
+    hypothesis_id: str,
+    data: Optional[Dict[str, Any]] = None,
+    run_id: str = "cursor-debug",
+) -> None:
+    """Append one NDJSON line for the active Cursor debug session (best-effort, never raises)."""
+    try:
+        payload: Dict[str, Any] = {
+            "sessionId": CURSOR_DEBUG_SESSION_ID,
+            "id": f"d_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+        }
+        CURSOR_DEBUG_NDJSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CURSOR_DEBUG_NDJSON_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
 
 def _default_log_path() -> Path:
     repo_root = Path(os.environ.get("AGENTI_HELIX_REPO_ROOT", str(Path(".").resolve()))).resolve()

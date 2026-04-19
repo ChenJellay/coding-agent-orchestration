@@ -176,7 +176,8 @@ def default_full_pipeline_coder_chain(task: Any | None = None) -> Dict[str, Any]
                         "Ensure tests fail before the implementation exists."
                     ),
                 },
-                "runtime": {"temperature": 0.1, "max_tokens": 4096},
+                # Tighter cap + prompt budget reduces runaway <redacted_thinking> (same class of issue as coder_builder).
+                "runtime": {"temperature": 0.0, "max_tokens": 3072},
             },
             # 5. Coder Builder: implement the feature.
             {
@@ -189,7 +190,8 @@ def default_full_pipeline_coder_chain(task: Any | None = None) -> Dict[str, Any]
                     "acceptance_criteria": {"$ref": "acceptance_criteria"},
                     "file_contexts_json": {"$ref": "file_contexts.file_contexts_json"},
                 },
-                "runtime": {"temperature": 0.0, "max_tokens": 8192},
+                # Cap avoids local-LLM runaway loops in <redacted_thinking> burning CPU until 8k tokens (see events.jsonl).
+                "runtime": {"temperature": 0.0, "max_tokens": 6144},
             },
             # 6. Write all files (code + tests) to disk; output becomes diff_json.
             {

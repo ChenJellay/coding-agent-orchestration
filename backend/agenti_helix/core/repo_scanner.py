@@ -37,7 +37,7 @@ class RepoFile:
     language: SupportedLanguage
 
 
-JS_EXTENSIONS = {".js", ".jsx"}
+JS_EXTENSIONS = {".js", ".jsx", ".cjs", ".mjs"}
 TS_EXTENSIONS = {".ts", ".tsx"}
 PY_EXTENSIONS = {".py"}
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import py_compile
 import subprocess
 import tempfile
@@ -94,6 +95,123 @@ def _patch_pipeline(task: EditTaskSpec) -> bool:
     """Line-patch verification requires staging + manual sign-off before workspace is final."""
     mode = getattr(task, "pipeline_mode", None) or "patch"
     return mode in ("patch", "diff_guard_patch")
+
+
+# Cap embedded git diff in checkpoint JSON (UI / control plane).
+_MAX_GIT_UNIFIED_DIFF_CHARS = 512_000
+
+
+def _paths_for_git_diff(task: EditTaskSpec, diff_json: Optional[Dict[str, Any]]) -> List[str]:
+    """Repo-relative paths to include in a unified diff (target file + diff_json metadata)."""
+    paths: List[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        raw = raw.strip().replace("\\", "/")
+        if not raw or raw in seen or ".." in raw.split("/"):
+            return
+        seen.add(raw)
+        paths.append(raw)
+
+    if task.target_file:
+        add(str(task.target_file))
+    if not isinstance(diff_json, dict):
+        return paths
+    fp = diff_json.get("filePath")
+    if isinstance(fp, str):
+        add(fp)
+    for key in ("files_written", "test_file_paths"):
+        lst = diff_json.get(key)
+        if isinstance(lst, list):
+            for item in lst:
+                if isinstance(item, str):
+                    add(item)
+    return paths
+
+
+def _git_unified_diff_for_paths(repo_root: Path, paths: List[str]) -> str:
+    """
+    Best-effort unified diff for working tree vs HEAD (tracked files) and new-file diffs (untracked).
+
+    Untracked paths use ``git diff --no-index`` against an empty file.
+    """
+    if not paths:
+        return ""
+    repo_root = repo_root.resolve()
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if probe.returncode != 0:
+            return ""
+        if (probe.stdout or "").strip().lower() != "true":
+            return ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+
+    chunks: List[str] = []
+    null_device = os.devnull
+    for rel in paths:
+        rel = rel.strip().replace("\\", "/")
+        if not rel or ".." in rel.split("/"):
+            continue
+        path = repo_root / rel
+        if not path.is_file():
+            continue
+        try:
+            ls = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--", rel],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        tracked = ls.returncode == 0
+        try:
+            if tracked:
+                diff = subprocess.run(
+                    ["git", "-C", str(repo_root), "diff", "--no-color", "HEAD", "--", rel],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if diff.stdout:
+                    chunks.append(diff.stdout)
+            else:
+                diff = subprocess.run(
+                    ["git", "diff", "--no-color", "--no-index", null_device, rel],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(repo_root),
+                    timeout=120,
+                )
+                if diff.stdout:
+                    chunks.append(diff.stdout)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+
+    out = "".join(chunks)
+    if len(out) > _MAX_GIT_UNIFIED_DIFF_CHARS:
+        return out[:_MAX_GIT_UNIFIED_DIFF_CHARS] + "\n... [truncated by agenti_helix: git unified diff cap]\n"
+    return out
+
+
+def _tool_logs_with_git_unified_diff(
+    *,
+    repo_root: Path,
+    task: EditTaskSpec,
+    diff_json: Optional[Dict[str, Any]],
+    base: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(base)
+    diff_txt = _git_unified_diff_for_paths(repo_root, _paths_for_git_diff(task, diff_json))
+    if diff_txt.strip():
+        merged["git_unified_diff"] = diff_txt
+    return merged
 
 
 def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
@@ -511,7 +629,12 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
 
     if str(verdict).upper() == "PASS":
         post_judge_body = target_path.read_text()
-        tool_logs_base = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
+        tool_logs_base = _tool_logs_with_git_unified_diff(
+            repo_root=repo_root,
+            task=state.task,
+            diff_json=state.diff_json,
+            base={"judge": state.judge_response, "static_checks": state.static_check_logs or {}},
+        )
         if _patch_pipeline(state.task):
             record_post_state(
                 state.checkpoint,
@@ -591,7 +714,16 @@ def node_handle_verdict(state: VerificationState) -> VerificationState:
                 state.checkpoint,
                 post_state_ref=target_path.read_text(),
                 diff=json.dumps(state.diff_json or {}, indent=2),
-                tool_logs={"judge": state.judge_response, "static_checks": state.static_check_logs or {}, "supreme_court_invoked": state.supreme_court_invoked},
+                tool_logs=_tool_logs_with_git_unified_diff(
+                    repo_root=repo_root,
+                    task=state.task,
+                    diff_json=state.diff_json,
+                    base={
+                        "judge": state.judge_response,
+                        "static_checks": state.static_check_logs or {},
+                        "supreme_court_invoked": state.supreme_court_invoked,
+                    },
+                ),
                 status=VerificationStatus.BLOCKED,
             )
             log_event(
@@ -787,12 +919,17 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
             state.checkpoint,
             post_state_ref=target_path.read_text(),
             diff=json.dumps(state.diff_json or {}, indent=2),
-            tool_logs={
-                "judge": state.judge_response,
-                "static_checks": state.static_check_logs or {},
-                "supreme_court_invoked": True,
-                "supreme_court_error": str(exc),
-            },
+            tool_logs=_tool_logs_with_git_unified_diff(
+                repo_root=repo_root,
+                task=state.task,
+                diff_json=state.diff_json,
+                base={
+                    "judge": state.judge_response,
+                    "static_checks": state.static_check_logs or {},
+                    "supreme_court_invoked": True,
+                    "supreme_court_error": str(exc),
+                },
+            ),
             status=VerificationStatus.BLOCKED,
         )
         log_event(
@@ -842,10 +979,15 @@ def build_verification_graph() -> StateGraph:
                     state.checkpoint,
                     post_state_ref=target_path.read_text() if target_path.exists() else "",
                     diff=json.dumps(state.diff_json or {}, indent=2),
-                    tool_logs={
-                        "judge": state.judge_response,
-                        "human_escalation": state.human_escalation_reason,
-                    },
+                    tool_logs=_tool_logs_with_git_unified_diff(
+                        repo_root=repo_root,
+                        task=state.task,
+                        diff_json=state.diff_json,
+                        base={
+                            "judge": state.judge_response,
+                            "human_escalation": state.human_escalation_reason,
+                        },
+                    ),
                     status=VerificationStatus.BLOCKED,
                 )
             return END
@@ -877,7 +1019,12 @@ def build_verification_graph() -> StateGraph:
                     state.checkpoint,
                     post_state_ref=target_path.read_text() if target_path.exists() else "",
                     diff=json.dumps(state.diff_json or {}, indent=2),
-                    tool_logs={"security_findings": logs["errors"], "security_blocked": True},
+                    tool_logs=_tool_logs_with_git_unified_diff(
+                        repo_root=repo_root,
+                        task=state.task,
+                        diff_json=state.diff_json,
+                        base={"security_findings": logs["errors"], "security_blocked": True},
+                    ),
                     status=VerificationStatus.BLOCKED,
                 )
                 return END
