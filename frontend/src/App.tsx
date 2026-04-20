@@ -33,7 +33,8 @@ import {
   applyNodeSignoff,
   resumeDag,
   startDagFromDashboard,
-  type PipelineMode,
+  type ExecutionExtras,
+  type ExecutionMode,
 } from './lib/api'
 
 function Icon({ label }: { label: string }) {
@@ -156,7 +157,8 @@ function DashboardPage() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
-  const [pipelineMode, setPipelineMode] = useState<PipelineMode | 'orchestrator'>('patch')
+  const [executionMode, setExecutionMode] = useState<ExecutionMode | 'orchestrator'>('patch')
+  const [extras, setExtras] = useState<ExecutionExtras>({ doc: false, diff_gate: false, lint_type: false })
 
   const [repoPath, setRepoPath] = useState<string>(REPO_PRESETS[0]?.value ?? '../demo-repo')
   const [macroIntent, setMacroIntent] = useState<string>('')
@@ -248,12 +250,13 @@ function DashboardPage() {
     }
     setRunBusy(true)
     try {
-      const resolvedPipeline: PipelineMode | null =
-        pipelineMode === 'orchestrator' ? null : pipelineMode
+      const resolvedMode: ExecutionMode | null =
+        executionMode === 'orchestrator' ? null : executionMode
       const res = await startDagFromDashboard({
         repo_path: trimmedRepo,
         macro_intent: trimmedIntent,
-        pipeline_mode: resolvedPipeline,
+        mode: resolvedMode,
+        extras,
         ...(docUploadText != null && docUploadText !== ''
           ? { doc_text: docUploadText, doc_filename: docUploadName ?? undefined }
           : docUrlField.trim() !== ''
@@ -465,7 +468,7 @@ function DashboardPage() {
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, alignItems: 'start' }}>
           <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--bg)', padding: 12 }}>
-            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Execution pipeline</div>
+            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Execution mode</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {(
                 [
@@ -482,36 +485,12 @@ function DashboardPage() {
                     desc: 'Full test-driven pipeline with context discovery, test coverage, and security audit. Best for new features and multi-file changes.',
                   },
                   {
-                    id: 'product_eng' as const,
-                    label: 'Product engineering (doc-first)',
-                    agents: 'doc_fetcher → librarian → sdet → builder | governor → diff_validator → judge_evaluator',
-                    desc: 'Fetches optional doc URL (task context or .agenti_helix/doc_url), then runs the full TDD stack with a diff scope gate before evaluation.',
-                  },
-                  {
-                    id: 'diff_guard_patch' as const,
-                    label: 'Quick patch + diff gate',
-                    agents: 'coder_patch_v1 → diff_validator_v1 → judge_v1',
-                    desc: 'Fast single-file patch with a git-diff scope check before the snippet judge. Uses the same sign-off semantics as Quick patch.',
-                  },
-                  {
-                    id: 'secure_build_plus' as const,
-                    label: 'Secure full build',
-                    agents: 'full TDD coder | governor → diff_validator → judge_evaluator',
-                    desc: 'Same multi-file TDD coder as Full build, with an extra diff-validator gate between security review and evaluation.',
-                  },
-                  {
-                    id: 'lint_type_gate' as const,
-                    label: 'Lint + type gate (build)',
-                    agents: 'full TDD coder | linter → type_checker → judge_evaluator',
-                    desc: 'Full TDD implementation with static analysis agents surfacing eslint/ruff and mypy/tsc signals into the evaluator.',
-                  },
-                  {
                     id: 'orchestrator' as const,
                     label: 'Orchestrator decides',
-                    agents: 'intent_compiler_v1 assigns pipeline per node',
-                    desc: 'LLM orchestrator analyses each subtask and picks "patch" or "build" per node. Requires LLM inference.',
+                    agents: 'intent_compiler_v1 assigns mode per node',
+                    desc: 'LLM orchestrator analyses each subtask and picks "patch" or "build" per node.',
                   },
-                ] as { id: PipelineMode | 'orchestrator'; label: string; agents: string; desc: string }[]
+                ] as { id: ExecutionMode | 'orchestrator'; label: string; agents: string; desc: string }[]
               ).map((opt) => (
                 <label
                   key={opt.id}
@@ -522,15 +501,15 @@ function DashboardPage() {
                     cursor: 'pointer',
                     padding: '8px 10px',
                     borderRadius: 10,
-                    border: `1px solid ${pipelineMode === opt.id ? 'var(--primary)' : 'var(--border)'}`,
-                    background: pipelineMode === opt.id ? 'var(--primary-bg)' : 'transparent',
+                    border: `1px solid ${executionMode === opt.id ? 'var(--primary)' : 'var(--border)'}`,
+                    background: executionMode === opt.id ? 'var(--primary-bg)' : 'transparent',
                   }}
                 >
                   <input
                     type="radio"
-                    name="pipeline_mode"
-                    checked={pipelineMode === opt.id}
-                    onChange={() => setPipelineMode(opt.id)}
+                    name="execution_mode"
+                    checked={executionMode === opt.id}
+                    onChange={() => setExecutionMode(opt.id)}
                     style={{ marginTop: 2 }}
                   />
                   <div>
@@ -542,6 +521,44 @@ function DashboardPage() {
                   </div>
                 </label>
               ))}
+            </div>
+
+            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+              <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 6 }}>Optional extras</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {(
+                  [
+                    {
+                      id: 'doc' as const,
+                      label: 'Doc-first (doc_fetcher prefix)',
+                      desc: 'Distil PRD/API docs into the macro intent before planning. Pairs with build mode.',
+                    },
+                    {
+                      id: 'diff_gate' as const,
+                      label: 'Diff-validator gate',
+                      desc: 'Insert diff_validator between coder and judge to catch out-of-scope changes.',
+                    },
+                    {
+                      id: 'lint_type' as const,
+                      label: 'Lint + type-check signals',
+                      desc: 'Run linter + type_checker agents and fold findings into the judge prompt. Build mode only.',
+                    },
+                  ] as { id: keyof ExecutionExtras; label: string; desc: string }[]
+                ).map((opt) => (
+                  <label key={opt.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(extras[opt.id])}
+                      onChange={(e) => setExtras({ ...extras, [opt.id]: e.target.checked })}
+                      style={{ marginTop: 3 }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: 12 }}>{opt.label}</div>
+                      <div style={{ color: 'var(--muted)', fontSize: 11 }}>{opt.desc}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
             </div>
           </section>
         </div>

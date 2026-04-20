@@ -346,20 +346,26 @@ export async function resumeDag(dag_id: string): Promise<{ ok: true }> {
   return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/resume`, {})
 }
 
-export type PipelineMode =
-  | 'patch'
-  | 'build'
-  | 'product_eng'
-  | 'diff_guard_patch'
-  | 'secure_build_plus'
-  | 'lint_type_gate'
+/** Base execution mode. `null` lets the LLM intent compiler decide per node. */
+export type ExecutionMode = 'patch' | 'build'
+
+/** Optional behaviour toggles layered on top of the base mode. */
+export interface ExecutionExtras {
+  /** Run the doc_fetcher prefix that distils PRD/API docs into the macro intent. */
+  doc?: boolean
+  /** Insert the diff_validator gate between the coder and the judge. */
+  diff_gate?: boolean
+  /** Run linter + type_checker agents and fold findings into the judge prompt. */
+  lint_type?: boolean
+}
 
 export async function startDagFromDashboard(params: {
   repo_path: string
   macro_intent: string
   agent_ids?: string[]
   dag_id?: string
-  pipeline_mode?: PipelineMode | null
+  mode?: ExecutionMode | null
+  extras?: ExecutionExtras
   /** Raw documentation text (from upload); server writes under target repo `.agenti_helix/`. */
   doc_text?: string
   doc_filename?: string
@@ -371,7 +377,12 @@ export async function startDagFromDashboard(params: {
     macro_intent: params.macro_intent,
     agent_ids: params.agent_ids ?? ['coder_patch_v1', 'judge_v1'],
     ...(params.dag_id != null ? { dag_id: params.dag_id } : {}),
-    pipeline_mode: params.pipeline_mode ?? null,
+    mode: params.mode ?? null,
+    extras: {
+      doc: Boolean(params.extras?.doc),
+      diff_gate: Boolean(params.extras?.diff_gate),
+      lint_type: Boolean(params.extras?.lint_type),
+    },
     ...(params.doc_text != null && params.doc_text !== ''
       ? { doc_text: params.doc_text, ...(params.doc_filename ? { doc_filename: params.doc_filename } : {}) }
       : params.doc_url != null && params.doc_url.trim() !== ''

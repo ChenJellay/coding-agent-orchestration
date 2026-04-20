@@ -299,25 +299,66 @@ class EditIntentRequestBody(BaseModel):
     macro_intent: str
 
 
+class ExecutionExtras(BaseModel):
+    """Optional behaviour toggles layered on top of the base mode."""
+
+    doc: bool = Field(
+        default=False,
+        description="Run the doc_fetcher prefix that distils PRD/API docs into the macro intent.",
+    )
+    diff_gate: bool = Field(
+        default=False,
+        description="Insert the diff_validator gate between the coder and the judge.",
+    )
+    lint_type: bool = Field(
+        default=False,
+        description="Run the linter + type_checker agents and fold their findings into the judge prompt.",
+    )
+
+
+# Maps (mode, extras) → the internal pipeline_mode string that chain resolvers understand.
+def _resolve_internal_pipeline_mode(
+    mode: Optional[str],
+    extras: ExecutionExtras,
+) -> Optional[str]:
+    if mode is None:
+        return None
+    base = mode.strip().lower()
+    if base == "patch":
+        return "diff_guard_patch" if extras.diff_gate else "patch"
+    if base == "build":
+        if extras.doc:
+            return "product_eng"
+        if extras.lint_type:
+            return "lint_type_gate"
+        if extras.diff_gate:
+            return "secure_build_plus"
+        return "build"
+    raise ValueError(f"Unknown mode={mode!r}; expected 'patch', 'build', or null.")
+
+
 class ExecuteDagFromDashboardRequestBody(BaseModel):
     repo_path: str = Field(description="Absolute or relative path to the target repository root.")
     macro_intent: str = Field(description="Helix command / macro intent that compiles into a DAG.")
     agent_ids: List[str] = Field(
-        description="Selected agents. When pipeline_mode is set, agent_ids are informational only.",
+        description="Selected agents. When mode is set, agent_ids are informational only.",
         default=["coder_patch_v1", "judge_v1"],
     )
     dag_id: Optional[str] = Field(default=None, description="Optional DAG id (feature id).")
-    pipeline_mode: Optional[str] = Field(
+    mode: Optional[str] = Field(
         default=None,
         description=(
-            "Override pipeline for all DAG nodes: "
-            '"patch", "build", "product_eng", "diff_guard_patch", "secure_build_plus", "lint_type_gate". '
-            "When null, the orchestrator assigns pipeline_mode per node based on the LLM compiler's output."
+            'Base execution mode: "patch" for fast single-file line-patches, "build" for full TDD. '
+            "Set to null to let the LLM intent compiler pick per node."
         ),
+    )
+    extras: ExecutionExtras = Field(
+        default_factory=ExecutionExtras,
+        description="Optional behaviour toggles (doc, diff_gate, lint_type).",
     )
     doc_url: Optional[str] = Field(
         default=None,
-        description="Optional documentation URL for doc_fetcher (product_eng). Ignored when doc_text is set.",
+        description="Optional documentation URL for doc_fetcher (extras.doc). Ignored when doc_text is set.",
     )
     doc_text: Optional[str] = Field(
         default=None,
@@ -527,27 +568,31 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     UI entrypoint for starting a new DAG from:
       - a selected local repository (`repo_path`)
       - a command (`macro_intent`)
-      - optional `pipeline_mode` override (see ExecuteDagFromDashboardRequestBody)
+      - an execution `mode` ("patch" or "build", or null to let the LLM decide)
+      - optional `extras` toggles (doc, diff_gate, lint_type)
 
-    When `pipeline_mode` is "build", the full TDD pipeline
+    When mode is "build", the full TDD pipeline
     (librarian → sdet → coder_builder → governor → judge_evaluator) runs per node.
-    When "patch" (default), the fast single-file coder_patch_v1 + judge_v1 chain runs.
-    When null, the orchestrator assigns pipeline_mode per node based on the LLM compiler's output.
+    When "patch", the fast single-file coder_patch_v1 + judge_v1 chain runs.
+    When null, the orchestrator assigns the pipeline per node based on the LLM compiler's output.
     """
     dag_id = body.dag_id or f"dag-ui-run-{int(time.time())}"
 
     _macro_intent = body.macro_intent
     _repo_path = body.repo_path
-    _pipeline_mode = body.pipeline_mode.strip() if isinstance(body.pipeline_mode, str) else body.pipeline_mode
-    _doc_url_opt = (body.doc_url or "").strip() or None
-    _doc_text = body.doc_text
-    _doc_filename = body.doc_filename
+    try:
+        _pipeline_mode = _resolve_internal_pipeline_mode(body.mode, body.extras)
+    except ValueError as exc:
+        raise_http_error(code="invalid_mode", message=str(exc), status_code=400)
     if _pipeline_mode is not None and _pipeline_mode not in PIPELINE_MODES:
         raise_http_error(
             code="invalid_pipeline_mode",
-            message=f"Unknown pipeline_mode={body.pipeline_mode!r}. Valid modes: {sorted(PIPELINE_MODES)}",
-            status_code=400,
+            message=f"Resolved pipeline_mode={_pipeline_mode!r} is not in {sorted(PIPELINE_MODES)}",
+            status_code=500,
         )
+    _doc_url_opt = (body.doc_url or "").strip() or None
+    _doc_text = body.doc_text
+    _doc_filename = body.doc_filename
 
     def _compile_and_execute(_cancel_token: object) -> None:
         """Compile the DAG spec via LLM and execute it — all in the background."""
@@ -607,7 +652,13 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
         execute_dag(spec)
 
     start_background_job(
-        meta={"dag_id": dag_id, "action": "ui-run", "pipeline_mode": body.pipeline_mode},
+        meta={
+            "dag_id": dag_id,
+            "action": "ui-run",
+            "mode": body.mode,
+            "extras": body.extras.model_dump(),
+            "pipeline_mode": _pipeline_mode,
+        },
         target=_compile_and_execute,
     )
 
