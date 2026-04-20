@@ -36,6 +36,7 @@ import {
   type ExecutionExtras,
   type ExecutionMode,
 } from './lib/api'
+import { useEventTick } from './lib/useEvents'
 
 function Icon({ label }: { label: string }) {
   return (
@@ -185,21 +186,18 @@ function DashboardPage() {
     }
   }
 
+  const dashboardTick = useEventTick()
+
   useEffect(() => {
     let cancelled = false
     void (async () => {
       if (cancelled) return
       await loadAll()
     })()
-    const t = window.setInterval(() => {
-      if (cancelled) return
-      void loadAll()
-    }, 5000)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [])
+  }, [dashboardTick])
 
   const trustScore = useMemo(() => {
     if (!features || features.length === 0) return null
@@ -1439,6 +1437,7 @@ function FeatureDagPage() {
 
   const [data, setData] = useState<FeatureDetails | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const featureTick = useEventTick({ dagId: featureId ?? null })
 
   useEffect(() => {
     if (!featureId) return
@@ -1455,12 +1454,10 @@ function FeatureDagPage() {
     }
 
     load()
-    const t = window.setInterval(load, 2500)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [featureId])
+  }, [featureId, featureTick])
 
   const nodes = data?.dag.nodes ?? {}
   const stateNodes = data?.state?.nodes ?? {}
@@ -1587,6 +1584,7 @@ function TaskInterventionPage() {
   const [error, setError] = useState<string | null>(null)
   const [actionNote, setActionNote] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
+  const nodeTick = useEventTick({ dagId: featureId ?? null })
 
   useEffect(() => {
     if (!featureId || !nodeId) return
@@ -1613,12 +1611,10 @@ function TaskInterventionPage() {
     }
 
     load()
-    const t = window.setInterval(load, 3000)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [featureId, nodeId, refreshTick])
+  }, [featureId, nodeId, refreshTick, nodeTick])
 
   const task = feature?.dag.nodes?.[nodeId ?? '']?.task
   const latestCp = (checkpoints ?? [])[0] ?? null
@@ -1776,6 +1772,8 @@ function SignoffTripanePage() {
     }
   }, [])
 
+  const taskInputTick = useEventTick({ dagId: featureId ?? null })
+
   useEffect(() => {
     if (!featureId) return
     let cancelled = false
@@ -1793,12 +1791,10 @@ function SignoffTripanePage() {
     }
 
     load()
-    const t = window.setInterval(load, 3000)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [featureId])
+  }, [featureId, taskInputTick])
 
   const tasks = Object.values(feature?.dag.nodes ?? {}).map((n) => n.task)
   const acceptance = tasks.map((t) => `- ${t.acceptance_criteria}`).join('\n')
@@ -2180,6 +2176,8 @@ function TriageInboxPage() {
     }
   }, [])
 
+  const triageTick = useEventTick()
+
   useEffect(() => {
     let cancelled = false
 
@@ -2194,14 +2192,10 @@ function TriageInboxPage() {
     }
 
     void load()
-    const t = window.setInterval(() => {
-      if (!cancelled) void load()
-    }, 2500)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [])
+  }, [triageTick])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -2488,6 +2482,8 @@ function FeaturesKanbanPage() {
     }
   }, [])
 
+  const kanbanTick = useEventTick()
+
   useEffect(() => {
     let cancelled = false
 
@@ -2502,14 +2498,10 @@ function FeaturesKanbanPage() {
     }
 
     void load()
-    const t = window.setInterval(() => {
-      if (!cancelled) void load()
-    }, 2500)
     return () => {
       cancelled = true
-      window.clearInterval(t)
     }
-  }, [])
+  }, [kanbanTick])
 
   // D6: Filter features by the search query (matches title or macro_intent).
   const filteredFeatures = useMemo(() => {
