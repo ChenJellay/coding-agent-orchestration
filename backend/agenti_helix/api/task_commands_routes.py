@@ -15,17 +15,12 @@ from pydantic import BaseModel, Field
 from agenti_helix.api.auth import Role, require_editor
 from agenti_helix.api.errors import raise_http_error
 from agenti_helix.runtime.pipeline_presets import PIPELINE_MODES
-
-# Dashboard pipeline modes that must compile via the LLM intent compiler (not the deterministic demo DAG).
-_DASHBOARD_LLM_INTENT_MODES: frozenset[str] = frozenset(
-    {"product_eng", "build", "secure_build_plus", "lint_type_gate"},
-)
 from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
 from agenti_helix.api.job_registry import CancelToken, start_background_job
 from agenti_helix.api.paths import PATHS, iter_jsonl, read_json
 from agenti_helix.api.task_context_store import load_task_context, render_task_context_feedback, save_task_context
 from agenti_helix.api.task_lookup import find_task_ref, persist_dag_state, try_load_dag_state
-from agenti_helix.observability.debug_log import log_event, write_debug_mode_ndjson
+from agenti_helix.observability.debug_log import log_event
 from agenti_helix.orchestration.orchestrator import DagNodeStatus, execute_dag, load_dag_spec, persist_dag_spec
 from agenti_helix.orchestration.intent_compiler import (
     compile_macro_intent_to_dag,
@@ -312,17 +307,12 @@ class ExecuteDagFromDashboardRequestBody(BaseModel):
         default=["coder_patch_v1", "judge_v1"],
     )
     dag_id: Optional[str] = Field(default=None, description="Optional DAG id (feature id).")
-    use_llm: bool = Field(
-        default=False,
-        description="When true, compile intent via LLM (needs inference; can block POST until complete). "
-        "When false or omitted, use the fast deterministic demo compiler (writes DAG immediately).",
-    )
     pipeline_mode: Optional[str] = Field(
         default=None,
         description=(
             "Override pipeline for all DAG nodes: "
             '"patch", "build", "product_eng", "diff_guard_patch", "secure_build_plus", "lint_type_gate". '
-            "When null, the orchestrator assigns pipeline_mode per node (requires use_llm=true)."
+            "When null, the orchestrator assigns pipeline_mode per node based on the LLM compiler's output."
         ),
     )
     doc_url: Optional[str] = Field(
@@ -479,7 +469,6 @@ def edit_dag_intent(dag_id: str, body: EditIntentRequestBody) -> Dict[str, Any]:
             body.macro_intent,
             repo_path=repo_root,
             dag_id=dag_id,
-            use_llm=True,
             user_intent_label=body.macro_intent.strip(),
         )
     except Exception as exc:
@@ -543,18 +532,12 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     When `pipeline_mode` is "build", the full TDD pipeline
     (librarian → sdet → coder_builder → governor → judge_evaluator) runs per node.
     When "patch" (default), the fast single-file coder_patch_v1 + judge_v1 chain runs.
-    When null and use_llm=true, the orchestrator assigns pipeline_mode per node.
-
-    Named full pipelines (`product_eng`, `build`, `secure_build_plus`, `lint_type_gate`) always compile
-    macro intent via the LLM intent compiler (`use_llm` is treated as true) so the DAG id returned
-    here matches the persisted spec and downstream agents (doc_fetcher, librarian, …) run.
+    When null, the orchestrator assigns pipeline_mode per node based on the LLM compiler's output.
     """
     dag_id = body.dag_id or f"dag-ui-run-{int(time.time())}"
 
-    # Capture body fields for use inside the closure (avoid late-binding issues).
     _macro_intent = body.macro_intent
     _repo_path = body.repo_path
-    _use_llm = body.use_llm
     _pipeline_mode = body.pipeline_mode.strip() if isinstance(body.pipeline_mode, str) else body.pipeline_mode
     _doc_url_opt = (body.doc_url or "").strip() or None
     _doc_text = body.doc_text
@@ -566,34 +549,8 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
             status_code=400,
         )
 
-    _use_llm_compile = bool(_use_llm or (_pipeline_mode in _DASHBOARD_LLM_INTENT_MODES))
-
-    # region agent log
-    write_debug_mode_ndjson(
-        location="task_commands_routes.py:run_dag_from_dashboard",
-        message="dashboard_run_request",
-        hypothesis_id="H1",
-        data={
-            "dag_id": dag_id,
-            "pipeline_mode": _pipeline_mode,
-            "use_llm_body": _use_llm,
-            "use_llm_compile": _use_llm_compile,
-            "has_doc_text": bool(_doc_text and str(_doc_text).strip()),
-            "has_doc_url": bool(_doc_url_opt),
-        },
-    )
-    # endregion
-
     def _compile_and_execute(_cancel_token: object) -> None:
-        """Compile the DAG spec (possibly via LLM) and execute it — all in the background."""
-        # region agent log
-        write_debug_mode_ndjson(
-            location="task_commands_routes.py:_compile_and_execute",
-            message="background_compile_start",
-            hypothesis_id="H3",
-            data={"dag_id": dag_id, "use_llm_compile": _use_llm_compile},
-        )
-        # endregion
+        """Compile the DAG spec via LLM and execute it — all in the background."""
         try:
             macro_for_compile, effective_doc, doc_merged_at_compile = enrich_macro_intent_with_doc_before_compile(
                 _macro_intent,
@@ -618,18 +575,9 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
                 macro_for_compile,
                 repo_path=_repo_path,
                 dag_id=dag_id,
-                use_llm=_use_llm_compile,
                 user_intent_label=_macro_intent.strip(),
             )
         except Exception as exc:
-            # region agent log
-            write_debug_mode_ndjson(
-                location="task_commands_routes.py:_compile_and_execute",
-                message="intent_compile_failed",
-                hypothesis_id="H3",
-                data={"dag_id": dag_id, "error": str(exc)[:500]},
-            )
-            # endregion
             log_event(
                 run_id=dag_id,
                 hypothesis_id="orchestrator",
@@ -638,15 +586,6 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
                 data={"error": str(exc)},
             )
             return
-
-        # region agent log
-        write_debug_mode_ndjson(
-            location="task_commands_routes.py:_compile_and_execute",
-            message="intent_compile_ok",
-            hypothesis_id="H3",
-            data={"dag_id": dag_id, "spec_dag_id": spec.dag_id, "node_count": len(spec.nodes)},
-        )
-        # endregion
 
         # Intent JSON may name a different dag_id than the dashboard assigned; features + UI key off `dag_id`.
         spec.dag_id = dag_id
@@ -659,12 +598,9 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
                 if doc_merged_at_compile:
                     node.task.skip_doc_chain_prefix = True
 
-        # Apply pipeline_mode override when provided.
-        for _node_id, node in spec.nodes.items():
-            if _pipeline_mode is not None:
+        if _pipeline_mode is not None:
+            for node in spec.nodes.values():
                 node.task.pipeline_mode = _pipeline_mode
-            elif not _use_llm_compile:
-                node.task.pipeline_mode = "patch"
 
         persist_dag_spec(spec)
         invalidate_features_and_triage_caches()

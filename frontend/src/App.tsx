@@ -267,19 +267,11 @@ function DashboardPage() {
         }),
       }).catch(() => {})
       // #endregion
-      const useLlm = import.meta.env.VITE_INTENT_USE_LLM === 'true'
-      // Orchestrator: LLM assigns pipeline_mode per node. Full pipelines (product_eng, build, …) require LLM intent compile on the server; we set use_llm so the payload matches.
-      const fullPipelineNeedsLlmIntent: boolean =
-        pipelineMode === 'product_eng' ||
-        pipelineMode === 'build' ||
-        pipelineMode === 'secure_build_plus' ||
-        pipelineMode === 'lint_type_gate'
       const resolvedPipeline: PipelineMode | null =
         pipelineMode === 'orchestrator' ? null : pipelineMode
       const res = await startDagFromDashboard({
         repo_path: trimmedRepo,
         macro_intent: trimmedIntent,
-        use_llm: useLlm || pipelineMode === 'orchestrator' || fullPipelineNeedsLlmIntent,
         pipeline_mode: resolvedPipeline,
         ...(docUploadText != null && docUploadText !== ''
           ? { doc_text: docUploadText, doc_filename: docUploadName ?? undefined }

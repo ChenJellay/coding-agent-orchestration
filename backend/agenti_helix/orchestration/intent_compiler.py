@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import ValidationError
 
 from agenti_helix.agents.models import IntentCompilerOutput as _IntentCompilerOutputModel
-from agenti_helix.observability.debug_log import log_event, write_debug_mode_ndjson
+from agenti_helix.observability.debug_log import log_event
 from agenti_helix.api.dashboard_doc import resolve_dashboard_doc_url
 from agenti_helix.runtime.chain_defaults import (
     default_intent_compiler_chain,
@@ -219,19 +219,9 @@ def compile_macro_intent_with_llm(
     repo_path: str,
     *,
     dag_id: Optional[str] = None,
-    base_url: Optional[str] = None,
-    timeout_seconds: float = 90.0,
     user_intent_label: Optional[str] = None,
 ) -> DagSpec:
     repo_root = Path(repo_path).resolve()
-    if base_url:
-        log_event(
-            run_id="intent",
-            hypothesis_id="LLM",
-            location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-            message="llm_base_url ignored (in-process chain runtime mode)",
-            data={"base_url": base_url},
-        )
 
     last_error: str = ""
     typed: Dict[str, object] = {}
@@ -335,150 +325,20 @@ def compile_macro_intent_with_llm(
     return spec
 
 
-def compile_macro_intent_deterministic(
-    macro_intent: str,
-    repo_path: str,
-    *,
-    dag_id: Optional[str] = None,
-    user_intent_label: Optional[str] = None,
-) -> DagSpec:
-    repo_root = Path(repo_path).resolve()
-    dag_identifier = dag_id or "dag-demo-header"
-
-    node1 = DagNodeSpec(
-        node_id="N1-change-color",
-        description="Update header button background color to green.",
-        task=EditTaskSpec(
-            task_id="header-color-primary",
-            intent=_coder_task_intent_for_node(
-                node_id="N1-change-color",
-                description="Change the header button background color to green.",
-                acceptance_criteria=(
-                    "Header has exactly one visible button whose background color is green. "
-                    "No unrelated logic is modified."
-                ),
-                macro_intent=macro_intent,
-            ),
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header has exactly one visible button whose background color is green. "
-                "No unrelated logic is modified."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    node2 = DagNodeSpec(
-        node_id="N2-refine-styles",
-        description="Refine header button styling to remain accessible and consistent.",
-        task=EditTaskSpec(
-            task_id="header-style-refine",
-            intent=_coder_task_intent_for_node(
-                node_id="N2-refine-styles",
-                description=(
-                    "Ensure the header button styling is consistent and accessible "
-                    "(contrast preserved, padding and radius intact)."
-                ),
-                acceptance_criteria=(
-                    "Header button remains green with good contrast, spacing, and radius. "
-                    "Structure of Header component is preserved."
-                ),
-                macro_intent=macro_intent,
-            ),
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header button remains green with good contrast, spacing, and radius. "
-                "Structure of Header component is preserved."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    node3 = DagNodeSpec(
-        node_id="N3-verify-structure",
-        description="Verify Header markup still renders a single primary button.",
-        task=EditTaskSpec(
-            task_id="header-structure-verify",
-            intent=_coder_task_intent_for_node(
-                node_id="N3-verify-structure",
-                description=(
-                    "Confirm the Header component still renders a single primary button "
-                    "inside a header wrapper with padding styles."
-                ),
-                acceptance_criteria=(
-                    "Header component renders one primary button inside a header element; "
-                    "styling changes must not introduce extra buttons or remove the wrapper."
-                ),
-                macro_intent=macro_intent,
-            ),
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header component renders one primary button inside a header element; "
-                "styling changes must not introduce extra buttons or remove the wrapper."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    nodes: Dict[str, DagNodeSpec] = {
-        node1.node_id: node1,
-        node2.node_id: node2,
-        node3.node_id: node3,
-    }
-    edges: List[Tuple[str, str]] = [
-        (node1.node_id, node2.node_id),
-        (node2.node_id, node3.node_id),
-    ]
-
-    display_label = (user_intent_label if user_intent_label is not None else macro_intent).strip()
-    spec = DagSpec(
-        dag_id=dag_identifier,
-        macro_intent=macro_intent,
-        nodes=nodes,
-        edges=edges,
-        user_intent_label=display_label,
-    )
-    persist_dag_spec(spec)
-    return spec
-
-
 def compile_macro_intent_to_dag(
     macro_intent: str,
     repo_path: str,
     *,
     dag_id: Optional[str] = None,
-    use_llm: bool = True,
-    llm_base_url: Optional[str] = None,
     user_intent_label: Optional[str] = None,
 ) -> DagSpec:
     """
-    Compile `macro_intent` into a `DagSpec`.
+    Compile `macro_intent` into a `DagSpec` via the LLM intent compiler.
 
-    When `use_llm=True` (default), the LLM intent compiler is used and a
-    `ValueError` is raised if it fails after all retries — callers must handle
-    this rather than silently falling back to the demo stub.
-
-    When `use_llm=False`, the deterministic demo compiler runs; this is only
-    appropriate for the demo repo layout (src/components/header.js). Callers
-    should not use `use_llm=False` in production.
+    Raises `ValueError` if the LLM intent compiler fails after all retries.
+    Callers must handle this; there is no deterministic fallback.
     """
-    # region agent log
-    write_debug_mode_ndjson(
-        location="intent_compiler.py:compile_macro_intent_to_dag",
-        message="compile_entry",
-        hypothesis_id="H3",
-        data={"use_llm": use_llm, "dag_id": dag_id, "repo_path_tail": str(repo_path)[-80:]},
-    )
-    # endregion
-    if use_llm:
-        return compile_macro_intent_with_llm(
-            macro_intent,
-            repo_path,
-            dag_id=dag_id,
-            base_url=llm_base_url,
-            user_intent_label=user_intent_label,
-        )
-    return compile_macro_intent_deterministic(
+    return compile_macro_intent_with_llm(
         macro_intent,
         repo_path,
         dag_id=dag_id,

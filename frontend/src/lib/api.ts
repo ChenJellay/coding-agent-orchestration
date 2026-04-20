@@ -359,7 +359,6 @@ export async function startDagFromDashboard(params: {
   macro_intent: string
   agent_ids?: string[]
   dag_id?: string
-  use_llm?: boolean
   pipeline_mode?: PipelineMode | null
   /** Raw documentation text (from upload); server writes under target repo `.agenti_helix/`. */
   doc_text?: string
@@ -372,7 +371,6 @@ export async function startDagFromDashboard(params: {
     macro_intent: params.macro_intent,
     agent_ids: params.agent_ids ?? ['coder_patch_v1', 'judge_v1'],
     ...(params.dag_id != null ? { dag_id: params.dag_id } : {}),
-    use_llm: params.use_llm ?? false,
     pipeline_mode: params.pipeline_mode ?? null,
     ...(params.doc_text != null && params.doc_text !== ''
       ? { doc_text: params.doc_text, ...(params.doc_filename ? { doc_filename: params.doc_filename } : {}) }
