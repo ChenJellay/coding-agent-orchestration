@@ -160,6 +160,23 @@ function DashboardPage() {
 
   const [executionMode, setExecutionMode] = useState<ExecutionMode | 'orchestrator'>('patch')
   const [extras, setExtras] = useState<ExecutionExtras>({ doc: false, diff_gate: false, lint_type: false })
+  // RunPlan presets: "quick" = patch, "tdd" = build + doc + diff_gate. Anything
+  // else (custom radios / extras combos) shows up as "custom".
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const activePreset: 'quick' | 'tdd' | 'custom' = useMemo(() => {
+    if (executionMode === 'patch' && !extras.doc && !extras.diff_gate && !extras.lint_type) return 'quick'
+    if (executionMode === 'build' && extras.doc && extras.diff_gate && !extras.lint_type) return 'tdd'
+    return 'custom'
+  }, [executionMode, extras])
+  function applyPreset(p: 'quick' | 'tdd') {
+    if (p === 'quick') {
+      setExecutionMode('patch')
+      setExtras({ doc: false, diff_gate: false, lint_type: false })
+    } else {
+      setExecutionMode('build')
+      setExtras({ doc: true, diff_gate: true, lint_type: false })
+    }
+  }
 
   const [repoPath, setRepoPath] = useState<string>(REPO_PRESETS[0]?.value ?? '../demo-repo')
   const [macroIntent, setMacroIntent] = useState<string>('')
@@ -466,98 +483,122 @@ function DashboardPage() {
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, alignItems: 'start' }}>
           <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--bg)', padding: 12 }}>
-            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Execution mode</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Execution plan</div>
+
+            {/* RunPlan presets: 2 primary buttons. Selecting one reconfigures
+                mode + all extras to a known-good combination. Custom combos
+                live behind the Advanced disclosure below. */}
+            <div style={{ display: 'flex', gap: 8 }}>
               {(
                 [
                   {
-                    id: 'patch' as const,
+                    id: 'quick' as const,
                     label: 'Quick patch',
-                    agents: 'coder_patch_v1 → judge_v1',
-                    desc: 'Fast single-file line-patch. Best for cosmetic changes, small bug fixes, config tweaks.',
+                    desc: 'Single-file line patch. Fastest. Best for bug fixes and config tweaks.',
                   },
                   {
-                    id: 'build' as const,
-                    label: 'Full TDD build',
-                    agents: 'librarian → sdet → coder_builder → governor → judge_evaluator',
-                    desc: 'Full test-driven pipeline with context discovery, test coverage, and security audit. Best for new features and multi-file changes.',
+                    id: 'tdd' as const,
+                    label: 'Full TDD',
+                    desc: 'Doc-first → librarian → sdet → coder_builder → diff gate → judge_evaluator.',
                   },
-                  {
-                    id: 'orchestrator' as const,
-                    label: 'Orchestrator decides',
-                    agents: 'intent_compiler_v1 assigns mode per node',
-                    desc: 'LLM orchestrator analyses each subtask and picks "patch" or "build" per node.',
-                  },
-                ] as { id: ExecutionMode | 'orchestrator'; label: string; agents: string; desc: string }[]
+                ] as { id: 'quick' | 'tdd'; label: string; desc: string }[]
               ).map((opt) => (
-                <label
+                <button
                   key={opt.id}
+                  type="button"
+                  onClick={() => applyPreset(opt.id)}
                   style={{
-                    display: 'flex',
-                    gap: 10,
-                    alignItems: 'flex-start',
-                    cursor: 'pointer',
-                    padding: '8px 10px',
+                    flex: 1,
+                    textAlign: 'left',
+                    padding: '10px 12px',
                     borderRadius: 10,
-                    border: `1px solid ${executionMode === opt.id ? 'var(--primary)' : 'var(--border)'}`,
-                    background: executionMode === opt.id ? 'var(--primary-bg)' : 'transparent',
+                    border: `1px solid ${activePreset === opt.id ? 'var(--primary)' : 'var(--border)'}`,
+                    background: activePreset === opt.id ? 'var(--primary-bg)' : 'var(--bg)',
+                    cursor: 'pointer',
                   }}
                 >
-                  <input
-                    type="radio"
-                    name="execution_mode"
-                    checked={executionMode === opt.id}
-                    onChange={() => setExecutionMode(opt.id)}
-                    style={{ marginTop: 2 }}
-                  />
-                  <div>
-                    <div style={{ fontWeight: 650, fontSize: 12 }}>{opt.label}</div>
-                    <div style={{ color: 'var(--primary)', fontSize: 11, fontFamily: 'var(--mono)', marginTop: 1 }}>
-                      {opt.agents}
-                    </div>
-                    <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 2 }}>{opt.desc}</div>
-                  </div>
-                </label>
+                  <div style={{ fontWeight: 650, fontSize: 12 }}>{opt.label}</div>
+                  <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 2 }}>{opt.desc}</div>
+                </button>
               ))}
             </div>
 
-            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
-              <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 6 }}>Optional extras</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {(
-                  [
-                    {
-                      id: 'doc' as const,
-                      label: 'Doc-first (doc_fetcher prefix)',
-                      desc: 'Distil PRD/API docs into the macro intent before planning. Pairs with build mode.',
-                    },
-                    {
-                      id: 'diff_gate' as const,
-                      label: 'Diff-validator gate',
-                      desc: 'Insert diff_validator between coder and judge to catch out-of-scope changes.',
-                    },
-                    {
-                      id: 'lint_type' as const,
-                      label: 'Lint + type-check signals',
-                      desc: 'Run linter + type_checker agents and fold findings into the judge prompt. Build mode only.',
-                    },
-                  ] as { id: keyof ExecutionExtras; label: string; desc: string }[]
-                ).map((opt) => (
-                  <label key={opt.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={Boolean(extras[opt.id])}
-                      onChange={(e) => setExtras({ ...extras, [opt.id]: e.target.checked })}
-                      style={{ marginTop: 3 }}
-                    />
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 12 }}>{opt.label}</div>
-                      <div style={{ color: 'var(--muted)', fontSize: 11 }}>{opt.desc}</div>
-                    </div>
-                  </label>
-                ))}
+            <button
+              type="button"
+              onClick={() => setAdvancedOpen((v) => !v)}
+              style={{
+                marginTop: 10,
+                background: 'transparent',
+                border: 'none',
+                color: 'var(--muted)',
+                fontSize: 12,
+                cursor: 'pointer',
+                padding: 0,
+              }}
+            >
+              {advancedOpen ? '▾' : '▸'} Advanced{activePreset === 'custom' ? ' · custom plan' : ''}
+            </button>
+
+            {advancedOpen ? (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+                <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 6 }}>Base mode</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(
+                    [
+                      { id: 'patch' as const, label: 'patch — single-file line patch coder' },
+                      { id: 'build' as const, label: 'build — full TDD coder (sdet + coder_builder)' },
+                      { id: 'orchestrator' as const, label: 'orchestrator decides per node' },
+                    ] as { id: ExecutionMode | 'orchestrator'; label: string }[]
+                  ).map((opt) => (
+                    <label key={opt.id} style={{ display: 'flex', gap: 8, alignItems: 'center', cursor: 'pointer', fontSize: 12 }}>
+                      <input
+                        type="radio"
+                        name="execution_mode"
+                        checked={executionMode === opt.id}
+                        onChange={() => setExecutionMode(opt.id)}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+
+                <div style={{ fontWeight: 650, fontSize: 12, margin: '12px 0 6px' }}>RunPlan toggles</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(
+                    [
+                      {
+                        id: 'doc' as const,
+                        label: 'gather_doc',
+                        desc: 'Prepend doc_fetcher prefix; distill PRD/API docs into the intent.',
+                      },
+                      {
+                        id: 'diff_gate' as const,
+                        label: 'diff_gate',
+                        desc: 'Insert diff_validator between coder and judge (out-of-scope guard).',
+                      },
+                      {
+                        id: 'lint_type' as const,
+                        label: 'lint_type_gate',
+                        desc: 'Run linter_v1 + type_checker_v1; fold findings into the judge. Build only.',
+                      },
+                    ] as { id: keyof ExecutionExtras; label: string; desc: string }[]
+                  ).map((opt) => (
+                    <label key={opt.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(extras[opt.id])}
+                        onChange={(e) => setExtras({ ...extras, [opt.id]: e.target.checked })}
+                        style={{ marginTop: 3 }}
+                      />
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: 12, fontFamily: 'var(--mono)' }}>{opt.label}</div>
+                        <div style={{ color: 'var(--muted)', fontSize: 11 }}>{opt.desc}</div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
               </div>
-            </div>
+            ) : null}
           </section>
         </div>
       </section>

@@ -300,7 +300,7 @@ class EditIntentRequestBody(BaseModel):
 
 
 class ExecutionExtras(BaseModel):
-    """Optional behaviour toggles layered on top of the base mode."""
+    """Optional behaviour toggles layered on top of the base mode (RunPlan flags)."""
 
     doc: bool = Field(
         default=False,
@@ -316,25 +316,51 @@ class ExecutionExtras(BaseModel):
     )
 
 
-# Maps (mode, extras) → the internal pipeline_mode string that chain resolvers understand.
+# Reverse map: a RunPlan tuple → the legacy pipeline_mode string EditTaskSpec uses.
+# Kept in lockstep with PIPELINE_MODES; any combination not in this table is rejected
+# upstream so the chain resolvers always see a valid mode.
+def _runplan_to_legacy_mode(*, gather_doc: bool, write_tests: bool, diff_gate: bool, lint_type_gate: bool) -> Optional[str]:
+    key = (gather_doc, write_tests, diff_gate, lint_type_gate)
+    return {
+        (False, False, False, False): "patch",
+        (False, False, True, False): "diff_guard_patch",
+        (False, True, False, False): "build",
+        (False, True, True, False): "secure_build_plus",
+        (True, True, True, False): "product_eng",
+        (False, True, False, True): "lint_type_gate",
+    }.get(key)
+
+
 def _resolve_internal_pipeline_mode(
     mode: Optional[str],
     extras: ExecutionExtras,
 ) -> Optional[str]:
+    """
+    Translate the dashboard ``(mode, extras)`` payload into a legacy
+    ``pipeline_mode`` string that ``EditTaskSpec`` carries through the loop.
+
+    Today the chain resolver still keys off ``pipeline_mode``; this is the
+    single conversion site so everything else can think in terms of RunPlan.
+    """
     if mode is None:
         return None
     base = mode.strip().lower()
-    if base == "patch":
-        return "diff_guard_patch" if extras.diff_gate else "patch"
-    if base == "build":
-        if extras.doc:
-            return "product_eng"
-        if extras.lint_type:
-            return "lint_type_gate"
-        if extras.diff_gate:
-            return "secure_build_plus"
-        return "build"
-    raise ValueError(f"Unknown mode={mode!r}; expected 'patch', 'build', or null.")
+    if base not in {"patch", "build"}:
+        raise ValueError(f"Unknown mode={mode!r}; expected 'patch', 'build', or null.")
+
+    write_tests = base == "build"
+    legacy = _runplan_to_legacy_mode(
+        gather_doc=bool(extras.doc),
+        write_tests=write_tests,
+        diff_gate=bool(extras.diff_gate),
+        lint_type_gate=bool(extras.lint_type),
+    )
+    if legacy is None:
+        raise ValueError(
+            f"Unsupported combination: mode={base!r}, extras={extras.model_dump()}. "
+            "Run the dashboard with one of the supported presets, or omit conflicting toggles."
+        )
+    return legacy
 
 
 class ExecuteDagFromDashboardRequestBody(BaseModel):
