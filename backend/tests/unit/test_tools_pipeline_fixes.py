@@ -62,20 +62,6 @@ def test_doc_fetcher_prompt_renders_json_examples_without_format_keyerror() -> N
     assert "body" in out
 
 
-def test_memory_summarizer_prompt_renders_without_format_keyerror() -> None:
-    template = load_prompt_template("memory_summarizer.md")
-    rendered = render_prompt(
-        template,
-        {
-            "errors": "judge failed",
-            "previous_patches": "{}",
-            "attempt": 1,
-        },
-    )
-    assert "compressed_summary" in rendered
-    assert "{errors}" not in rendered
-
-
 def test_diff_validator_prompt_renders_json_examples_without_format_keyerror() -> None:
     """JSON examples must use {{ }} so str.format does not treat \"verdict\" as a placeholder."""
     template = load_prompt_template("diff_validator.md")

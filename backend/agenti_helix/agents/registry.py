@@ -113,13 +113,6 @@ _AGENTS: Dict[str, AgentSpec] = {
         input_model=BaseModel,
         output_model=models.JudgeOutput,
     ),
-    "scribe_v1": AgentSpec(
-        agent_id="scribe_v1",
-        description="Scribe: produce conventional commit message and semantic trace log.",
-        prompt_filename="scribe_documenter.md",
-        input_model=BaseModel,
-        output_model=models.ScribeOutput,
-    ),
     "judge_v1": AgentSpec(
         agent_id="judge_v1",
         description='Strict judge that returns PASS/FAIL with justification and optional problematic lines.',
@@ -127,13 +120,6 @@ _AGENTS: Dict[str, AgentSpec] = {
         input_model=models.SnippetJudgeInput,
         output_model=models.SnippetJudgeOutput,
         backend_type="mlx_local",  # Local quantized model: fast, cheap, good for classification
-    ),
-    "memory_summarizer_v1": AgentSpec(
-        agent_id="memory_summarizer_v1",
-        description="Memory Summarizer: compress error history and past attempts into a concise scratchpad.",
-        prompt_filename="memory_summarizer.md",
-        input_model=BaseModel,
-        output_model=models.MemorySummaryOutput,
     ),
     "doc_fetcher_v1": AgentSpec(
         agent_id="doc_fetcher_v1",
@@ -162,22 +148,6 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="type_checker.md",
         input_model=BaseModel,
         output_model=models.TypeCheckerAgentOutput,
-    ),
-    "memory_writer_v1": AgentSpec(
-        agent_id="memory_writer_v1",
-        description="Memory writer: distils completed tasks into reusable episodic memory (optional post-step).",
-        prompt_filename="memory_writer.md",
-        input_model=BaseModel,
-        output_model=models.MemoryWriterOutput,
-    ),
-    "supreme_court_v1": AgentSpec(
-        agent_id="supreme_court_v1",
-        description="Supreme Court: local MLX arbitrator that resolves coder/judge deadlocks by producing a definitive patch.",
-        prompt_filename="supreme_court.md",
-        input_model=BaseModel,
-        output_model=models.SupremeCourtOutput,
-        # Same shared local model as all other agents (QWEN_MODEL_PATH / default MLX HF id).
-        backend_type="mlx_local",
     ),
 }
 

@@ -64,15 +64,6 @@ class JudgeOutput(BaseModel):
     )
 
 
-# ---------------------------------------------------------
-# 7. The Scribe
-# ---------------------------------------------------------
-class ScribeOutput(BaseModel):
-    summary_reasoning: str = Field(description="Analysis of the task execution to extract key architectural decisions")
-    commit_message: str = Field(description="Conventional commit message for this task")
-    semantic_trace_log: str = Field(description="A 2-3 sentence summary of how the agent solved the original intent")
-
-
 # =========================================================
 # Legacy schemas (used by currently-wired endpoints)
 # =========================================================
@@ -172,37 +163,6 @@ class SnippetJudgeOutput(BaseModel):
     problematic_lines: List[int] = Field(description="1-based line numbers in edited snippet that are problematic")
 
 
-# ---------------------------------------------------------
-# 8. The Memory Summarizer
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# 9. The Supreme Court Arbitrator
-# ---------------------------------------------------------
-class SupremeCourtOutput(BaseModel):
-    resolved: bool = Field(
-        description="True if the Supreme Court was able to produce a definitive patch. False if escalation to human is unavoidable."
-    )
-    reasoning: str = Field(description="Arbitration reasoning explaining the decision or why resolution failed")
-    # Populated only when resolved=True — same shape as CoderPatchOutput.
-    filePath: Optional[str] = Field(default=None, description="Target file path for the resolved patch")
-    startLine: Optional[int] = Field(default=None, description="1-based start line of the resolved patch")
-    endLine: Optional[int] = Field(default=None, description="1-based end line of the resolved patch")
-    replacementLines: Optional[List[str]] = Field(default=None, description="Replacement lines for the resolved patch")
-    compromise_summary: Optional[str] = Field(default=None, description="One-sentence description of the compromise made")
-
-
-class MemorySummaryOutput(BaseModel):
-    compressed_summary: str = Field(
-        description=(
-            "2-4 sentence summary of what was attempted, what failed, and the current state. "
-            "Should preserve enough context for the next coder attempt without raw error dumps."
-        )
-    )
-    key_constraints: List[str] = Field(
-        description="Bullet list of constraints or facts the next attempt MUST respect (max 5)."
-    )
-
-
 class DocFetcherOutput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -232,10 +192,4 @@ class TypeCheckerAgentOutput(BaseModel):
 
     summary: str = ""
     type_health: str = "clean"
-
-
-class MemoryWriterOutput(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    episode: Dict[str, Any] = Field(default_factory=dict)
 

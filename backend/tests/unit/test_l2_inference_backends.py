@@ -124,13 +124,6 @@ def test_agent_spec_backend_type_field():
     assert judge.backend_type == "mlx_local"
 
 
-def test_memory_summarizer_registered():
-    from agenti_helix.agents.registry import get_agent
-    spec = get_agent("memory_summarizer_v1")
-    assert spec.agent_id == "memory_summarizer_v1"
-    assert spec.output_model.__name__ == "MemorySummaryOutput"
-
-
 def test_agent_spec_render_generic_roster_agent():
     """Generic roster agents (no specialised render) should render without raising."""
     from agenti_helix.agents.registry import get_agent

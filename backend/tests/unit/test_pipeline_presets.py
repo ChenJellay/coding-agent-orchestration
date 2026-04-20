@@ -102,5 +102,5 @@ def test_chain_skip_if_nonempty_key() -> None:
 
 
 def test_new_roster_agents_registered() -> None:
-    for aid in ("doc_fetcher_v1", "diff_validator_v1", "linter_v1", "type_checker_v1", "memory_writer_v1"):
+    for aid in ("doc_fetcher_v1", "diff_validator_v1", "linter_v1", "type_checker_v1"):
         get_agent(aid)

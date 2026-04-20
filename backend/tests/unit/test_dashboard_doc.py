@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from agenti_helix.api.dashboard_doc import resolve_dashboard_doc_url
-from agenti_helix.api.task_commands_routes import _DASHBOARD_LLM_INTENT_MODES
 from agenti_helix.runtime.tools import tool_fetch_doc_content
 
 
@@ -51,11 +50,6 @@ def test_tool_fetch_doc_content_reads_local_file_uri(tmp_path: Path) -> None:
     assert out["fetch_error"] == ""
     assert "Hello" in out["doc_content"]
     assert out["doc_title"] == "notes.md"
-
-
-def test_dashboard_forces_llm_intent_for_product_eng() -> None:
-    assert "product_eng" in _DASHBOARD_LLM_INTENT_MODES
-    assert "patch" not in _DASHBOARD_LLM_INTENT_MODES
 
 
 def test_tool_fetch_doc_content_rejects_file_outside_repo(tmp_path: Path) -> None:
