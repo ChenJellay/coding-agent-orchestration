@@ -13,6 +13,35 @@ CURSOR_DEBUG_NDJSON_PATH = Path(
 )
 CURSOR_DEBUG_SESSION_ID = "1f6f94"
 
+# Debug mode session (IDE) — NDJSON path from active debug instructions.
+DEBUG_MODE_LOG_PATH = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-f6751c.log")
+DEBUG_MODE_SESSION_ID = "f6751c"
+
+
+def write_debug_mode_ndjson(
+    *,
+    location: str,
+    message: str,
+    hypothesis_id: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Append one NDJSON line for debug-mode investigation (best-effort, never raises)."""
+    try:
+        payload: Dict[str, Any] = {
+            "sessionId": DEBUG_MODE_SESSION_ID,
+            "id": f"dm_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "hypothesisId": hypothesis_id,
+        }
+        DEBUG_MODE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_MODE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
 
 def write_cursor_debug_ndjson(
     *,

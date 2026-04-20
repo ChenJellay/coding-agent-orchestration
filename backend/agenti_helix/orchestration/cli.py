@@ -44,6 +44,7 @@ def main() -> None:
         dag_id="dag-cli-run",
         use_llm=not args.no_llm,
         llm_base_url=args.llm_base_url,
+        user_intent_label=args.macro_intent.strip(),
     )
 
     result = execute_dag(dag_spec)

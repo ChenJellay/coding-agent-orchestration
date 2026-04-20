@@ -6,11 +6,60 @@ import json
 from pathlib import Path
 
 from agenti_helix.agents.render import load_prompt_template, render_prompt
+from agenti_helix.orchestration.intent_compiler import (
+    _coder_task_intent_for_node,
+    enrich_macro_intent_with_doc_before_compile,
+)
 from agenti_helix.runtime.tools import (
     _discover_jest_config,
     _js_tests_likely_need_jsdom,
     tool_write_all_files,
 )
+
+
+def test_enrich_macro_intent_no_doc_returns_unchanged(tmp_path: Path) -> None:
+    """Without a doc URL or uploaded text, enrichment is a no-op."""
+    out, effective, merged = enrich_macro_intent_with_doc_before_compile(
+        "plan the feature",
+        repo_path=str(tmp_path),
+        dag_id="dag-x",
+        doc_url=None,
+        doc_text=None,
+        doc_filename=None,
+    )
+    assert out == "plan the feature"
+    assert effective == ""
+    assert merged is False
+
+
+def test_coder_task_intent_prioritizes_node_goal_over_macro() -> None:
+    s = _coder_task_intent_for_node(
+        node_id="N2",
+        description="Change the label on the save button.",
+        acceptance_criteria="Button reads Save.",
+        macro_intent="Rebuild the entire dashboard and add analytics.",
+    )
+    assert "N2" in s
+    assert "save button" in s.lower()
+    assert "Rebuild the entire dashboard" in s
+    assert s.index("### Goal") < s.index("Product context")
+
+
+def test_doc_fetcher_prompt_renders_json_examples_without_format_keyerror() -> None:
+    """JSON examples in doc_fetcher.md must use {{ }} so str.format does not eat \"doc_url\" keys."""
+    template = load_prompt_template("doc_fetcher.md")
+    out = render_prompt(
+        template,
+        {
+            "doc_url": "file:///repo/.agenti_helix/x.md",
+            "doc_content": "body",
+            "intent": "i",
+            "target_file": "t.js",
+            "acceptance_criteria": "a",
+        },
+    )
+    assert "file:///repo/.agenti_helix/x.md" in out
+    assert "body" in out
 
 
 def test_memory_summarizer_prompt_renders_without_format_keyerror() -> None:
@@ -25,6 +74,54 @@ def test_memory_summarizer_prompt_renders_without_format_keyerror() -> None:
     )
     assert "compressed_summary" in rendered
     assert "{errors}" not in rendered
+
+
+def test_diff_validator_prompt_renders_json_examples_without_format_keyerror() -> None:
+    """JSON examples must use {{ }} so str.format does not treat \"verdict\" as a placeholder."""
+    template = load_prompt_template("diff_validator.md")
+    out = render_prompt(
+        template,
+        {
+            "intent": "i",
+            "target_file": "t.js",
+            "acceptance_criteria": "a",
+            "git_diff": "diff --git",
+            "allowed_paths": '["t.js"]',
+            "repo_rules_text": "{}",
+        },
+    )
+    assert '"verdict": "WARN"' in out
+
+
+def test_type_checker_prompt_renders_json_examples_without_format_keyerror() -> None:
+    template = load_prompt_template("type_checker.md")
+    out = render_prompt(
+        template,
+        {
+            "target_file": "t.ts",
+            "language": "typescript",
+            "file_content": "x",
+            "type_checker_output": "error TS2345",
+            "intent": "i",
+            "acceptance_criteria": "a",
+        },
+    )
+    assert '"type_health"' in out
+
+
+def test_linter_prompt_renders_json_examples_without_format_keyerror() -> None:
+    template = load_prompt_template("linter.md")
+    out = render_prompt(
+        template,
+        {
+            "target_file": "t.ts",
+            "language": "typescript",
+            "file_content": "x",
+            "linter_raw_output": "err",
+            "acceptance_criteria": "a",
+        },
+    )
+    assert '"finding_count"' in out
 
 
 def test_write_all_files_includes_snapshots_in_diff_json_str(tmp_path: Path) -> None:

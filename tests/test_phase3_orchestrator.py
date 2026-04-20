@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,13 +28,14 @@ def test_compile_macro_intent_creates_linear_dag(tmp_path: Path, monkeypatch) ->
     (src / "header.js").write_text("console.log('header');\n")
 
     macro_intent = "Update header button color, refactor styles, and update tests."
+    dag_id = f"dag-test-{uuid.uuid4().hex[:12]}"
     spec = intent_compiler.compile_macro_intent_deterministic(
         macro_intent,
         repo_path=str(repo),
-        dag_id="dag-test",
+        dag_id=dag_id,
     )
 
-    assert spec.dag_id == "dag-test"
+    assert spec.dag_id == dag_id
     assert 3 <= len(spec.nodes) <= 5
     # Expect a simple linear chain N1 -> N2 -> N3 for the demo.
     assert ("N1-change-color", "N2-refine-styles") in spec.edges
@@ -50,12 +52,12 @@ def test_execute_dag_runs_nodes_in_order_when_all_pass(tmp_path: Path, monkeypat
     spec = intent_compiler.compile_macro_intent_deterministic(
         macro_intent,
         repo_path=str(repo),
-        dag_id="dag-all-pass",
+        dag_id=f"dag-all-pass-{uuid.uuid4().hex[:12]}",
     )
 
     called_tasks: list[EditTaskSpec] = []
 
-    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec, *args: Any, **kwargs: Any) -> Any:
         called_tasks.append(task)
         return DummyVerificationState(VerificationStatus.PASSED)
 
@@ -85,10 +87,10 @@ def test_execute_dag_blocks_downstream_on_failure(tmp_path: Path, monkeypatch) -
     spec = intent_compiler.compile_macro_intent_deterministic(
         macro_intent,
         repo_path=str(repo),
-        dag_id="dag-with-failure",
+        dag_id=f"dag-with-failure-{uuid.uuid4().hex[:12]}",
     )
 
-    def fake_run_verification_loop(task: EditTaskSpec) -> Any:  # type: ignore[override]
+    def fake_run_verification_loop(task: EditTaskSpec, *args: Any, **kwargs: Any) -> Any:
         if task.task_id == "header-style-refine":
             return DummyVerificationState(VerificationStatus.BLOCKED)
         return DummyVerificationState(VerificationStatus.PASSED)

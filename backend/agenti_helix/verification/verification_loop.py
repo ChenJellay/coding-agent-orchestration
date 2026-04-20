@@ -33,6 +33,20 @@ from .checkpointing import (
 )
 from .config import DEFAULT_CONFIG
 
+# Bound supreme_court prompt size and generation length — MLX defaults to very large max_tokens
+# (see inference_backends._mlx_max_tokens_default), which can make arbitration appear to hang.
+_SC_CLIP_INTENT = 14_000
+_SC_CLIP_REJECTION = 8_000
+_SC_CLIP_ERR = 16_000
+_SC_CLIP_PATCH = 48_000
+
+
+def _clip_supreme_court_text(text: str, max_chars: int) -> str:
+    t = text or ""
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 48] + "\n\n… [truncated for supreme_court prompt size]"
+
 
 @dataclass
 class VerificationState:
@@ -857,17 +871,21 @@ def node_supreme_court(state: VerificationState) -> VerificationState:
         (state.judge_response or {}).get("justification", "No rejection reasons recorded")
     )
 
+    best_patch_str = json.dumps(state.diff_json or {}, ensure_ascii=False)
     try:
         result = run_agent(
             agent_id="supreme_court_v1",
             raw_input={
                 "original_intent": state.task.task_id,
-                "intent": state.task.intent,
-                "best_patch": json.dumps(state.diff_json or {}),
-                "rejection_reasons": rejection_summary,
-                "error_history": "\n".join(state.error_history),
+                "intent": _clip_supreme_court_text(state.task.intent, _SC_CLIP_INTENT),
+                "best_patch": _clip_supreme_court_text(best_patch_str, _SC_CLIP_PATCH),
+                "rejection_reasons": _clip_supreme_court_text(rejection_summary, _SC_CLIP_REJECTION),
+                "error_history": _clip_supreme_court_text(
+                    "\n".join(state.error_history),
+                    _SC_CLIP_ERR,
+                ),
             },
-            runtime={"temperature": 0.1},
+            runtime={"temperature": 0.1, "max_tokens": 6144},
             cancel_token=state.cancel_token,
             observe={
                 "run_id": state.task.task_id,

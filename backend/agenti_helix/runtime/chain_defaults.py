@@ -284,6 +284,54 @@ def default_full_pipeline_judge_chain(task: Any | None = None) -> Dict[str, Any]
     }
 
 
+def precompile_doc_enrichment_chain() -> Dict[str, Any]:
+    """
+    Fetch + distill documentation and merge into `macro_intent` before the intent_compiler chain runs.
+
+    Uses the same doc prefix as `pipeline_product_eng_coder_chain` (without downstream coder steps) so
+    DAG decomposition sees API/PRD constraints when breaking work into nodes.
+    """
+    return {
+        "steps": [
+            {
+                "type": "tool",
+                "id": "fetch_doc_precompile",
+                "output_key": "doc_fetch",
+                "tool_name": "fetch_doc_content",
+                "input_bindings": {
+                    "repo_root": {"$ref": "repo_root"},
+                    "task_id": {"$ref": "task_id"},
+                    "doc_url": {"$ref": "doc_url"},
+                },
+            },
+            {
+                "type": "agent",
+                "id": "doc_fetcher_precompile",
+                "output_key": "doc_fetcher_out",
+                "agent_id": "doc_fetcher_v1",
+                "input_bindings": {
+                    "doc_url": {"$ref": "doc_fetch.doc_url"},
+                    "doc_content": {"$ref": "doc_fetch.doc_content"},
+                    "intent": {"$ref": "macro_intent"},
+                    "target_file": {"$ref": "target_file"},
+                    "acceptance_criteria": {"$ref": "acceptance_criteria"},
+                },
+                "runtime": {"temperature": 0.0, "max_tokens": 3072},
+            },
+            {
+                "type": "tool",
+                "id": "merge_doc_intent_precompile",
+                "output_key": "macro_intent",
+                "tool_name": "merge_doc_into_intent",
+                "input_bindings": {
+                    "intent": {"$ref": "macro_intent"},
+                    "doc_fetcher_output": {"$ref": "doc_fetcher_out"},
+                },
+            },
+        ]
+    }
+
+
 def pipeline_product_eng_coder_chain(task: Any | None = None) -> Dict[str, Any]:
     """
     Doc-first full TDD coder chain:

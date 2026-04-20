@@ -32,6 +32,18 @@ def test_resolve_chains_non_empty(mode: str) -> None:
     assert isinstance(j.get("steps"), list) and len(j["steps"]) >= 1
 
 
+def test_product_eng_skip_doc_chain_prefix_omits_doc_fetcher() -> None:
+    task = _minimal_task("product_eng")
+    task.skip_doc_chain_prefix = True
+    preset = resolve_preset_chains(task)
+    assert preset is not None
+    coder, _judge = preset
+    step_ids = [s.get("id") for s in coder.get("steps") or []]
+    assert "fetch_doc" not in step_ids
+    assert "doc_fetcher" not in step_ids
+    assert "merge_doc_intent" not in step_ids
+
+
 def test_named_presets_match_registry_agents() -> None:
     """Every agent_id referenced in preset chains must be registered."""
     agent_ids = {a["id"] for a in list_agents()}

@@ -45,7 +45,11 @@ def resolve_preset_chains(task: EditTaskSpec) -> Optional[Tuple[Dict[str, Any], 
     if not builders:
         return None
     c_fn, j_fn = builders
-    return (c_fn(task), j_fn(task))
+    coder_chain = c_fn(task)
+    # Doc was merged into macro intent pre-compile; skip redundant per-node doc_fetcher prefix.
+    if mode == "product_eng" and getattr(task, "skip_doc_chain_prefix", False):
+        coder_chain = default_full_pipeline_coder_chain(task)
+    return (coder_chain, j_fn(task))
 
 
 def preset_fallback_build_chains(task: EditTaskSpec) -> Tuple[Dict[str, Any], Dict[str, Any]]:

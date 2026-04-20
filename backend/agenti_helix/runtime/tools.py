@@ -9,7 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, url2pathname, urlopen
 
 from agenti_helix.api.task_context_store import load_task_context
 from agenti_helix.core.ast_parser import parse_file
@@ -472,6 +473,30 @@ def tool_fetch_doc_content(
             "doc_title": "",
             "fetch_error": "No doc_url (set via task context API or .agenti_helix/doc_url).",
         }
+    root = Path(repo_root).resolve()
+    if url.startswith("file:"):
+        try:
+            parsed = urlparse(url)
+            raw_path = url2pathname(unquote(parsed.path))
+            local = Path(raw_path).resolve()
+            try:
+                local.relative_to(root)
+            except ValueError:
+                return {
+                    "doc_url": url,
+                    "doc_content": "",
+                    "doc_title": "",
+                    "fetch_error": "file:// doc path must be inside repo_root.",
+                }
+            text = local.read_text(encoding="utf-8", errors="replace")[:120_000]
+            return {"doc_url": url, "doc_content": text, "doc_title": local.name, "fetch_error": ""}
+        except (OSError, ValueError) as exc:
+            return {
+                "doc_url": url,
+                "doc_content": "",
+                "doc_title": "",
+                "fetch_error": f"Local doc read failed: {exc}",
+            }
     try:
         req = Request(url, headers={"User-Agent": "agenti-helix-doc-fetch/1.0"})
         with urlopen(req, timeout=20) as resp:  # noqa: S310 — bounded URL fetch for doc presets

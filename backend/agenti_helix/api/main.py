@@ -249,12 +249,13 @@ def _derive_features(limit: int = 200) -> List[Dict[str, Any]]:
         counts = _node_status_counts(state)
         column = _feature_column_from_state(dag_id, spec, state, events)
         macro_intent = (spec or {}).get("macro_intent")
+        user_label = (spec or {}).get("user_intent_label") or ""
 
         features.append(
             {
                 "feature_id": dag_id,
                 "dag_id": dag_id,
-                "title": macro_intent or dag_id,
+                "title": (user_label or macro_intent or dag_id),
                 "column": column,
                 "node_status_counts": counts,
                 "confidence": _confidence_score(counts),

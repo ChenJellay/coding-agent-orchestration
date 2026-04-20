@@ -34,24 +34,24 @@ First, reason step-by-step inside `<think>...</think>` tags — walk through eac
 Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
-{
+{{
   "verdict": "WARN",
   "files_changed": ["src/components/header.js"],
   "out_of_scope_files": [],
   "findings": [
-    {
+    {{
       "type": "deletion",
       "severity": "warn",
       "file": "src/components/header.js",
       "line_range": [14, 16],
       "description": "Three comment lines removed that described the component's accessibility contract.",
       "recommendation": "Restore the comments unless they were explicitly asked to be removed."
-    }
+    }}
   ],
   "rule_violations": [],
   "structural_regressions": [],
   "summary": "Change is scoped correctly but removed accessibility comments may be unintentional."
-}
+}}
 ```
 
 ## Rules

@@ -41,6 +41,8 @@ class EditTaskSpec:
     pipeline_mode: str = "patch"
     # Optional URL for doc_fetcher-first pipelines; may also be supplied via task context API.
     doc_url: str = ""
+    # When true, product_eng skips fetch_doc + doc_fetcher + merge (already merged at intent-compile time).
+    skip_doc_chain_prefix: bool = False
 
 
 @dataclass

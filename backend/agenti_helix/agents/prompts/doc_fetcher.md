@@ -33,7 +33,7 @@ First, reason step-by-step inside `<think>...</think>` tags — identify which p
 Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
-{
+{{
   "doc_url": "<echoed>",
   "doc_title": "React useEffect documentation",
   "key_constraints": [
@@ -42,26 +42,26 @@ Then, after `</think>`, respond with **only** a JSON object — no prose, no mar
     "Effects run after every render by default — pass an empty array to run only on mount."
   ],
   "code_examples": [
-    {
+    {{
       "label": "Effect with cleanup",
-      "snippet": "useEffect(() => {\n  const sub = api.subscribe(cb);\n  return () => sub.unsubscribe();\n}, []);"
-    }
+      "snippet": "useEffect(() => {{\n  const sub = api.subscribe(cb);\n  return () => sub.unsubscribe();\n}}, []);"
+    }}
   ],
   "task_relevance_summary": "The task requires adding a polling interval inside a React component. The doc confirms that the interval must be cleared in the cleanup return to avoid memory leaks on unmount — the acceptance criteria around 'no stale callbacks' maps directly to this requirement.",
   "irrelevant": false
-}
+}}
 ```
 
 **If the document is entirely irrelevant to the task:**
 ```json
-{
+{{
   "doc_url": "<echoed>",
   "doc_title": "...",
   "key_constraints": [],
   "code_examples": [],
   "task_relevance_summary": "This document does not contain information relevant to the current task.",
   "irrelevant": true
-}
+}}
 ```
 
 ## Rules

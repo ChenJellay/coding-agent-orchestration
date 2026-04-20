@@ -21,6 +21,8 @@ export type FeatureDetails = {
   dag: {
     dag_id: string
     macro_intent: string
+    /** Short dashboard command for titles; falls back to macro_intent when absent. */
+    user_intent_label?: string
     nodes: Record<
       string,
       {
@@ -359,6 +361,11 @@ export async function startDagFromDashboard(params: {
   dag_id?: string
   use_llm?: boolean
   pipeline_mode?: PipelineMode | null
+  /** Raw documentation text (from upload); server writes under target repo `.agenti_helix/`. */
+  doc_text?: string
+  doc_filename?: string
+  /** Remote doc URL for doc_fetcher when not uploading text. */
+  doc_url?: string
 }): Promise<{ ok: true; dag_id: string }> {
   const body = {
     repo_path: params.repo_path,
@@ -367,6 +374,11 @@ export async function startDagFromDashboard(params: {
     ...(params.dag_id != null ? { dag_id: params.dag_id } : {}),
     use_llm: params.use_llm ?? false,
     pipeline_mode: params.pipeline_mode ?? null,
+    ...(params.doc_text != null && params.doc_text !== ''
+      ? { doc_text: params.doc_text, ...(params.doc_filename ? { doc_filename: params.doc_filename } : {}) }
+      : params.doc_url != null && params.doc_url.trim() !== ''
+        ? { doc_url: params.doc_url.trim() }
+        : {}),
   }
   return await postJson<{ ok: true; dag_id: string }>('/api/dags/run', body)
 }

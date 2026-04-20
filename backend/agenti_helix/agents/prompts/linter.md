@@ -35,13 +35,13 @@ First, reason step-by-step inside `<think>...</think>` tags — parse the linter
 Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
 
 ```json
-{
+{{
   "target_file": "<echoed>",
   "language": "<echoed>",
   "finding_count": 3,
   "has_errors": true,
   "findings": [
-    {
+    {{
       "line_number": 12,
       "column": 5,
       "rule_id": "TS2345",
@@ -49,10 +49,10 @@ Then, after `</think>`, respond with **only** a JSON object — no prose, no mar
       "message": "Argument of type 'string' is not assignable to parameter of type 'number'.",
       "fix_hint": "Cast the argument with Number() or change the parameter type to string.",
       "blocks_acceptance": true
-    }
+    }}
   ],
   "summary": "2 errors and 1 warning. The type error on line 12 will likely cause the judge to fail this task."
-}
+}}
 ```
 
 ## Rules

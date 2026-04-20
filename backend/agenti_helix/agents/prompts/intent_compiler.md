@@ -12,7 +12,11 @@ Use for: new features, multi-file changes, logic-heavy tasks, anything requiring
 
 ## Rules
 
-Tasks must be granular and actionable (e.g., "Create API route", not "Build backend").
+**Decomposition (critical):** Prefer **several small nodes** over one large node. For a non-trivial feature, aim for **3–7 nodes** unless the repo map clearly supports a smaller plan. Each node must be **one verifiable slice**: one coherent change in **one primary file** (helpers only if unavoidable), with a **single clear outcome** (e.g. "header shows new copy", "tests cover X"). Do **not** pack an entire feature, refactor, and tests into a single node — that causes downstream coders to over-implement or miss the goal.
+
+**Ordering:** Put **foundational** work first (shared types, data shape, route shell) and **dependent** work later (UI that consumes the data). If the macro intent or repository map suggests a natural sequence (read path → write path → tests), encode that in `edges`.
+
+**Node descriptions:** Write **imperative, concrete** descriptions the coder can execute in one sitting (1–2 sentences). Mention the **primary file** by path when possible. Avoid vague titles like "Improve UX" or "Polish app".
 
 **Consistency:** `acceptance_criteria` must not contradict the macro intent. If the user asks to create a new file, add tests, or introduce new behaviour, your acceptance criteria must allow the files and changes required to satisfy that intent (do not forbid new files while also asking for a new file or for test coverage the repo does not yet have).
 

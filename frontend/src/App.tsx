@@ -160,6 +160,10 @@ function DashboardPage() {
 
   const [repoPath, setRepoPath] = useState<string>(REPO_PRESETS[0]?.value ?? '../demo-repo')
   const [macroIntent, setMacroIntent] = useState<string>('')
+  const [docUploadName, setDocUploadName] = useState<string | null>(null)
+  const [docUploadText, setDocUploadText] = useState<string | null>(null)
+  const [docUrlField, setDocUrlField] = useState<string>('')
+  const docFileInputRef = useRef<HTMLInputElement | null>(null)
   const [runError, setRunError] = useState<string | null>(null)
   const [runBusy, setRunBusy] = useState(false)
   const [queuedDagId, setQueuedDagId] = useState<string | null>(null)
@@ -228,6 +232,12 @@ function DashboardPage() {
     setRunError(null)
     setQueuedDagId(null)
 
+    const _DOC_MAX = 400_000
+    if (docUploadText != null && docUploadText.length > _DOC_MAX) {
+      setRunError(`Documentation file is too large (max ${_DOC_MAX} characters).`)
+      return
+    }
+
     if (!trimmedRepo) {
       setRunError('repo_path is required.')
       return
@@ -238,20 +248,77 @@ function DashboardPage() {
     }
     setRunBusy(true)
     try {
+      // #region agent log
+      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
+        body: JSON.stringify({
+          sessionId: 'f6751c',
+          location: 'App.tsx:handleRunCommand',
+          message: 'submit_start',
+          hypothesisId: 'H1',
+          data: {
+            pipelineMode,
+            intentLen: trimmedIntent.length,
+            hasDocUpload: Boolean(docUploadText && docUploadText.length > 0),
+            docUrlLen: docUrlField.trim().length,
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {})
+      // #endregion
       const useLlm = import.meta.env.VITE_INTENT_USE_LLM === 'true'
-      // "orchestrator" lets the LLM assign pipeline_mode per node; requires use_llm=true.
+      // Orchestrator: LLM assigns pipeline_mode per node. Full pipelines (product_eng, build, …) require LLM intent compile on the server; we set use_llm so the payload matches.
+      const fullPipelineNeedsLlmIntent: boolean =
+        pipelineMode === 'product_eng' ||
+        pipelineMode === 'build' ||
+        pipelineMode === 'secure_build_plus' ||
+        pipelineMode === 'lint_type_gate'
       const resolvedPipeline: PipelineMode | null =
         pipelineMode === 'orchestrator' ? null : pipelineMode
       const res = await startDagFromDashboard({
         repo_path: trimmedRepo,
         macro_intent: trimmedIntent,
-        use_llm: useLlm || pipelineMode === 'orchestrator',
+        use_llm: useLlm || pipelineMode === 'orchestrator' || fullPipelineNeedsLlmIntent,
         pipeline_mode: resolvedPipeline,
+        ...(docUploadText != null && docUploadText !== ''
+          ? { doc_text: docUploadText, doc_filename: docUploadName ?? undefined }
+          : docUrlField.trim() !== ''
+            ? { doc_url: docUrlField.trim() }
+            : {}),
       })
+      // #region agent log
+      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
+        body: JSON.stringify({
+          sessionId: 'f6751c',
+          location: 'App.tsx:handleRunCommand',
+          message: 'submit_ok',
+          hypothesisId: 'H1',
+          data: { dagId: res.dag_id, pipelineMode },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {})
+      // #endregion
       setQueuedDagId(res.dag_id)
       // Immediately refresh UI; execution may take a while.
       await loadAll()
     } catch (e) {
+      // #region agent log
+      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
+        body: JSON.stringify({
+          sessionId: 'f6751c',
+          location: 'App.tsx:handleRunCommand',
+          message: 'submit_error',
+          hypothesisId: 'H1',
+          data: { err: e instanceof Error ? e.message : String(e), pipelineMode },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {})
+      // #endregion
       setRunError(e instanceof Error ? e.message : String(e))
     } finally {
       setRunBusy(false)
@@ -310,30 +377,124 @@ function DashboardPage() {
 
         <div>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Command / macro intent</div>
-          <textarea
-            value={macroIntent}
-            onChange={(e) => setMacroIntent(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return
-              e.preventDefault()
-              if (!runBusy) void handleRunCommand()
-            }}
-            placeholder='e.g. "Update header button background to green and keep accessibility."'
+          <div
             style={{
-              width: '100%',
-              minHeight: 120,
-              resize: 'vertical',
-              borderRadius: 12,
-              border: '1px solid var(--border)',
-              background: 'var(--bg)',
-              padding: 10,
-              color: 'var(--text)',
-              font: 'inherit',
-              fontFamily: 'var(--mono)',
-              fontSize: 12,
-              whiteSpace: 'pre-wrap',
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gap: 12,
+              alignItems: 'stretch',
             }}
-          />
+          >
+            <textarea
+              value={macroIntent}
+              onChange={(e) => setMacroIntent(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return
+                e.preventDefault()
+                if (!runBusy) void handleRunCommand()
+              }}
+              placeholder='e.g. "Update header button background to green and keep accessibility."'
+              style={{
+                width: '100%',
+                minHeight: 120,
+                resize: 'vertical',
+                borderRadius: 12,
+                border: '1px solid var(--border)',
+                background: 'var(--bg)',
+                padding: 10,
+                color: 'var(--text)',
+                font: 'inherit',
+                fontFamily: 'var(--mono)',
+                fontSize: 12,
+                whiteSpace: 'pre-wrap',
+              }}
+            />
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+                borderRadius: 12,
+                border: '1px solid var(--border)',
+                background: 'var(--bg)',
+                padding: 10,
+                minHeight: 120,
+              }}
+            >
+              <div style={{ fontWeight: 650, fontSize: 12 }}>Documentation (optional)</div>
+              <div style={{ color: 'var(--muted)', fontSize: 11, lineHeight: 1.35 }}>
+                For Product engineering (doc-first), attach a PRD or spec (.md / .txt), or paste a URL.
+              </div>
+              <input
+                ref={docFileInputRef}
+                type="file"
+                accept=".md,.txt,.markdown,text/markdown,text/plain"
+                style={{ fontSize: 11, maxWidth: '100%' }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0]
+                  if (!f) {
+                    setDocUploadName(null)
+                    setDocUploadText(null)
+                    return
+                  }
+                  const reader = new FileReader()
+                  reader.onload = () => {
+                    const t = typeof reader.result === 'string' ? reader.result : ''
+                    setDocUploadName(f.name)
+                    setDocUploadText(t)
+                    setDocUrlField('')
+                  }
+                  reader.onerror = () => {
+                    setDocUploadName(null)
+                    setDocUploadText(null)
+                  }
+                  reader.readAsText(f)
+                }}
+              />
+              {docUploadName ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', fontSize: 11 }}>
+                  <span className="pill" style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {docUploadName}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDocUploadName(null)
+                      setDocUploadText(null)
+                      if (docFileInputRef.current) docFileInputRef.current.value = ''
+                    }}
+                    style={{
+                      borderRadius: 8,
+                      border: '1px solid var(--border)',
+                      background: 'var(--panel)',
+                      fontSize: 11,
+                      padding: '4px 8px',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ) : null}
+              <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 2 }}>Doc URL (if no file)</div>
+              <input
+                value={docUrlField}
+                onChange={(e) => setDocUrlField(e.target.value)}
+                disabled={Boolean(docUploadText)}
+                placeholder="https://…"
+                style={{
+                  width: '100%',
+                  borderRadius: 8,
+                  border: '1px solid var(--border)',
+                  background: docUploadText ? 'var(--bg-muted)' : 'var(--panel)',
+                  padding: '6px 8px',
+                  color: 'var(--text)',
+                  font: 'inherit',
+                  fontSize: 11,
+                }}
+              />
+            </div>
+          </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 10 }}>
             <button
               type="button"
@@ -1355,7 +1516,11 @@ function FeatureDagPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <PageTitle
-          title={data?.dag.macro_intent ? data.dag.macro_intent : `Feature: ${featureId ?? ''}`}
+          title={
+            (data?.dag.user_intent_label || data?.dag.macro_intent)
+              ? String(data.dag.user_intent_label || data.dag.macro_intent)
+              : `Feature: ${featureId ?? ''}`
+          }
           subtitle={
             data ? `Confidence ${Math.round(data.metrics.confidence * 100)}% · ETA ${formatEta(data.metrics.eta_seconds)}` : 'Loading…'
           }
