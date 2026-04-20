@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from agenti_helix.api.paths import HelixPaths
+from agenti_helix.verification import checkpointing as cp_mod
 from agenti_helix.verification.checkpointing import (
     Checkpoint,
     EditTaskSpec,
@@ -23,6 +25,15 @@ from agenti_helix.verification.checkpointing import (
     save_checkpoint,
     load_checkpoint,
 )
+
+
+def _isolate_helix_paths(monkeypatch, tmp_path: Path) -> None:
+    """Redirect checkpoint storage to ``tmp_path``.
+
+    AGENTI_HELIX_REPO_ROOT is read at module-import time, so updating the env
+    var inside a test has no effect; we have to patch the live ``PATHS`` object.
+    """
+    monkeypatch.setattr(cp_mod, "PATHS", HelixPaths(repo_root=tmp_path))
 
 
 def _make_task(repo_path: str, target_file: str = "target.py") -> EditTaskSpec:
@@ -66,6 +77,7 @@ def _make_checkpoint(task: EditTaskSpec, pre_content: str, cp_dir: Path) -> Chec
 
 def test_rollback_restores_file_content(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTI_HELIX_REPO_ROOT", str(tmp_path))
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     target = tmp_path / "target.py"
     target.write_text("# modified content")
@@ -79,6 +91,7 @@ def test_rollback_restores_file_content(tmp_path, monkeypatch):
 
 def test_rollback_resets_checkpoint_status_to_running(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTI_HELIX_REPO_ROOT", str(tmp_path))
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     target = tmp_path / "target.py"
     target.write_text("modified")
@@ -95,6 +108,7 @@ def test_rollback_resets_checkpoint_status_to_running(tmp_path, monkeypatch):
 
 def test_rollback_clears_post_state_and_diff(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTI_HELIX_REPO_ROOT", str(tmp_path))
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     target = tmp_path / "target.py"
     target.write_text("modified")
@@ -113,6 +127,7 @@ def test_rollback_clears_post_state_and_diff(tmp_path, monkeypatch):
 
 def test_rollback_persists_to_disk(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTI_HELIX_REPO_ROOT", str(tmp_path))
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     target = tmp_path / "target.py"
     target.write_text("modified")

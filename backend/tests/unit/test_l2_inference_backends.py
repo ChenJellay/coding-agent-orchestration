@@ -31,6 +31,7 @@ def test_default_backend_is_mlx_local():
 def test_mlx_backend_uses_large_default_when_max_tokens_none(monkeypatch):
     """Omitting max_tokens should use AGENTI_HELIX_MLX_MAX_TOKENS (default 262144)."""
     pytest.importorskip("mlx_lm", reason="MLX not installed")
+    import mlx_lm  # type: ignore
     from agenti_helix.runtime.inference_backends import MLXLocalInferenceBackend, MLXModelConfig
 
     monkeypatch.setenv("AGENTI_HELIX_MLX_MAX_TOKENS", "99999")
@@ -39,13 +40,19 @@ def test_mlx_backend_uses_large_default_when_max_tokens_none(monkeypatch):
     def fake_get_mlx(self: MLXLocalInferenceBackend):
         return object(), object()
 
-    def fake_generate(model, tokenizer, *, prompt: str, max_tokens: int, sampler=None, **kwargs):
+    def fake_stream_generate(model, tokenizer, *, prompt: str, max_tokens: int, **kwargs):
         captured["max_tokens"] = max_tokens
-        return "{}"
+
+        class _Chunk:
+            text = "{}"
+            generation_tokens = 1
+            generation_tps = 0.0
+
+        yield _Chunk()
 
     backend = MLXLocalInferenceBackend(MLXModelConfig(model_path="/fake/model"))
     with patch.object(MLXLocalInferenceBackend, "_get_mlx_model", fake_get_mlx):
-        with patch("mlx_lm.generate", fake_generate):
+        with patch.object(mlx_lm, "stream_generate", fake_stream_generate):
             backend.generate("hi", max_tokens=None, temperature=0.0)
 
     assert captured.get("max_tokens") == 99999
