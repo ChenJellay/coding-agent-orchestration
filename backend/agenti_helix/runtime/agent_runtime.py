@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from agenti_helix.agents.registry import get_agent
 from agenti_helix.api.job_registry import TaskCancelledError
-from agenti_helix.observability.debug_log import log_event, write_cursor_debug_ndjson
+from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.inference_backends import get_default_inference_backend
 from agenti_helix.runtime.json_utils import extract_first_json_object, try_fallback_snippet_judge_dict
 
@@ -185,29 +185,8 @@ def run_agent(
             if fb is not None:
                 data = fb
                 parse_exc = None
-                # #region agent log
-                write_cursor_debug_ndjson(
-                    location="agent_runtime.py:run_agent",
-                    message="judge_v1_json_fallback_used",
-                    hypothesis_id="H3",
-                    data={"verdict": fb.get("verdict"), "agent_id": agent_id},
-                    run_id=run_id_log,
-                )
-                # #endregion
 
     if parse_exc is not None:
-        # #region agent log
-        write_cursor_debug_ndjson(
-            location="agent_runtime.py:run_agent",
-            message="json_extract_failed",
-            hypothesis_id="H4",
-            data={
-                "agent_id": agent_id,
-                "error": str(parse_exc)[:500],
-            },
-            run_id=run_id_log,
-        )
-        # #endregion
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,
@@ -230,15 +209,6 @@ def run_agent(
         typed = output_model.model_validate(data)
         result = typed.model_dump()
     except Exception as exc:
-        # #region agent log
-        write_cursor_debug_ndjson(
-            location="agent_runtime.py:run_agent",
-            message="pydantic_validate_failed",
-            hypothesis_id="H5",
-            data={"agent_id": agent_id, "error": str(exc)[:500]},
-            run_id=run_id_log,
-        )
-        # #endregion
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,

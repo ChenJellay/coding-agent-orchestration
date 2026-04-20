@@ -248,25 +248,6 @@ function DashboardPage() {
     }
     setRunBusy(true)
     try {
-      // #region agent log
-      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
-        body: JSON.stringify({
-          sessionId: 'f6751c',
-          location: 'App.tsx:handleRunCommand',
-          message: 'submit_start',
-          hypothesisId: 'H1',
-          data: {
-            pipelineMode,
-            intentLen: trimmedIntent.length,
-            hasDocUpload: Boolean(docUploadText && docUploadText.length > 0),
-            docUrlLen: docUrlField.trim().length,
-          },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {})
-      // #endregion
       const resolvedPipeline: PipelineMode | null =
         pipelineMode === 'orchestrator' ? null : pipelineMode
       const res = await startDagFromDashboard({
@@ -279,38 +260,9 @@ function DashboardPage() {
             ? { doc_url: docUrlField.trim() }
             : {}),
       })
-      // #region agent log
-      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
-        body: JSON.stringify({
-          sessionId: 'f6751c',
-          location: 'App.tsx:handleRunCommand',
-          message: 'submit_ok',
-          hypothesisId: 'H1',
-          data: { dagId: res.dag_id, pipelineMode },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {})
-      // #endregion
       setQueuedDagId(res.dag_id)
-      // Immediately refresh UI; execution may take a while.
       await loadAll()
     } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7320/ingest/69fc216a-c981-4ea3-a323-547dec11fac3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'f6751c' },
-        body: JSON.stringify({
-          sessionId: 'f6751c',
-          location: 'App.tsx:handleRunCommand',
-          message: 'submit_error',
-          hypothesisId: 'H1',
-          data: { err: e instanceof Error ? e.message : String(e), pipelineMode },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {})
-      // #endregion
       setRunError(e instanceof Error ? e.message : String(e))
     } finally {
       setRunBusy(false)

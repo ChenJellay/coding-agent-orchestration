@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from agenti_helix.observability.debug_log import log_event, write_cursor_debug_ndjson
+from agenti_helix.observability.debug_log import log_event
 from agenti_helix.api.paths import PATHS
 from agenti_helix.api.task_lookup import try_load_dag_state
 from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
@@ -245,15 +245,6 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
 
     node_states = _initial_node_states_from_disk(spec)
     requeued = _requeue_retryable_nodes(node_states)
-    # #region agent log
-    write_cursor_debug_ndjson(
-        location="orchestrator.py:execute_dag",
-        message="requeue_retryable_nodes",
-        hypothesis_id="H1",
-        data={"dag_id": spec.dag_id, "requeued_node_ids": requeued},
-        run_id=spec.dag_id,
-    )
-    # #endregion
     if requeued:
         log_event(
             run_id=spec.dag_id,
@@ -289,37 +280,10 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         if node_state.status is DagNodeStatus.RUNNING:
             node_state.status = DagNodeStatus.PENDING
         if node_state.status in (DagNodeStatus.PASSED_VERIFICATION, DagNodeStatus.AWAITING_SIGNOFF):
-            # #region agent log
-            write_cursor_debug_ndjson(
-                location="orchestrator.py:execute_dag:skip",
-                message="node_skip_already_verified",
-                hypothesis_id="H2",
-                data={"node_id": node_id, "status": node_state.status.value},
-                run_id=spec.dag_id,
-            )
-            # #endregion
             continue
         if node_state.status is DagNodeStatus.FAILED:
-            # #region agent log
-            write_cursor_debug_ndjson(
-                location="orchestrator.py:execute_dag:skip",
-                message="node_skip_stale_failed",
-                hypothesis_id="H2",
-                data={"node_id": node_id, "status": node_state.status.value},
-                run_id=spec.dag_id,
-            )
-            # #endregion
             continue
         if node_state.status is not DagNodeStatus.PENDING:
-            # #region agent log
-            write_cursor_debug_ndjson(
-                location="orchestrator.py:execute_dag:skip",
-                message="node_skip_non_pending",
-                hypothesis_id="H2",
-                data={"node_id": node_id, "status": node_state.status.value},
-                run_id=spec.dag_id,
-            )
-            # #endregion
             continue
 
         preds = predecessors.get(node_id, set())
