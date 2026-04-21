@@ -17,7 +17,7 @@ from agenti_helix.runtime.chain_runtime import run_chain
 from agenti_helix.runtime.tools import tool_build_repo_map_context, tool_fetch_doc_content
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
-from .orchestrator import DagNodeSpec, DagSpec, persist_dag_spec
+from .orchestrator import DagNodeSpec, DagSpec
 
 _MAX_COMPILE_RETRIES = 2
 
@@ -268,7 +268,9 @@ def compile_macro_intent_with_llm(
 
     nodes_raw = typed.get("nodes") or []
     edges_raw = typed.get("edges") or []
-    dag_identifier = str(typed.get("dag_id") or dag_id or "dag-llm-intent")
+    # Caller-supplied dag_id (dashboard / CLI) must win over the optional id in LLM JSON,
+    # otherwise we persist two different `*.json` specs and the UI shows duplicate DAGs.
+    dag_identifier = str(dag_id or typed.get("dag_id") or "dag-llm-intent")
 
     intent_nodes: List[IntentNodeSpec] = []
     for item in nodes_raw:
@@ -321,7 +323,6 @@ def compile_macro_intent_with_llm(
         edges=edges,
         user_intent_label=display_label,
     )
-    persist_dag_spec(spec)
     return spec
 
 

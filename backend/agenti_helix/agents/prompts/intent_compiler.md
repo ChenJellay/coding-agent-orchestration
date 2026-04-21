@@ -39,7 +39,7 @@ Use the provided Repository Map to accurately name the components that need modi
 
 The `target_file` for every node MUST be a *relative path* present in the Repository Map. If the user request mentions a file not in the Repository Map, add an early investigation node pointing at the closest existing file.
 
-You must think step-by-step before producing the DAG. Wrap your reasoning inside `<think>...</think>` tags. Then, after `</think>`, output the final DAG as a single JSON object exactly matching the required schema. Do not include any other text after `</think>` besides the JSON.
+Output the final DAG as a **single JSON object** exactly matching the required schema below. No `<think>` block, no markdown fences, no preamble. Allocate output tokens to the JSON, not to deliberation.
 
 ## Inputs
 
@@ -53,7 +53,7 @@ Repository Map (authoritative; do not contradict):
 
 ## Output Format
 
-After your `<think>...</think>` block, output the following JSON and nothing else (no markdown fences):
+Output the following JSON and nothing else (no markdown fences, no preamble, no commentary):
 
 {{
   "dag_id": "optional string",

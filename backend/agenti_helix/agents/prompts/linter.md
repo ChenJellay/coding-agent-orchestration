@@ -30,9 +30,7 @@ acceptance_criteria:{acceptance_criteria}
 5. Sort: errors first, then warnings, then info. Within each tier, sort by line_number ascending.
 
 ## Output
-First, reason step-by-step inside `<think>...</think>` tags — parse the linter output and cross-reference against acceptance criteria.
-
-Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
+Respond with **only** a JSON object — no `<think>` block, no prose, no markdown fences. Put any reasoning into the `summary` field of the JSON, not before it.
 
 ```json
 {{

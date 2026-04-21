@@ -21,6 +21,15 @@ class AgentSpec:
     # Optional backend routing hint consumed by get_default_inference_backend.
     # None means "use the system default (mlx_local or AGENTI_HELIX_BACKEND_TYPE env)".
     backend_type: Optional[str] = None
+    # Authoritative output-token ceiling for this agent. The runtime treats
+    # this as an *upper bound*: if the chain DSL passes a smaller max_tokens,
+    # the smaller value wins; if it passes a larger one (or omits it), the
+    # spec ceiling is used.  This stops local quant models from running away
+    # on classification-shaped prompts (e.g. judge_v1 emitting a 6 k-token
+    # `<think>` block before a 50-token JSON answer).  Defaults to a generous
+    # 4096 so unspecified agents do not behave any worse than the old
+    # MLX-only runtime.
+    max_output_tokens: int = 4096
 
     def render(self, raw_input: Dict[str, Any]) -> str:
         """Render the agent prompt from `raw_input`.
@@ -63,6 +72,10 @@ class AgentSpec:
         return render_prompt(template, raw_input)
 
 
+# Per-agent max_output_tokens budgets — set tight enough to keep local quant
+# models from over-thinking, loose enough to fit the worst legitimate output
+# (full file rewrites for coder_builder, multi-node DAGs for intent_compiler).
+# Audit log: see `docs/phase2-verification-loop.md` for the rationale.
 _AGENTS: Dict[str, AgentSpec] = {
     "coder_patch_v1": AgentSpec(
         agent_id="coder_patch_v1",
@@ -70,6 +83,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="coder_patch.md",
         input_model=models.CoderPatchInput,
         output_model=models.CoderPatchOutput,
+        max_output_tokens=1024,
     ),
     "intent_compiler_v1": AgentSpec(
         agent_id="intent_compiler_v1",
@@ -77,6 +91,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="intent_compiler.md",
         input_model=models.IntentCompilerInput,
         output_model=models.IntentCompilerOutput,
+        max_output_tokens=4096,
     ),
     "context_librarian_v1": AgentSpec(
         agent_id="context_librarian_v1",
@@ -84,6 +99,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="context_librarian_scout.md",
         input_model=BaseModel,
         output_model=models.LibrarianOutput,
+        max_output_tokens=2048,
     ),
     "sdet_v1": AgentSpec(
         agent_id="sdet_v1",
@@ -91,6 +107,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="sdet_test_writer.md",
         input_model=BaseModel,
         output_model=models.SdetOutput,
+        max_output_tokens=4096,
     ),
     "coder_builder_v1": AgentSpec(
         agent_id="coder_builder_v1",
@@ -98,6 +115,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="coder_builder.md",
         input_model=BaseModel,
         output_model=models.CoderOutput,
+        max_output_tokens=8192,  # Full file rewrites can be large.
     ),
     "security_governor_v1": AgentSpec(
         agent_id="security_governor_v1",
@@ -105,6 +123,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="security_governor.md",
         input_model=BaseModel,
         output_model=models.GovernorOutput,
+        max_output_tokens=1536,
     ),
     "judge_evaluator_v1": AgentSpec(
         agent_id="judge_evaluator_v1",
@@ -112,6 +131,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="judge_evaluator.md",
         input_model=BaseModel,
         output_model=models.JudgeOutput,
+        max_output_tokens=2048,
     ),
     "judge_v1": AgentSpec(
         agent_id="judge_v1",
@@ -120,6 +140,10 @@ _AGENTS: Dict[str, AgentSpec] = {
         input_model=models.SnippetJudgeInput,
         output_model=models.SnippetJudgeOutput,
         backend_type="mlx_local",  # Local quantized model: fast, cheap, good for classification
+        # PASS/FAIL + one-sentence justification + line list — fits in well
+        # under 256 tokens.  Tight cap so a runaway model is killed in seconds
+        # rather than minutes.
+        max_output_tokens=768,
     ),
     "doc_fetcher_v1": AgentSpec(
         agent_id="doc_fetcher_v1",
@@ -127,6 +151,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="doc_fetcher.md",
         input_model=BaseModel,
         output_model=models.DocFetcherOutput,
+        max_output_tokens=2048,
     ),
     "diff_validator_v1": AgentSpec(
         agent_id="diff_validator_v1",
@@ -134,6 +159,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="diff_validator.md",
         input_model=BaseModel,
         output_model=models.DiffValidatorOutput,
+        max_output_tokens=1536,
     ),
     "linter_v1": AgentSpec(
         agent_id="linter_v1",
@@ -141,6 +167,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="linter.md",
         input_model=BaseModel,
         output_model=models.LinterAgentOutput,
+        max_output_tokens=2048,
     ),
     "type_checker_v1": AgentSpec(
         agent_id="type_checker_v1",
@@ -148,6 +175,26 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="type_checker.md",
         input_model=BaseModel,
         output_model=models.TypeCheckerAgentOutput,
+        max_output_tokens=2048,
+    ),
+    "memory_summarizer_v1": AgentSpec(
+        agent_id="memory_summarizer_v1",
+        description="Retry coach: fuses attempt history + similar past episodes into a focused hint for the next coder attempt.",
+        prompt_filename="memory_summarizer.md",
+        input_model=models.MemorySummarizerInput,
+        output_model=models.MemorySummarizerOutput,
+        # Output = hypothesis + hint + 3-5 anti-patterns. Tight cap prevents
+        # the hint from growing into a second prompt that dwarfs the coder's.
+        max_output_tokens=1024,
+    ),
+    "supreme_court_v1": AgentSpec(
+        agent_id="supreme_court_v1",
+        description="Final arbiter on exhausted retries: emits PASS_OVERRIDE / CONFIRM_BLOCKED / ESCALATE_HUMAN.",
+        prompt_filename="supreme_court.md",
+        input_model=models.SupremeCourtInput,
+        output_model=models.SupremeCourtOutput,
+        # Classification-shaped: 3-way ruling + one paragraph + evidence list.
+        max_output_tokens=1536,
     ),
 }
 

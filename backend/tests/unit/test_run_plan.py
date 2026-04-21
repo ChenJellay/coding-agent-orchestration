@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from agenti_helix.runtime.run_plan import (
+    PRESET_DELIBERATIVE,
     PRESET_FULL_TDD,
     PRESET_QUICK_PATCH,
     RunPlan,
@@ -105,6 +106,43 @@ def test_lint_type_gate_overlays_linter_and_typechecker() -> None:
     ids = _ids(chain)
     for step in ("run_linter_tool", "linter_agent", "run_typecheck_tool", "type_checker_agent", "overlay_logs"):
         assert step in ids, f"missing {step} in lint_type_gate judge chain"
+
+
+# ─── master_orchestrator delegates to RunPlan ─────────────────────────────
+
+
+# ─── Retry-loop flags are orthogonal to chain composition ────────────────
+
+
+def test_retry_flags_do_not_change_coder_chain_shape() -> None:
+    """memory_summarizer / supreme_court are loop-level, not chain-level.
+
+    Enabling them must produce the same coder chain as the equivalent plan
+    with the flags off — otherwise we'd be accidentally re-entangling them
+    with chain composition.
+    """
+    base = RunPlan()
+    with_retry = RunPlan(memory_summarizer=True, supreme_court=True)
+    assert _ids(build_coder_chain(_task(), base)) == _ids(build_coder_chain(_task(), with_retry))
+    assert _ids(build_judge_chain(_task(), base)) == _ids(build_judge_chain(_task(), with_retry))
+
+
+def test_preset_deliberative_enables_both_retry_flags() -> None:
+    assert PRESET_DELIBERATIVE.memory_summarizer is True
+    assert PRESET_DELIBERATIVE.supreme_court is True
+    # And does NOT silently turn on TDD / doc-fetch.
+    assert PRESET_DELIBERATIVE.write_tests is False
+    assert PRESET_DELIBERATIVE.gather_doc is False
+
+
+def test_run_plan_from_extras_threads_retry_flags() -> None:
+    plan = RunPlan.from_extras(
+        "patch",
+        {"memory_summarizer": True, "supreme_court": True, "diff_gate": False},
+    )
+    assert plan.memory_summarizer is True
+    assert plan.supreme_court is True
+    assert plan.diff_gate is False
 
 
 # ─── master_orchestrator delegates to RunPlan ─────────────────────────────

@@ -31,6 +31,7 @@ from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.chain_runtime import run_chain
 from agenti_helix.api.task_lookup import record_verification_cycle_snapshot
 from agenti_helix.memory.indexer import index_from_verification_state
+from agenti_helix.memory.store import MemoryStore, get_default_store
 
 from .checkpointing import (
     Checkpoint,
@@ -62,6 +63,14 @@ class VerificationState:
     cancel_token: Any | None = None
     trace_id: Optional[str] = None
     dag_id: Optional[str] = None
+    # Ordered per-attempt snapshots used by ``memory_summarizer_v1`` and
+    # ``supreme_court_v1``. Each entry mirrors ``AttemptRecord`` (see
+    # agenti_helix.agents.models). Populated by the main loop right after
+    # each judge verdict resolves.
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    # Terminal arbitration output, if the supreme_court agent ran. Surfaced
+    # in the final checkpoint tool_logs so reviewers can see the ruling.
+    supreme_court_ruling: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -613,11 +622,17 @@ def _record_pass(state: VerificationState) -> None:
     repo_root = Path(state.task.repo_path).resolve()
     target_path = repo_root / state.task.target_file
     post_judge_body = target_path.read_text()
+    base: Dict[str, Any] = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
+    if state.supreme_court_ruling is not None:
+        # PASS_OVERRIDE path: per-attempt judge said FAIL, supreme_court said
+        # the transcript actually satisfies acceptance_criteria. Keep both
+        # signals in tool_logs so humans can audit the override.
+        base["supreme_court"] = state.supreme_court_ruling
     tool_logs = _tool_logs_with_git_unified_diff(
         repo_root=repo_root,
         task=state.task,
         diff_json=state.diff_json,
-        base={"judge": state.judge_response, "static_checks": state.static_check_logs or {}},
+        base=base,
     )
     if _patch_pipeline(state.task):
         record_post_state(
@@ -681,11 +696,28 @@ def _record_pass(state: VerificationState) -> None:
     )
 
 
-def _record_blocked_after_retries(state: VerificationState) -> None:
-    """Retries exhausted with no PASS: BLOCKED."""
+def _record_blocked_after_retries(
+    state: VerificationState,
+    *,
+    human_review: bool = False,
+) -> None:
+    """Retries exhausted with no PASS: BLOCKED.
+
+    When ``human_review`` is True, the supreme_court ruled ``ESCALATE_HUMAN``
+    — we still mark BLOCKED but stash the flag in tool_logs so dashboards /
+    downstream sign-off flows can route the task to a reviewer.
+    """
     assert state.checkpoint is not None
     repo_root = Path(state.task.repo_path).resolve()
     target_path = repo_root / state.task.target_file
+    base: Dict[str, Any] = {
+        "judge": state.judge_response,
+        "static_checks": state.static_check_logs or {},
+    }
+    if state.supreme_court_ruling is not None:
+        base["supreme_court"] = state.supreme_court_ruling
+    if human_review:
+        base["human_review_required"] = True
     record_post_state(
         state.checkpoint,
         post_state_ref=target_path.read_text() if target_path.exists() else "",
@@ -694,10 +726,7 @@ def _record_blocked_after_retries(state: VerificationState) -> None:
             repo_root=repo_root,
             task=state.task,
             diff_json=state.diff_json,
-            base={
-                "judge": state.judge_response,
-                "static_checks": state.static_check_logs or {},
-            },
+            base=base,
         ),
         status=VerificationStatus.BLOCKED,
     )
@@ -716,6 +745,221 @@ def _record_blocked_after_retries(state: VerificationState) -> None:
     )
 
 
+def _record_attempt(state: VerificationState, *, verdict_from_static: bool) -> None:
+    """Append a compact snapshot of this coder→judge attempt to ``state.attempts``.
+
+    Called exactly once per loop iteration, right after a verdict has resolved
+    (whether from static-check short-circuit or a real judge call). The shape
+    matches ``agenti_helix.agents.models.AttemptRecord`` so the retry-loop
+    agents can consume it directly.
+    """
+    jr = state.judge_response or {}
+    static_logs = state.static_check_logs or {}
+    static_errors = [str(e) for e in (static_logs.get("errors") or [])][:8]
+    diff_summary = _summarise_diff_for_attempt(state)
+    state.attempts.append(
+        {
+            "attempt_n": state.retry_count + 1,
+            "judge_verdict": str(jr.get("verdict") or "FAIL").upper(),
+            "justification": str(jr.get("justification") or "")[:500],
+            "diff_summary": diff_summary,
+            "static_errors": static_errors,
+        }
+    )
+
+
+def _summarise_diff_for_attempt(state: VerificationState) -> str:
+    """One-line description of what the attempt changed — NOT the full diff.
+
+    The retry agents don't need the full unified diff (that would blow the
+    context budget); they need to see whether each attempt touched the same
+    file, how many hunks, and roughly which region.
+    """
+    dj = state.diff_json or {}
+    files_written = dj.get("files_written") or []
+    if isinstance(files_written, list) and files_written:
+        return f"wrote {len(files_written)} file(s): " + ", ".join(str(p) for p in files_written[:3])
+    # Patch-style diff_json has filePath / startLine / endLine.
+    path = dj.get("filePath")
+    start = dj.get("startLine")
+    end = dj.get("endLine")
+    if path is not None:
+        return f"edited {path} lines {start}..{end}"
+    return "(no diff summary available)"
+
+
+def _run_memory_summarizer_into_feedback(
+    state: VerificationState,
+    *,
+    memory_store: Optional[MemoryStore] = None,
+) -> None:
+    """Replace raw judge justification in ``state.feedback`` with a focused hint.
+
+    Invoked from ``_prepare_retry`` when ``task.enable_memory_summarizer`` is
+    set. On any failure (agent raises, schema repair exhausted, memory store
+    missing, etc.) the loop silently keeps the legacy feedback — a retry hint
+    is best-effort and must never block the loop.
+    """
+    # Lazy import: avoids a structured_output → agent_runtime import cycle at
+    # module load time and keeps the dependency optional for tests that patch
+    # the verification loop without registering structured agents.
+    from agenti_helix.runtime.structured_output import run_agent_structured
+
+    store = memory_store or get_default_store()
+    jr = state.judge_response or {}
+    query_text = str(jr.get("justification") or state.feedback or "")
+    try:
+        episodes = store.query(query_text, top_k=3)
+    except Exception:
+        episodes = []
+    similar = [
+        {"error_text": ep.error_text[:500], "resolution": ep.resolution[:500]}
+        for ep in episodes
+    ]
+
+    raw_input = {
+        "task_intent": state.task.intent,
+        "target_file": state.task.target_file,
+        "acceptance_criteria": state.task.acceptance_criteria,
+        "attempts": list(state.attempts),
+        "similar_past_episodes": similar,
+    }
+
+    try:
+        hint = run_agent_structured(
+            agent_id="memory_summarizer_v1",
+            raw_input=raw_input,
+            cancel_token=state.cancel_token,
+            observe={
+                "run_id": state.task.task_id,
+                "hypothesis_id": f"memory_summarizer_attempt_{state.retry_count + 1}",
+                "location": "agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+                "trace_id": state.trace_id,
+                "dag_id": state.dag_id,
+            },
+        )
+    except Exception as exc:
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"memory_summarizer_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+            message="memory_summarizer_v1 failed — keeping legacy judge-justification feedback",
+            data={"error": f"{type(exc).__name__}: {exc}", "task_id": state.task.task_id},
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        return
+
+    root_cause = str(hint.get("root_cause_hypothesis") or "").strip()
+    actionable = str(hint.get("actionable_hint") or "").strip()
+    anti = hint.get("anti_patterns_to_avoid") or []
+    if not actionable:
+        return  # Empty hint is no hint; keep legacy feedback.
+
+    anti_block = ""
+    if isinstance(anti, list) and anti:
+        bullets = "\n".join(f"- {str(a).strip()}" for a in anti[:5] if str(a).strip())
+        if bullets:
+            anti_block = "\nDo NOT repeat:\n" + bullets
+
+    state.feedback = "\n".join(
+        line
+        for line in [
+            "Retry hint from memory_summarizer_v1:",
+            f"Root cause: {root_cause}" if root_cause else None,
+            f"Next-step hint: {actionable}",
+            anti_block.strip() or None,
+        ]
+        if line
+    )
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id=f"memory_summarizer_attempt_{state.retry_count + 1}",
+        location="agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+        message="Injected memory_summarizer_v1 hint into retry feedback",
+        data={
+            "task_id": state.task.task_id,
+            "similar_episodes": len(similar),
+            "hint_chars": len(state.feedback),
+        },
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
+
+
+def _run_supreme_court(state: VerificationState) -> Optional[Dict[str, Any]]:
+    """Invoke ``supreme_court_v1`` to arbitrate an exhausted retry budget.
+
+    Returns the ruling dict on success, or ``None`` if the agent failed (in
+    which case the caller must fall back to the legacy ``CONFIRM_BLOCKED``
+    behaviour — we never let an arbitration failure swallow a genuine block).
+    """
+    from agenti_helix.runtime.structured_output import run_agent_structured
+
+    repo_root = Path(state.task.repo_path).resolve()
+    diff_text = _git_unified_diff_for_paths(
+        repo_root=repo_root,
+        paths=_paths_for_git_diff(state.task, state.diff_json),
+    )
+    static_logs = state.static_check_logs or {}
+    static_summary_bits: List[str] = []
+    if static_logs:
+        if static_logs.get("security_blocked"):
+            static_summary_bits.append("security-blocked")
+        if static_logs.get("errors"):
+            static_summary_bits.append(f"{len(static_logs['errors'])} static error(s)")
+        if static_logs.get("passed") is True:
+            static_summary_bits.append("static checks passed")
+    static_summary = "; ".join(static_summary_bits) or "no static-check signal"
+
+    raw_input = {
+        "task_intent": state.task.intent,
+        "target_file": state.task.target_file,
+        "acceptance_criteria": state.task.acceptance_criteria,
+        "final_git_diff": diff_text[:_MAX_GIT_UNIFIED_DIFF_CHARS] if diff_text else "",
+        "attempts": list(state.attempts),
+        "final_judge_verdict": state.judge_response or {},
+        "static_check_summary": static_summary,
+    }
+
+    try:
+        ruling = run_agent_structured(
+            agent_id="supreme_court_v1",
+            raw_input=raw_input,
+            cancel_token=state.cancel_token,
+            observe={
+                "run_id": state.task.task_id,
+                "hypothesis_id": "supreme_court_final",
+                "location": "agenti_helix/verification/verification_loop.py:_run_supreme_court",
+                "trace_id": state.trace_id,
+                "dag_id": state.dag_id,
+            },
+        )
+    except Exception as exc:
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id="supreme_court_final",
+            location="agenti_helix/verification/verification_loop.py:_run_supreme_court",
+            message="supreme_court_v1 failed — falling back to CONFIRM_BLOCKED",
+            data={"error": f"{type(exc).__name__}: {exc}", "task_id": state.task.task_id},
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        return None
+
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id="supreme_court_final",
+        location="agenti_helix/verification/verification_loop.py:_run_supreme_court",
+        message=f"supreme_court_v1 ruling: {ruling.get('ruling')}",
+        data={"task_id": state.task.task_id, "ruling": ruling.get("ruling")},
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
+    state.supreme_court_ruling = ruling
+    return ruling
+
+
 def _prepare_retry(state: VerificationState) -> None:
     """Roll the workspace back to the pre-checkpoint and stash judge feedback for the next coder pass."""
     assert state.checkpoint is not None
@@ -728,6 +972,8 @@ def _prepare_retry(state: VerificationState) -> None:
     state.feedback = "\n".join(
         ["Judge reported a failure.", f"Justification: {justification}"]
     )
+    if getattr(state.task, "enable_memory_summarizer", False):
+        _run_memory_summarizer_into_feedback(state)
     log_event(
         run_id=state.task.task_id,
         hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",
@@ -747,6 +993,36 @@ def _prepare_retry(state: VerificationState) -> None:
         verification_cycle=state.retry_count + 2,
         verification_status=VerificationStatus.RUNNING.value,
     )
+
+
+def _finalise_after_retries(state: VerificationState) -> None:
+    """Retry budget exhausted. If ``supreme_court`` is enabled, let it arbitrate.
+
+    Dispatch table:
+      - PASS_OVERRIDE  → promote to ``_record_pass`` (supreme_court sides with
+        the workspace state despite per-attempt FAILs).
+      - ESCALATE_HUMAN → BLOCKED with ``human_review_required`` flag set.
+      - CONFIRM_BLOCKED / agent failure / disabled → legacy BLOCKED path.
+    """
+    if not getattr(state.task, "enable_supreme_court", False):
+        _record_blocked_after_retries(state)
+        return
+
+    ruling = _run_supreme_court(state)
+    if ruling is None:
+        # Agent failed; never let arbitration errors unblock a BLOCKED task.
+        _record_blocked_after_retries(state)
+        return
+
+    verdict = str(ruling.get("ruling") or "").upper()
+    if verdict == "PASS_OVERRIDE":
+        _record_pass(state)
+        return
+    if verdict == "ESCALATE_HUMAN":
+        _record_blocked_after_retries(state, human_review=True)
+        return
+    # CONFIRM_BLOCKED or anything we don't recognise → default BLOCKED.
+    _record_blocked_after_retries(state)
 
 
 def _mark_blocked_for_cancel(state: VerificationState) -> None:
@@ -817,6 +1093,9 @@ def run_verification_loop(
                 logs = state.static_check_logs or {}
                 if not logs.get("passed", True) and logs.get("errors"):
                     if logs.get("security_blocked"):
+                        # Security-blocked short-circuits both the judge and
+                        # any supreme_court arbitration — we never override
+                        # a security violation.
                         _record_security_blocked(state)
                         break
                     state.judge_response = {
@@ -828,6 +1107,8 @@ def run_verification_loop(
                 else:
                     _call_judge(state)
 
+            _record_attempt(state, verdict_from_static=verdict_from_static)
+
             verdict = str((state.judge_response or {}).get("verdict", "FAIL")).upper()
             if verdict == "PASS":
                 _record_pass(state)
@@ -835,7 +1116,7 @@ def run_verification_loop(
 
             state.retry_count += 1
             if state.retry_count >= cfg.max_retries:
-                _record_blocked_after_retries(state)
+                _finalise_after_retries(state)
                 break
 
             _prepare_retry(state)

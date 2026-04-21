@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from agenti_helix.orchestration.intent_compiler import compile_macro_intent_to_dag
-from agenti_helix.orchestration.orchestrator import execute_dag
+from agenti_helix.orchestration.orchestrator import execute_dag, persist_dag_spec
 
 
 def main() -> None:
@@ -28,6 +28,7 @@ def main() -> None:
         dag_id="dag-cli-run",
         user_intent_label=args.macro_intent.strip(),
     )
+    persist_dag_spec(dag_spec)
 
     result = execute_dag(dag_spec)
     print(f"DAG {result.dag_id} completed.")

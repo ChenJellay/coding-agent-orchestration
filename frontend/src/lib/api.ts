@@ -357,6 +357,18 @@ export interface ExecutionExtras {
   diff_gate?: boolean
   /** Run linter + type_checker agents and fold findings into the judge prompt. */
   lint_type?: boolean
+  /**
+   * Before each retry, replace raw judge justification with a focused hint
+   * synthesised by ``memory_summarizer_v1`` from attempt history + similar
+   * past episodes.
+   */
+  memory_summarizer?: boolean
+  /**
+   * After retries are exhausted, invoke ``supreme_court_v1`` to arbitrate.
+   * ``PASS_OVERRIDE`` promotes to PASSED; ``ESCALATE_HUMAN`` marks BLOCKED
+   * with a human-review flag; ``CONFIRM_BLOCKED`` is the default.
+   */
+  supreme_court?: boolean
 }
 
 export async function startDagFromDashboard(params: {

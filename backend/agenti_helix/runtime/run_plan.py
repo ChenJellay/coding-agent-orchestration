@@ -43,6 +43,10 @@ class RunPlan:
     write_tests: bool = False
     diff_gate: bool = False
     lint_type_gate: bool = False
+    # Retry-loop opt-ins (verification_loop consumes these directly via
+    # EditTaskSpec; they do not affect coder / judge *chain* composition):
+    memory_summarizer: bool = False  # enrich per-retry feedback with memory_summarizer_v1
+    supreme_court: bool = False      # final arbitration on exhausted retries
 
     def to_dict(self) -> Dict[str, bool]:
         return {
@@ -50,6 +54,8 @@ class RunPlan:
             "write_tests": self.write_tests,
             "diff_gate": self.diff_gate,
             "lint_type_gate": self.lint_type_gate,
+            "memory_summarizer": self.memory_summarizer,
+            "supreme_court": self.supreme_court,
         }
 
     @classmethod
@@ -68,12 +74,18 @@ class RunPlan:
             write_tests=write_tests,
             diff_gate=bool(extras.get("diff_gate")),
             lint_type_gate=bool(extras.get("lint_type") or extras.get("lint_type_gate")),
+            memory_summarizer=bool(extras.get("memory_summarizer")),
+            supreme_court=bool(extras.get("supreme_court")),
         )
 
 
 # Dashboard presets — keep these stable; the UI surfaces them as named buttons.
 PRESET_QUICK_PATCH = RunPlan()
 PRESET_FULL_TDD = RunPlan(gather_doc=True, write_tests=True, diff_gate=True)
+# Deliberative preset: patch-style (fast single-file) + both retry agents on.
+# Use when a task has been flaky in the past or when you want the strictest
+# arbitration before a final BLOCKED.
+PRESET_DELIBERATIVE = RunPlan(memory_summarizer=True, supreme_court=True)
 
 
 # ---------------------------------------------------------------------------

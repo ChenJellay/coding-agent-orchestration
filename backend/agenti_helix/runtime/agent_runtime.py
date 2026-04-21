@@ -17,6 +17,82 @@ import re
 _THINK_EXTRACT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 
+class StructuredOutputError(Exception):
+    """Raised when an agent produces text that fails JSON parse OR Pydantic validation.
+
+    Carries the raw model output and the rendered prompt so that the
+    repair-loop wrapper (``runtime.structured_output``) can build a
+    targeted retry prompt.
+
+    ``truncated`` is a best-effort signal that the backend stopped generating
+    because it hit ``max_tokens`` (not because the model decided it was done).
+    When set, the repair wrapper short-circuits — retrying with a longer
+    repair prompt would only hit the same ceiling sooner. See
+    ``_looks_truncated`` for the heuristic.
+    """
+
+    def __init__(
+        self,
+        *,
+        message: str,
+        raw_output: str,
+        agent_id: str,
+        kind: str,
+        truncated: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
+        self.agent_id = agent_id
+        self.kind = kind  # "parse" | "validate"
+        self.truncated = truncated
+
+
+# ---------------------------------------------------------------------------
+# Truncation heuristic
+# ---------------------------------------------------------------------------
+#
+# Local quant models don't expose a finish_reason; when they stop because they
+# hit ``max_tokens`` the output is just cut mid-JSON. Retrying the structured-
+# output repair loop with an *even longer* prompt will make the same thing
+# happen sooner, so we detect truncation and bail out of the repair loop.
+#
+# The heuristic is intentionally conservative — we'd rather miss a truncation
+# (and do one harmless wasted repair) than flag a real malformed response as
+# truncated (and skip the repair that would have recovered it).
+_TRUNCATION_ERROR_MARKERS: tuple[str, ...] = (
+    # Raised by ``extract_first_json_object`` when we see an opening ``{``
+    # but no matching ``}``. The most reliable parse-time signal.
+    "never closes it",
+)
+# Rough char-per-token ratio for JSON-heavy output (English text + a lot of
+# quotes + punctuation trends slightly below the 4.0 rule-of-thumb).
+_CHARS_PER_TOKEN = 3.5
+# Fraction of the budget that must be consumed before length alone counts as
+# a truncation signal. At >=85% we're confident the model was cut off.
+_TRUNCATION_LENGTH_RATIO = 0.85
+
+
+def _looks_truncated(*, raw: str, max_tokens: Optional[int], error_message: str) -> bool:
+    """True when the parse failure is consistent with hitting ``max_tokens``.
+
+    Signals, any one of which is sufficient:
+      1. The parser explicitly flagged an unterminated JSON object.
+      2. Output length is >=85% of the token budget (by char estimate) AND
+         the output has more opening than closing braces (so a container is
+         genuinely still open).
+    """
+    if any(marker in error_message for marker in _TRUNCATION_ERROR_MARKERS):
+        return True
+    if max_tokens is None or max_tokens <= 0:
+        return False
+    length_threshold = int(_TRUNCATION_LENGTH_RATIO * max_tokens * _CHARS_PER_TOKEN)
+    if len(raw) < length_threshold:
+        return False
+    opens = raw.count("{") + raw.count("[")
+    closes = raw.count("}") + raw.count("]")
+    return closes < opens
+
+
 def _extract_thinking(raw: str) -> str | None:
     """Pull out the concatenated contents of all ``<think>`` blocks, or None."""
     matches = _THINK_EXTRACT_RE.findall(raw)
@@ -64,25 +140,38 @@ def run_agent(
     runtime: Optional[dict[str, Any]] = None,
     cancel_token: Any | None = None,
     observe: Optional[Dict[str, Any]] = None,
+    prompt_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Render `agent_id` prompt + run inference + parse/validate JSON output.
 
     Returns a JSON-serializable dict (the validated output model dump).
     Raises `TaskCancelledError` if `cancel_token` is set before or after inference.
+    Raises `StructuredOutputError` (carrying raw_output) on JSON parse OR
+    Pydantic validation failure so callers can run a repair loop.
+
+    Pass ``prompt_override`` to bypass ``agent.render`` (used by the structured
+    output repair wrapper to inject error feedback + JSON schema reminders).
     """
     if _is_cancelled(cancel_token):
         raise TaskCancelledError("Agent run cancelled before inference")
 
     agent = get_agent(agent_id)
-    prompt = agent.render(raw_input)
+    prompt = prompt_override if prompt_override is not None else agent.render(raw_input)
 
     runtime_cfg = runtime or {}
-    # Omit max_tokens for local MLX: backend applies a large ceiling (no practical cap).
-    if "max_tokens" in runtime_cfg and runtime_cfg["max_tokens"] is not None:
-        max_tokens = int(runtime_cfg["max_tokens"])
+    # Token budget resolution:
+    # - AgentSpec.max_output_tokens is the authoritative *ceiling* per agent.
+    # - The chain DSL may pass a runtime max_tokens that is smaller (tighter
+    #   for a particular call site).  We always take the smaller value so
+    #   neither layer can accidentally let a local quant model run away on
+    #   a classification-shaped prompt (see judge_v1 over-thinking incident).
+    spec_cap = int(agent.max_output_tokens)
+    chain_max = runtime_cfg.get("max_tokens")
+    if chain_max is None:
+        max_tokens: Optional[int] = spec_cap
     else:
-        max_tokens = None
+        max_tokens = min(int(chain_max), spec_cap)
     temperature = float(runtime_cfg.get("temperature") or 0.0)
 
     # Build backend config: merge agent-level hint (backend_type) with any
@@ -187,6 +276,7 @@ def run_agent(
                 parse_exc = None
 
     if parse_exc is not None:
+        truncated = _looks_truncated(raw=raw, max_tokens=max_tokens, error_message=str(parse_exc))
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,
@@ -196,11 +286,18 @@ def run_agent(
                 data=_trace_payload(
                     error=str(parse_exc),
                     parsed_output=None,
+                    truncated=truncated,
                 ),
                 trace_id=trace_id,
                 dag_id=dag_id,
             )
-        raise parse_exc
+        raise StructuredOutputError(
+            message=str(parse_exc),
+            raw_output=raw,
+            agent_id=agent_id,
+            kind="parse",
+            truncated=truncated,
+        ) from parse_exc
 
     assert data is not None
 
@@ -209,6 +306,9 @@ def run_agent(
         typed = output_model.model_validate(data)
         result = typed.model_dump()
     except Exception as exc:
+        # Validation errors on a fully-parsed object are NOT truncation: we
+        # got a valid JSON back, it just didn't match the schema. Only flag
+        # truncation for parse-time failures.
         if _llm_trace_enabled():
             log_event(
                 run_id=run_id_log,
@@ -222,7 +322,9 @@ def run_agent(
                 trace_id=trace_id,
                 dag_id=dag_id,
             )
-        raise
+        raise StructuredOutputError(
+            message=str(exc), raw_output=raw, agent_id=agent_id, kind="validate", truncated=False
+        ) from exc
 
     if _llm_trace_enabled():
         parsed_json: Optional[str] = None

@@ -193,3 +193,98 @@ class TypeCheckerAgentOutput(BaseModel):
     summary: str = ""
     type_health: str = "clean"
 
+
+# ---------------------------------------------------------
+# Retry-loop agents (memory_summarizer_v1, supreme_court_v1)
+# ---------------------------------------------------------
+class AttemptRecord(BaseModel):
+    """Single coder→judge attempt snapshot fed into retry-aware agents."""
+
+    attempt_n: int = Field(description="1-based attempt index")
+    judge_verdict: str = Field(description='"PASS" or "FAIL"')
+    justification: str = Field(description="Judge's one-line justification for the verdict")
+    diff_summary: str = Field(
+        default="",
+        description="Short, human-readable description of what this attempt changed (NOT the full diff)",
+    )
+    static_errors: List[str] = Field(
+        default_factory=list,
+        description="Non-LLM static-check findings observed on this attempt (lint, syntax, security)",
+    )
+
+
+class MemorySummarizerInput(BaseModel):
+    """Context for ``memory_summarizer_v1``: fuse this task's attempts with similar past episodes."""
+
+    task_intent: str
+    target_file: str
+    acceptance_criteria: str
+    attempts: List[AttemptRecord] = Field(description="All coder→judge attempts observed so far for this task")
+    similar_past_episodes: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description='Up to top_k similar resolved error/fix pairs retrieved from MemoryStore. Each dict has keys "error_text" and "resolution".',
+    )
+
+
+class MemorySummarizerOutput(BaseModel):
+    """Structured hint that replaces raw judge justification in ``state.feedback`` for the next retry."""
+
+    model_config = ConfigDict(extra="allow")
+
+    root_cause_hypothesis: str = Field(
+        description="One-sentence hypothesis of why the previous attempts failed"
+    )
+    actionable_hint: str = Field(
+        description="Concrete, specific direction for the next coder attempt (e.g. 'use X, not Y, because Z')"
+    )
+    anti_patterns_to_avoid: List[str] = Field(
+        default_factory=list,
+        description="Specific approaches that previous attempts tried and that the next attempt must NOT repeat",
+    )
+
+
+class SupremeCourtInput(BaseModel):
+    """Context for ``supreme_court_v1``: the full retry transcript after ``max_retries`` is exhausted."""
+
+    task_intent: str
+    target_file: str
+    acceptance_criteria: str
+    final_git_diff: str = Field(
+        default="",
+        description="Unified git diff representing the current workspace state after the last attempt",
+    )
+    attempts: List[AttemptRecord]
+    final_judge_verdict: Dict[str, Any] = Field(
+        description="The final judge_response dict (verdict + justification + problematic_lines)"
+    )
+    static_check_summary: str = Field(
+        default="",
+        description="Short human-readable summary of the last attempt's static-check status",
+    )
+
+
+class SupremeCourtOutput(BaseModel):
+    """Arbitration ruling. The verification loop maps this to PASSED / BLOCKED / human escalation."""
+
+    model_config = ConfigDict(extra="allow")
+
+    ruling: str = Field(
+        description='One of "PASS_OVERRIDE" (judge was wrong, accept the change), "CONFIRM_BLOCKED" (retries truly failed), "ESCALATE_HUMAN" (ambiguous; needs review)'
+    )
+    justification: str = Field(description="One-paragraph reasoning for the ruling")
+    evidence: List[str] = Field(
+        default_factory=list,
+        description="Specific, concrete points from the transcript that support the ruling",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_ruling(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        r = str(out.get("ruling") or "").strip().upper().replace("-", "_").replace(" ", "_")
+        allowed = {"PASS_OVERRIDE", "CONFIRM_BLOCKED", "ESCALATE_HUMAN"}
+        out["ruling"] = r if r in allowed else "CONFIRM_BLOCKED"
+        return out
+

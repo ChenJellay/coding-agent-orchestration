@@ -95,6 +95,19 @@ def test_compile_succeeds_on_first_attempt(tmp_path):
     assert "N1" in spec.nodes
 
 
+def test_caller_dag_id_overrides_llm_dag_id(tmp_path):
+    """Dashboard/CLI dag_id must not lose to an optional id emitted inside LLM JSON."""
+    with patch("agenti_helix.orchestration.intent_compiler.run_chain", side_effect=_valid_chain_output(tmp_path)):
+        spec = compile_macro_intent_with_llm(
+            "add a test",
+            repo_path=str(tmp_path),
+            dag_id="dag-ui-run-fixed",
+        )
+
+    assert spec.dag_id == "dag-ui-run-fixed"
+    assert spec.nodes["N1"].task.task_id.startswith("dag-ui-run-fixed:")
+
+
 def test_compile_raises_after_max_retries_empty_nodes(tmp_path):
     """Should raise ValueError when all attempts return empty nodes."""
     def bad_chain(*, chain_spec, initial_context, **kwargs):

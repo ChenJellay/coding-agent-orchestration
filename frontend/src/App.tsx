@@ -159,22 +159,47 @@ function DashboardPage() {
   const [busy, setBusy] = useState(false)
 
   const [executionMode, setExecutionMode] = useState<ExecutionMode | 'orchestrator'>('patch')
-  const [extras, setExtras] = useState<ExecutionExtras>({ doc: false, diff_gate: false, lint_type: false })
-  // RunPlan presets: "quick" = patch, "tdd" = build + doc + diff_gate. Anything
-  // else (custom radios / extras combos) shows up as "custom".
+  const [extras, setExtras] = useState<ExecutionExtras>({
+    doc: false,
+    diff_gate: false,
+    lint_type: false,
+    memory_summarizer: false,
+    supreme_court: false,
+  })
+  // RunPlan presets:
+  //   "quick"        = patch, no extras.
+  //   "tdd"          = build + doc + diff_gate (classic full pipeline).
+  //   "deliberative" = patch + memory_summarizer + supreme_court (retry-aware).
+  // Anything else is "custom".
   const [advancedOpen, setAdvancedOpen] = useState(false)
-  const activePreset: 'quick' | 'tdd' | 'custom' = useMemo(() => {
-    if (executionMode === 'patch' && !extras.doc && !extras.diff_gate && !extras.lint_type) return 'quick'
-    if (executionMode === 'build' && extras.doc && extras.diff_gate && !extras.lint_type) return 'tdd'
+  const activePreset: 'quick' | 'tdd' | 'deliberative' | 'custom' = useMemo(() => {
+    const noExtras = !extras.doc && !extras.diff_gate && !extras.lint_type
+    const noRetry = !extras.memory_summarizer && !extras.supreme_court
+    if (executionMode === 'patch' && noExtras && noRetry) return 'quick'
+    if (
+      executionMode === 'build' &&
+      extras.doc && extras.diff_gate && !extras.lint_type && noRetry
+    )
+      return 'tdd'
+    if (
+      executionMode === 'patch' &&
+      noExtras &&
+      extras.memory_summarizer &&
+      extras.supreme_court
+    )
+      return 'deliberative'
     return 'custom'
   }, [executionMode, extras])
-  function applyPreset(p: 'quick' | 'tdd') {
+  function applyPreset(p: 'quick' | 'tdd' | 'deliberative') {
     if (p === 'quick') {
       setExecutionMode('patch')
-      setExtras({ doc: false, diff_gate: false, lint_type: false })
-    } else {
+      setExtras({ doc: false, diff_gate: false, lint_type: false, memory_summarizer: false, supreme_court: false })
+    } else if (p === 'tdd') {
       setExecutionMode('build')
-      setExtras({ doc: true, diff_gate: true, lint_type: false })
+      setExtras({ doc: true, diff_gate: true, lint_type: false, memory_summarizer: false, supreme_court: false })
+    } else {
+      setExecutionMode('patch')
+      setExtras({ doc: false, diff_gate: false, lint_type: false, memory_summarizer: true, supreme_court: true })
     }
   }
 
@@ -501,7 +526,13 @@ function DashboardPage() {
                     label: 'Full TDD',
                     desc: 'Doc-first → librarian → sdet → coder_builder → diff gate → judge_evaluator.',
                   },
-                ] as { id: 'quick' | 'tdd'; label: string; desc: string }[]
+                  {
+                    id: 'deliberative' as const,
+                    label: 'Deliberative',
+                    desc:
+                      'Patch pipeline + memory_summarizer between retries + supreme_court final arbitration. Use for flaky tasks.',
+                  },
+                ] as { id: 'quick' | 'tdd' | 'deliberative'; label: string; desc: string }[]
               ).map((opt) => (
                 <button
                   key={opt.id}
@@ -580,6 +611,18 @@ function DashboardPage() {
                         id: 'lint_type' as const,
                         label: 'lint_type_gate',
                         desc: 'Run linter_v1 + type_checker_v1; fold findings into the judge. Build only.',
+                      },
+                      {
+                        id: 'memory_summarizer' as const,
+                        label: 'memory_summarizer',
+                        desc:
+                          'Between retries, swap raw judge justification for a focused hint synthesised from attempt history + similar past episodes.',
+                      },
+                      {
+                        id: 'supreme_court' as const,
+                        label: 'supreme_court',
+                        desc:
+                          'After retries are exhausted, arbitrate: PASS_OVERRIDE promotes to PASSED; ESCALATE_HUMAN flags for human review; CONFIRM_BLOCKED is the default.',
                       },
                     ] as { id: keyof ExecutionExtras; label: string; desc: string }[]
                   ).map((opt) => (
@@ -1765,17 +1808,18 @@ function TaskInterventionPage() {
             }}
           />
           <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-            <a
+            <button
+              type="button"
               className="pill"
-              href="#"
-              onClick={(e) => {
-                e.preventDefault()
+              disabled={busy}
+              title="POST /api/tasks/apply-and-rerun — schedules rollback to this checkpoint and re-runs verification"
+              onClick={() => {
                 if (busy) return
                 void handleApplyAndRerun()
               }}
             >
-              Apply + re-run
-            </a>
+              {busy ? 'Scheduling…' : 'Apply + re-run'}
+            </button>
           </div>
         </section>
       </div>
@@ -1905,6 +1949,7 @@ function SignoffTripanePage() {
       setActionError('No verified checkpoint available yet for merge.')
       return
     }
+    if (!featureId) return
     setActionError(null)
     setBusy(true)
     try {
@@ -1914,6 +1959,12 @@ function SignoffTripanePage() {
         target_branch: 'main',
         commit_message: 'Merge verified checkpoint',
       })
+      const [f, ev] = await Promise.all([
+        fetchFeature(featureId),
+        fetchEvents({ runId: featureId, limit: 5000 }),
+      ])
+      setFeature(f)
+      setEvents(ev)
       setMergeCelebration(true)
       if (mergeCelebrationTimerRef.current != null) window.clearTimeout(mergeCelebrationTimerRef.current)
       mergeCelebrationTimerRef.current = window.setTimeout(() => {
@@ -1964,23 +2015,33 @@ function SignoffTripanePage() {
           >
             Back to DAG
           </a>
-          <a
+          <button
+            type="button"
             className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
+            disabled={busy || !pendingSignoff}
+            title={
+              pendingSignoff
+                ? 'POST signoff-apply, then POST /api/dags/{dag_id}/resume'
+                : 'No PASSED_PENDING_SIGNOFF checkpoint for an AWAITING_SIGNOFF node'
+            }
+            onClick={() => {
+              if (busy || !pendingSignoff) return
               void handleApplySignoff()
             }}
           >
             {busy ? 'Working…' : 'Sign off on changes'}
-          </a>
-          <a
+          </button>
+          <button
+            type="button"
             className="pill"
-            href="#"
-            onClick={(e) => {
-              e.preventDefault()
-              if (busy) return
+            disabled={busy || !mergeCandidate}
+            title={
+              mergeCandidate
+                ? 'POST /api/tasks/merge — materialize PASSED checkpoint and commit to main'
+                : 'No PASSED checkpoint available to merge yet'
+            }
+            onClick={() => {
+              if (busy || !mergeCandidate) return
               void handleMergeToMain()
             }}
             style={{
@@ -1990,7 +2051,7 @@ function SignoffTripanePage() {
             }}
           >
             Merge to main
-          </a>
+          </button>
         </div>
       </div>
 
@@ -2156,6 +2217,7 @@ function SignoffDiffBlock({
 
         let pending: { checkpoint: Checkpoint; nodeId: string } | null = null
         let mergeEligible: Checkpoint | null = null
+        let mergeEligibleTs = -1
         const latestPerNode: Array<{ nodeId: string; cp: Checkpoint }> = []
 
         for (const [nodeId, n] of ordered.slice(0, 12)) {
@@ -2165,8 +2227,12 @@ function SignoffDiffBlock({
             if (_checkpointIsPendingSignoff(c) && !pending) {
               pending = { checkpoint: c, nodeId }
             }
-            if (c.status === 'PASSED' && !mergeEligible) {
-              mergeEligible = c
+            if (c.status === 'PASSED') {
+              const ts = Number(c.updated_at ?? c.created_at ?? 0)
+              if (ts > mergeEligibleTs) {
+                mergeEligibleTs = ts
+                mergeEligible = c
+              }
             }
           }
         }

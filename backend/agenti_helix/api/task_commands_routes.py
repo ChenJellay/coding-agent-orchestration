@@ -314,6 +314,20 @@ class ExecutionExtras(BaseModel):
         default=False,
         description="Run the linter + type_checker agents and fold their findings into the judge prompt.",
     )
+    memory_summarizer: bool = Field(
+        default=False,
+        description=(
+            "Before each retry, replace raw judge justification with a focused hint synthesised by "
+            "memory_summarizer_v1 from attempt history + similar past episodes."
+        ),
+    )
+    supreme_court: bool = Field(
+        default=False,
+        description=(
+            "After retries are exhausted, invoke supreme_court_v1 to arbitrate: PASS_OVERRIDE promotes "
+            "to PASSED; ESCALATE_HUMAN marks BLOCKED with human_review_required; CONFIRM_BLOCKED is the default."
+        ),
+    )
 
 
 # Reverse map: a RunPlan tuple → the legacy pipeline_mode string EditTaskSpec uses.
@@ -673,6 +687,16 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
             for node in spec.nodes.values():
                 node.task.pipeline_mode = _pipeline_mode
 
+        # Retry-loop opt-ins are orthogonal to pipeline_mode (they govern the
+        # loop's behaviour *after* per-attempt judge returns, not the coder
+        # chain). Apply unconditionally when enabled in extras.
+        if body.extras.memory_summarizer or body.extras.supreme_court:
+            for node in spec.nodes.values():
+                if body.extras.memory_summarizer:
+                    node.task.enable_memory_summarizer = True
+                if body.extras.supreme_court:
+                    node.task.enable_supreme_court = True
+
         persist_dag_spec(spec)
         invalidate_features_and_triage_caches()
         execute_dag(spec)
@@ -938,6 +962,8 @@ def merge_task_to_main(body: MergeRequestBody, _role: Role = Depends(require_edi
         message=f"Merged to main{simulated_note}",
         data={"task_id": body.task_id, "checkpoint_id": body.checkpoint_id, "mergeRef": merge_ref, "sha": commit_result.get("sha")},
     )
+
+    invalidate_features_and_triage_caches()
 
     return {"ok": True, "mergeRef": merge_ref, "sha": commit_result.get("sha"), "simulated": commit_result.get("simulated", True)}
 

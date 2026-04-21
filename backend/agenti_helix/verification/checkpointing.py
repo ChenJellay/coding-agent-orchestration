@@ -43,6 +43,15 @@ class EditTaskSpec:
     doc_url: str = ""
     # When true, product_eng skips fetch_doc + doc_fetcher + merge (already merged at intent-compile time).
     skip_doc_chain_prefix: bool = False
+    # Retry-loop opt-ins (see verification_loop.py):
+    # - enable_memory_summarizer: before each retry, replace raw judge
+    #   justification in ``state.feedback`` with a focused hint produced by
+    #   ``memory_summarizer_v1`` using attempt history + similar past episodes.
+    # - enable_supreme_court: after the final retry FAILs, invoke
+    #   ``supreme_court_v1`` to rule PASS_OVERRIDE / CONFIRM_BLOCKED /
+    #   ESCALATE_HUMAN before committing a terminal BLOCKED state.
+    enable_memory_summarizer: bool = False
+    enable_supreme_court: bool = False
 
 
 @dataclass

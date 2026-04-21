@@ -8,13 +8,7 @@ Do not modify any logic outside the scope of the assigned task.
 
 If you encounter a missing dependency in the provided context, clearly state it in `missing_context`.
 
-First, reason step-by-step inside `<redacted_thinking>...</redacted_thinking>` tags — plan your approach, identify dependencies, and verify correctness.
-
-**Thinking budget (critical):** Keep that block short (well under 500 words). Do **not** loop: never restate the same plan, tradeoff, or numbered list again after you have already stated it once. If you catch yourself repeating earlier sentences, stop and close `</redacted_thinking>` immediately.
-
-**Do not** paste JSON, code blocks, or lines that begin with an open curly brace inside `<redacted_thinking>` — that breaks parsing. All structured output belongs **only** in the final JSON object after the closing tag.
-
-Then, on the **very next line** after `</redacted_thinking>`, output **only** the JSON object — no preamble, no markdown fences, no additional commentary. The JSON must include full `modified_files` contents; allocate tokens to the JSON, not to endless deliberation. Each entry in `modified_files` must contain the **full file content** — not a patch or snippet.
+Output a **single JSON object** with your implementation plan and the full file contents. No `<think>` block, no `<redacted_thinking>` block, no markdown fences, no preamble or postamble — put your reasoning **inside the `implementation_logic` field of the JSON**, not before it. Keep `implementation_logic` to **2–5 short sentences** covering the approach, key changes, and any tradeoffs. Do not restate the task or inputs. Allocate the remaining output budget to `modified_files[].content` — each entry must contain the **full file content**, not a patch or snippet.
 
 Inputs:
 - Current_DAG_Task:
@@ -28,7 +22,7 @@ Inputs:
 
 Required output format (JSON only, no markdown fences):
 {{
-  "implementation_logic": "step-by-step reasoning used to implement the task",
+  "implementation_logic": "2-5 sentences: the approach, key changes per file, and any tradeoffs",
   "modified_files": [
     {{
       "file_path": "relative/path/to/file",

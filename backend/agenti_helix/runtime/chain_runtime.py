@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from agenti_helix.api.job_registry import TaskCancelledError
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.agent_runtime import run_agent
+from agenti_helix.runtime.structured_output import is_structured_agent, run_agent_structured
 from agenti_helix.runtime.tools import TOOL_REGISTRY
 
 
@@ -145,7 +146,8 @@ def run_chain(
                 v = ctx.get(key)
                 if isinstance(v, str) and v:
                     observe[key] = v
-            out = run_agent(
+            agent_caller = run_agent_structured if is_structured_agent(agent_id) else run_agent
+            out = agent_caller(
                 agent_id=agent_id,
                 raw_input=bound_inputs,
                 runtime=runtime,

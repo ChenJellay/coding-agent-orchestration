@@ -1,0 +1,26 @@
+{
+  "dag_id": "eval-s3-supreme",
+  "macro_intent": "Eval S3: contradictory criteria to exhaust judge retries then supreme_court_v1.",
+  "user_intent_label": "Eval S3 supreme court",
+  "nodes": {
+    "N1": {
+      "node_id": "N1",
+      "description": "Forced judge disagreement then SC arbitration.",
+      "task": {
+        "task_id": "eval-s3-supreme:N1",
+        "intent": "Change the header button background color in src/components/header.js to #2563eb (blue).",
+        "target_file": "src/components/header.js",
+        "acceptance_criteria": "The header button MUST remain #22c55e (green); blue is forbidden.",
+        "repo_path": "__REPO_ROOT__",
+        "coder_chain": null,
+        "judge_chain": null,
+        "pipeline_mode": "patch",
+        "doc_url": "",
+        "skip_doc_chain_prefix": false,
+        "enable_memory_summarizer": false,
+        "enable_supreme_court": true
+      }
+    }
+  },
+  "edges": []
+}

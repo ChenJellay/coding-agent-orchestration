@@ -35,9 +35,7 @@ acceptance_criteria:  {acceptance_criteria}
    - `structural` — errors require changing an interface or type contract that other code depends on (risky, flag for human review).
 
 ## Output
-First, reason step-by-step inside `<think>...</think>` tags — classify each error and plan concrete fixes.
-
-Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
+Respond with **only** a JSON object — no `<think>` block, no prose, no markdown fences. Put any reasoning into the `summary` field of the JSON, not before it.
 
 ```json
 {{

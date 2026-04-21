@@ -6,9 +6,7 @@ Be surgically precise. Do not retrieve files unless they are absolutely necessar
 
 If the task requires creating a new file, specify the exact path where it should be created based on the project's architecture.
 
-First, reason step-by-step inside `<think>...</think>` tags — trace the dependency graph and identify exactly what the coder will need.
-
-Then, after `</think>`, output a single JSON object with your search strategy and the array of required files.
+Output a **single JSON object** with your search strategy and the array of required files. No `<think>` block, no markdown fences, no preamble — put your reasoning into the `search_strategy` field of the JSON, not before it.
 
 Inputs:
 - Current_DAG_Task:

@@ -12,9 +12,7 @@ Rules (apply in order; prefer user-visible outcomes over rigid test scripts):
 
 **Feedback:** When failing, give specific, actionable `feedback_for_coder`. Do not write full code for them.
 
-First, reason step-by-step inside `<think>...</think>` tags — analyse the test output and diff against the **original task** and acceptance criteria, not only the test file's expectations.
-
-Then, after `</think>`, output a single JSON object with your evaluation reasoning, the boolean result, and feedback.
+Output a **single JSON object** with your evaluation reasoning, the boolean result, and feedback. No `<think>` block, no markdown fences, no preamble — put your reasoning inside the `evaluation_reasoning` field of the JSON, not before it.
 
 Inputs:
 - Original_DAG_Task:
