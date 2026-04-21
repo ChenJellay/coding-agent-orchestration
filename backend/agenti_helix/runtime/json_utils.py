@@ -21,12 +21,87 @@ except ImportError:
 # Qwen3 and similar reasoning models emit a <think>…</think> block before
 # the actual answer.  We strip these so the JSON extractor sees only the
 # final structured output.  Handles multiline and multiple blocks.
-_THINK_RE = re.compile(r"<redacted_thinking>.*?</redacted_thinking>", re.DOTALL)
+_THINK_RE = re.compile(
+    r"<redacted_thinking>.*?</(?:redacted_thinking|redacted_thicked_thinking)>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def strip_thinking_blocks(raw: str) -> str:
     """Remove all ``<think>…</think>`` sections from model output."""
     return _THINK_RE.sub("", raw).strip()
+
+
+def strip_markdown_json_fences(raw: str) -> str:
+    """
+    If the model wrapped JSON in markdown code fences (`` ```json `` … `` ``` ``),
+    return the inner payload. Otherwise return ``raw`` unchanged.
+
+    Many models ignore "no markdown" instructions; stripping fences avoids
+    ``raw_decode`` failing on leading backticks or a spurious ``{`` inside the fence line.
+    """
+    s = raw.strip()
+    # Require ``json`` on the opening fence so we don't strip unrelated ``` code blocks.
+    # Opening may be followed by newline or immediately by `{` (some models omit the blank line).
+    start_m = re.search(r"```(?:json|JSON)\s*\r?\n?", s)
+    if not start_m:
+        return raw
+    body = s[start_m.end() :]
+    end_m = re.search(r"\r?\n```", body)
+    if end_m:
+        return body[: end_m.start()].strip()
+    if body.rstrip().endswith("```"):
+        return body[: body.rfind("```")].strip()
+    return body.strip()
+
+
+def _has_unclosed_redacted_thinking(raw: str) -> bool:
+    """True when an opening ``<redacted_thinking>`` exists but no ``</redacted_think...>`` closes it."""
+    if not re.search(r"<redacted_thinking\b", raw, re.IGNORECASE):
+        return False
+    return not re.search(r"</redacted_think", raw, re.IGNORECASE)
+
+
+def _slice_from_likely_json_object(raw: str) -> str:
+    """
+    When the model interleaves prose with JSON, find a plausible outer object by
+    anchoring on known top-level keys (coder, SDET, librarian, etc.) and taking
+    the nearest preceding ``{``.  Falls back to ``raw`` if no anchor matches.
+    """
+    anchors = (
+        '"implementation_logic"',
+        '"modified_files"',
+        '"test_files"',
+        '"testing_strategy"',
+        '"search_strategy"',
+        '"required_files"',
+        '"dag_id"',
+    )
+    best: int | None = None
+    for a in anchors:
+        i = raw.find(a)
+        if i != -1 and (best is None or i < best):
+            best = i
+    if best is None:
+        return raw
+    brace = raw.rfind("{", 0, best)
+    if brace == -1:
+        return raw
+    return raw[brace:]
+
+
+def _prepare_model_output_for_json(raw: str) -> str:
+    """
+    Normalize model output before JSON extraction: unclosed thinking blocks,
+    standard thinking strips, markdown fences, chat suffixes.
+    """
+    r = raw
+    if _has_unclosed_redacted_thinking(r):
+        r = _slice_from_likely_json_object(r)
+    r = strip_thinking_blocks(r)
+    r = strip_markdown_json_fences(r)
+    r = strip_model_chat_suffixes(r)
+    return r
 
 
 def strip_model_chat_suffixes(raw: str) -> str:
@@ -150,8 +225,7 @@ def try_fallback_snippet_judge_dict(raw: str) -> Dict[str, Any] | None:
     because ``justification`` contains unescaped ``"`` (e.g. code like ``"purple"``),
     which breaks ``json.loads`` / json5 and yields errors like ``Unexpected \"\"\"``.
     """
-    cleaned = strip_thinking_blocks(raw)
-    cleaned = strip_model_chat_suffixes(cleaned)
+    cleaned = _prepare_model_output_for_json(raw)
     verdict_m = re.search(r'"verdict"\s*:\s*"(PASS|FAIL)"', cleaned, re.I)
     if not verdict_m:
         return None
@@ -220,34 +294,41 @@ def try_fallback_snippet_judge_dict(raw: str) -> Dict[str, Any] | None:
     }
 
 
-def extract_first_json_object(raw: str) -> Dict[str, Any]:
+def _try_multi_brace_decode(cleaned: str, *, max_starts: int = 32) -> Dict[str, Any] | None:
     """
-    Extract and parse the first top-level JSON object from a model response.
-
-    Many local models emit surrounding text; we recover by locating the first '{'
-    and matching braces to the corresponding closing '}'.
-
-    **Thinking support**: if the model output contains ``<think>…</think>``
-    blocks (Qwen3, DeepSeek-R1, etc.), they are stripped before extraction
-    so that reasoning text doesn't interfere with brace matching.
-
-    This implementation is string-aware: braces inside JSON string literals
-    (delimited by `"`) are ignored.  Backslash-escaped quotes (`\\"`) inside
-    strings are handled correctly so that code containing braces in
-    replacementLines (JSX `style={{}}`, function bodies, etc.) does not
-    confuse the brace counter.
+    Try ``JSONDecoder().raw_decode`` (and loose parse) at each ``{`` position.
+    Helps when the first ``{`` is inside prose or a nested snippet, not the real object.
     """
-    # Strip thinking blocks first so reasoning prose doesn't confuse
-    # brace counting (thinking blocks often contain code snippets with braces).
-    cleaned = strip_thinking_blocks(raw)
-    cleaned = strip_model_chat_suffixes(cleaned)
+    pos = 0
+    n = 0
+    while n < max_starts:
+        start = cleaned.find("{", pos)
+        if start == -1:
+            break
+        n += 1
+        try:
+            obj, _end = JSONDecoder().raw_decode(cleaned, start)
+            if isinstance(obj, dict) and obj:
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            tail = cleaned[start:].strip()
+            obj = _parse_json_fragment_loose(tail)
+            if isinstance(obj, dict) and obj:
+                return obj
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        pos = start + 1
+    return None
 
+
+def _try_parse_single_cleaned(cleaned: str) -> Dict[str, Any] | None:
+    """Return a dict if any strategy succeeds; otherwise None."""
     start = cleaned.find("{")
     if start == -1:
-        raise ValueError("Model output did not contain a JSON object (no '{' found).")
+        return None
 
-    # Prefer the stdlib decoder: parses the first complete JSON value from `start`
-    # and ignores trailing prose (models often append extra text after the object).
     try:
         obj, _end = JSONDecoder().raw_decode(cleaned, start)
         if isinstance(obj, dict):
@@ -255,7 +336,6 @@ def extract_first_json_object(raw: str) -> Dict[str, Any]:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Try tolerant parse on the full tail (trailing commas / json5) before brace matching.
     tail = cleaned[start:].strip()
     try:
         return _parse_json_fragment_loose(tail)
@@ -271,7 +351,6 @@ def extract_first_json_object(raw: str) -> Dict[str, Any]:
 
         if in_string:
             if ch == "\\" and i + 1 < len(cleaned):
-                # Skip the escaped character (e.g. \", \\, \n).
                 i += 2
                 continue
             if ch == '"':
@@ -290,10 +369,58 @@ def extract_first_json_object(raw: str) -> Dict[str, Any]:
         i += 1
 
     if end is None:
-        raise ValueError("Model output appears to start a JSON object but never closes it.")
+        return None
 
     fragment = cleaned[start : end + 1]
-    return _parse_json_fragment_loose(fragment)
+    try:
+        return _parse_json_fragment_loose(fragment)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def extract_first_json_object(raw: str) -> Dict[str, Any]:
+    """
+    Extract and parse the first top-level JSON object from a model response.
+
+    Many local models emit surrounding text; we recover by locating the first '{'
+    and matching braces to the corresponding closing '}'.
+
+    **Thinking support**: if the model output contains ``<think>…</think>``
+    blocks (Qwen3, DeepSeek-R1, etc.), they are stripped before extraction
+    so that reasoning text doesn't interfere with brace matching.
+
+    **Infrastructure**: unclosed thinking blocks, anchor-based slicing on known keys,
+    and multi-brace decode reduce parse failures from long reasoning or preamble.
+
+    This implementation is string-aware: braces inside JSON string literals
+    (delimited by `"`) are ignored.  Backslash-escaped quotes (`\\"`) inside
+    strings are handled correctly so that code containing braces in
+    replacementLines (JSX `style={{}}`, function bodies, etc.) does not
+    confuse the brace counter.
+    """
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def _add(s: str) -> None:
+        if s not in seen:
+            seen.add(s)
+            candidates.append(s)
+
+    _add(_prepare_model_output_for_json(raw))
+    _add(_prepare_model_output_for_json(_slice_from_likely_json_object(raw)))
+
+    last_err = "Model output did not contain a JSON object (no '{' found)."
+    for cleaned in candidates:
+        got = _try_parse_single_cleaned(cleaned)
+        if got is not None:
+            return got
+        got = _try_multi_brace_decode(cleaned)
+        if got is not None:
+            return got
+        if cleaned.find("{") != -1:
+            last_err = "Model output appears to start a JSON object but never closes it."
+
+    raise ValueError(last_err)
 
 
 def extract_json_dict_prefer_markdown_fences(raw: str) -> Dict[str, Any]:

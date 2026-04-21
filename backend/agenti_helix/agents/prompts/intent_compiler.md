@@ -32,9 +32,15 @@ Judge-side agents (evaluate the diff):
 
 ## Rules
 
-**Scope constraint:** Your DAG must contain ONLY the tasks explicitly required by the macro intent above. Do not add tasks for files, features, buttons, integrations, or modifications to files not mentioned by the user. Err on the side of fewer, more targeted tasks. If in doubt, leave it out.
+**Decomposition (critical):** Prefer **several small nodes** over one large node. For a non-trivial feature, aim for **3–7 nodes** unless the repo map clearly supports a smaller plan. Each node must be **one verifiable slice**: one coherent change in **one primary file** (helpers only if unavoidable), with a **single clear outcome** (e.g. "header shows new copy", "tests cover X"). Do **not** pack an entire feature, refactor, and tests into a single node — that causes downstream coders to over-implement or miss the goal.
 
-Tasks must be granular and actionable (e.g., "Create API route", not "Build backend").
+**Ordering:** Put **foundational** work first (shared types, data shape, route shell) and **dependent** work later (UI that consumes the data). If the macro intent or repository map suggests a natural sequence (read path → write path → tests), encode that in `edges`.
+
+**Node descriptions:** Write **imperative, concrete** descriptions the coder can execute in one sitting (1–2 sentences). Mention the **primary file** by path when possible. Avoid vague titles like "Improve UX" or "Polish app".
+
+**Consistency:** `acceptance_criteria` must not contradict the macro intent. If the user asks to create a new file, add tests, or introduce new behaviour, your acceptance criteria must allow the files and changes required to satisfy that intent (do not forbid new files while also asking for a new file or for test coverage the repo does not yet have).
+
+**Acceptance criteria — keep them loose and outcome-focused:** Describe what the user should *observe* (UI, API response, file content goal), not how the code must be structured. Prefer one or two short sentences. Avoid micromanaging variable names, exact DOM structure, or implementation steps unless the user explicitly required them. Overly specific criteria invite brittle tests and false failures; the downstream judge will treat the **macro intent** as primary when criteria are ambiguous.
 
 Assign `pipeline_mode: "build"` when a task:
 - touches business logic or adds new behaviour
@@ -53,7 +59,7 @@ Use the provided Repository Map to accurately name the components that need modi
 
 The `target_file` for every node MUST be a *relative path* present in the Repository Map. If the user request mentions a file not in the Repository Map, add an early investigation node pointing at the closest existing file.
 
-You must think step-by-step before producing the DAG. Wrap your reasoning inside `<think>...</think>` tags. Then, after `</think>`, output the final DAG as a single JSON object exactly matching the required schema. Do not include any other text after `</think>` besides the JSON.
+Output the final DAG as a **single JSON object** exactly matching the required schema below. No `<think>` block, no markdown fences, no preamble. Allocate output tokens to the JSON, not to deliberation.
 
 ## Inputs
 
@@ -67,7 +73,7 @@ Repository Map (authoritative; do not contradict):
 
 ## Output Format
 
-After your `<think>...</think>` block, output the following JSON and nothing else (no markdown fences):
+Output the following JSON and nothing else (no markdown fences, no preamble, no commentary):
 
 {{
   "dag_id": "optional string",

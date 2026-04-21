@@ -44,6 +44,8 @@ class DagSpec:
     macro_intent: str
     nodes: Dict[str, DagNodeSpec] = field(default_factory=dict)
     edges: List[Tuple[str, str]] = field(default_factory=list)
+    # Short label for UI (dashboard command); may differ from macro_intent when docs were merged pre-compile.
+    user_intent_label: str = ""
 
 
 @dataclass
@@ -98,6 +100,7 @@ def persist_dag_spec(spec: DagSpec) -> None:
     data = {
         "dag_id": spec.dag_id,
         "macro_intent": spec.macro_intent,
+        "user_intent_label": getattr(spec, "user_intent_label", "") or "",
         "nodes": {
             node_id: {
                 "node_id": node.node_id,
@@ -211,6 +214,23 @@ def _initial_node_states_from_disk(spec: DagSpec) -> Dict[str, DagNodeExecutionS
     return out
 
 
+def _requeue_retryable_nodes(
+    node_states: Dict[str, DagNodeExecutionState],
+) -> list[str]:
+    """
+    New ``execute_dag`` invocations should retry nodes that failed or escalated on a
+    prior run. Persisted ``*_state.json`` otherwise leaves them ``FAILED``, and the
+    main loop would skip them forever (instant no-op DAG completion).
+    """
+    reset_ids: list[str] = []
+    for node_id, ns in node_states.items():
+        if ns.status in (DagNodeStatus.FAILED, DagNodeStatus.ESCALATED):
+            ns.status = DagNodeStatus.PENDING
+            ns.verification_status = None
+            reset_ids.append(node_id)
+    return reset_ids
+
+
 def execute_dag(spec: DagSpec) -> DagExecutionResult:
     """
     Execute a DAG by routing each node through the verification loop.
@@ -224,6 +244,18 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
     trace_id = str(uuid.uuid4())
 
     node_states = _initial_node_states_from_disk(spec)
+    requeued = _requeue_retryable_nodes(node_states)
+    if requeued:
+        log_event(
+            run_id=spec.dag_id,
+            hypothesis_id="dag_requeue",
+            location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+            message="Re-queued failed/escalated nodes for retry (persisted state from prior run)",
+            data={"dag_id": spec.dag_id, "node_ids": requeued},
+            trace_id=trace_id,
+            dag_id=spec.dag_id,
+        )
+        persist_dag_execution_state(spec.dag_id, node_states)
 
     order = _topological_order(spec)
     predecessors: Dict[str, Set[str]] = {node_id: set() for node_id in spec.nodes}
@@ -364,6 +396,7 @@ def load_dag_spec(dag_id: str) -> DagSpec:
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     macro_intent = str(raw.get("macro_intent") or "")
+    user_intent_label = str(raw.get("user_intent_label") or "")
     dag_identifier = str(raw.get("dag_id") or dag_id)
 
     nodes_out: Dict[str, DagNodeSpec] = {}
@@ -388,5 +421,11 @@ def load_dag_spec(dag_id: str) -> DagSpec:
             if isinstance(e, (list, tuple)) and len(e) == 2:
                 edges_out.append((str(e[0]), str(e[1])))
 
-    return DagSpec(dag_id=dag_identifier, macro_intent=macro_intent, nodes=nodes_out, edges=edges_out)
+    return DagSpec(
+        dag_id=dag_identifier,
+        macro_intent=macro_intent,
+        nodes=nodes_out,
+        edges=edges_out,
+        user_intent_label=user_intent_label,
+    )
 

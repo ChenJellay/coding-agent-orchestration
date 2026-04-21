@@ -1,24 +1,37 @@
+"""
+Verification loop — plain-Python implementation.
+
+This module replaces the previous LangGraph state-machine. The pipeline is
+straightforward enough to express as a single ``while`` loop, which makes
+control flow obvious and removes a heavy dependency (``langgraph`` + its
+async runtime) plus two roles that were never used in production
+(``memory_summarizer_v1`` and ``supreme_court_v1``).
+
+Public API kept stable:
+    - ``VerificationState`` (dataclass holding loop state, used by tests)
+    - ``run_verification_loop(task, cancel_token=None, ...) -> VerificationState``
+    - ``_run_static_checks`` and the individual ``_check_*`` helpers
+      (referenced from L3 / L4 unit tests)
+    - ``_paths_for_git_diff`` / ``_git_unified_diff_for_paths`` /
+      ``_tool_logs_with_git_unified_diff`` (used by sign-off + git unit tests)
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import py_compile
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langgraph.graph import END, StateGraph
-
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.chain_runtime import run_chain
-from agenti_helix.runtime.pipeline_presets import is_pipeline_preset
-# master_orchestrator is imported lazily inside node_run_coder / node_call_judge
-# to break the verification_loop ↔ orchestrator circular dependency.
-
 from agenti_helix.api.task_lookup import record_verification_cycle_snapshot
 from agenti_helix.memory.indexer import index_from_verification_state
+from agenti_helix.memory.store import MemoryStore, get_default_store
 
 from .checkpointing import (
     Checkpoint,
@@ -63,7 +76,7 @@ def _supreme_court_allowed_paths(*, repo_root: Path, task_target_file: str, patc
 
 @dataclass
 class VerificationState:
-    """Mutable state that flows through the LangGraph verification loop."""
+    """Mutable state carried through the verification loop."""
 
     task: EditTaskSpec
     checkpoint: Optional[Checkpoint] = None
@@ -77,17 +90,19 @@ class VerificationState:
     cancel_token: Any | None = None
     trace_id: Optional[str] = None
     dag_id: Optional[str] = None
+    # Ordered per-attempt snapshots used by ``memory_summarizer_v1`` and
+    # ``supreme_court_v1``. Each entry mirrors ``AttemptRecord`` (see
+    # agenti_helix.agents.models). Populated by the main loop right after
+    # each judge verdict resolves.
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    # Terminal arbitration output, if the supreme_court agent ran. Surfaced
+    # in the final checkpoint tool_logs so reviewers can see the ruling.
+    supreme_court_ruling: Optional[Dict[str, Any]] = None
 
-    # §4.3 — Context pruning
-    error_history: List[str] = field(default_factory=list)  # raw per-attempt errors (capped)
-    compressed_context: Optional[str] = None                # LLM-compressed scratchpad
 
-    # §4.4 — Supreme Court
-    supreme_court_invoked: bool = False
-
-    # §4.5 — Hybrid escalation
-    human_escalation_requested: bool = False
-    human_escalation_reason: str = ""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
     # §4.6 — Upstream context cache (librarian + SDET outputs).
     # Populated after the first successful chain run so that retries skip those
@@ -119,256 +134,131 @@ def _resolve_target_path(task: EditTaskSpec) -> Path:
 
 
 def _text_fingerprint(text: str) -> Dict[str, Any]:
-    """Stable, compact evidence for pre/post code comparisons (logged + merged into dag state)."""
     raw = text.encode("utf-8")
     return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
 
 
-def _requires_manual_signoff(task: EditTaskSpec) -> bool:
-    """
-    Whether the workspace should be rolled back and require explicit sign-off to apply changes.
-
-    - patch mode: always staged + rollback (historical behavior)
-    - build mode: also staged + rollback so code isn't written "for real" before review
-    """
-    mode = (getattr(task, "pipeline_mode", None) or "patch").lower()
-    return mode in ("patch", "build") or is_pipeline_preset(mode)
+def _patch_pipeline(task: EditTaskSpec) -> bool:
+    """Line-patch verification stages the post-state for manual sign-off."""
+    mode = getattr(task, "pipeline_mode", None) or "patch"
+    return mode in ("patch", "diff_guard_patch")
 
 
-def _restore_paths_from_snapshots(*, repo_root: Path, snapshots: Dict[str, Any]) -> None:
-    pre = snapshots.get("pre") if isinstance(snapshots, dict) else None
-    pre_meta = snapshots.get("pre_meta") if isinstance(snapshots, dict) else None
-    if not isinstance(pre, dict):
-        return
-    for rel_path, prior in pre.items():
-        if not isinstance(rel_path, str) or not rel_path:
-            continue
-        p = (repo_root / rel_path).resolve()
-        try:
-            # Only delete a file on rollback if we have explicit evidence it did not exist pre-run.
-            existed_pre = None
-            if isinstance(pre_meta, dict):
-                m = pre_meta.get(rel_path)
-                if isinstance(m, dict):
-                    existed_pre = m.get("existed")
-            if prior is None:
-                if existed_pre is False and p.exists():
-                    p.unlink()
-            elif isinstance(prior, str):
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(prior, encoding="utf-8")
-        except Exception:
-            continue
+# Cap embedded git diff in checkpoint JSON (UI / control plane).
+_MAX_GIT_UNIFIED_DIFF_CHARS = 512_000
 
 
-def node_take_pre_checkpoint(state: VerificationState) -> VerificationState:
-    if _is_cancelled(state.cancel_token):
-        return state
-    target_path = _resolve_target_path(state.task)
-    original = snapshot_file(target_path)
-    pre_state_ref = original
-    checkpoint = create_pre_checkpoint(state.task, pre_state_ref)
-    checkpoint.status = VerificationStatus.RUNNING
-    state.checkpoint = checkpoint
-    state.original_content = original
-    log_event(
-        run_id=state.task.task_id,
-        hypothesis_id="pre_checkpoint",
-        location="agenti_helix/verification/verification_loop.py:node_take_pre_checkpoint",
-        message="Created pre-checkpoint and captured original file snapshot",
-        data={
-            "task_id": state.task.task_id,
-            "target_file": state.task.target_file,
-            "checkpoint_id": checkpoint.checkpoint_id,
-            "pre_execution_fingerprint": _text_fingerprint(original),
-        },
-        trace_id=state.trace_id,
-        dag_id=state.dag_id,
-    )
-    record_verification_cycle_snapshot(
-        dag_id=state.dag_id,
-        task_id=state.task.task_id,
-        verification_cycle=state.retry_count + 1,
-        verification_status=VerificationStatus.RUNNING.value,
-        code_evidence={"pre_execution": _text_fingerprint(original)},
-    )
-    return state
+def _paths_for_git_diff(task: EditTaskSpec, diff_json: Optional[Dict[str, Any]]) -> List[str]:
+    """Repo-relative paths to include in a unified diff."""
+    paths: List[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        raw = raw.strip().replace("\\", "/")
+        if not raw or raw in seen or ".." in raw.split("/"):
+            return
+        seen.add(raw)
+        paths.append(raw)
+
+    if task.target_file:
+        add(str(task.target_file))
+    if not isinstance(diff_json, dict):
+        return paths
+    fp = diff_json.get("filePath")
+    if isinstance(fp, str):
+        add(fp)
+    for key in ("files_written", "test_file_paths"):
+        lst = diff_json.get(key)
+        if isinstance(lst, list):
+            for item in lst:
+                if isinstance(item, str):
+                    add(item)
+    return paths
 
 
-def _build_coder_intent(state: VerificationState) -> str:
-    """Build the full intent string for the coder, incorporating compressed context."""
-    intent = state.task.intent
-    parts: List[str] = [intent]
-
-    # §4.x — Repo reality injection (prevents language/tooling hallucinations).
-    repo_root = Path(state.task.repo_path).resolve()
-    has_tsconfig = any(repo_root.glob("tsconfig*.json"))
-    has_any_ts = any(repo_root.rglob("*.ts")) or any(repo_root.rglob("*.tsx"))
-    has_package_json = (repo_root / "package.json").exists()
-    # For demo-repo: default to JS-only when there's no TS signal.
-    if not has_tsconfig and not has_any_ts:
-        parts.append(
-            "\n\nRepository facts (ground truth):\n"
-            "- This repo is JavaScript-first. Do NOT create or reference TypeScript files (.ts/.tsx) and do NOT add tsconfig.\n"
-            "- Prefer .js/.jsx for React components and tests.\n"
-            f"- package.json present: {bool(has_package_json)} (if false, avoid inventing new test runner config files).\n"
-            "- For visual elements (icons, illustrations, images): use the simplest self-contained approach — an emoji character"
-            " (e.g. 🦆) or a short Unicode symbol inside a <span> or <div>. Only use inline SVG when the acceptance criteria"
-            " explicitly says 'SVG required'. Never hand-draw complex SVG shapes with many <path> coordinates; they produce"
-            " excessive tokens and break JSON output.\n"
-        )
-
-    # §4.3 — Prefer compressed context when available; fall back to raw feedback.
-    if state.compressed_context:
-        parts.append(f"\n\nCompressed context from previous attempts:\n{state.compressed_context}")
-    elif state.feedback:
-        # Cap raw feedback to avoid unbounded context growth.
-        raw = state.feedback
-        if len(raw) > DEFAULT_CONFIG.max_error_history_chars:
-            raw = raw[-DEFAULT_CONFIG.max_error_history_chars :]
-        parts.append(f"\n\nPrevious attempt feedback from Judge and tools:\n{raw}")
-
-    return "".join(parts)
-
-
-def node_run_coder(state: VerificationState) -> VerificationState:
-    if _is_cancelled(state.cancel_token):
-        if state.checkpoint is not None:
-            state.checkpoint.status = VerificationStatus.BLOCKED
-            save_checkpoint(state.checkpoint)
-        return state
-
-    cp_st = state.checkpoint.status.value if state.checkpoint else None
-    record_verification_cycle_snapshot(
-        dag_id=state.dag_id,
-        task_id=state.task.task_id,
-        verification_cycle=state.retry_count + 1,
-        verification_status=cp_st,
-    )
-
-    repo_root = Path(state.task.repo_path).resolve()
-    intent = _build_coder_intent(state)
-
-    # Keys produced by the librarian/SDET that are safe to reuse across coder retries.
-    _CACHEABLE_CTX_KEYS = (
-        "doc_context",
-        "doc_fetcher_output",
-        "task_input",
-        "ast_repo_map_ctx",
-        "librarian_output",
-        "file_contexts",
-        "sdet_output",
-    )
-
+def _git_unified_diff_for_paths(repo_root: Path, paths: List[str]) -> str:
+    """Best-effort unified diff (working tree vs HEAD for tracked, vs /dev/null for untracked)."""
+    if not paths:
+        return ""
+    repo_root = repo_root.resolve()
     try:
-        from agenti_helix.orchestration.master_orchestrator import resolve_coder_chain  # noqa: PLC0415
-        coder_chain = resolve_coder_chain(state.task)
-        ctx: Dict[str, Any] = {
-            "repo_root": repo_root,
-            "intent": intent,
-            "task_input": {
-                "intent": intent,
-                "acceptance_criteria": state.task.acceptance_criteria,
-            },
-            "target_file": state.task.target_file,
-            "acceptance_criteria": state.task.acceptance_criteria,
-            "repo_path": state.task.repo_path,
-            "checkpoint_id": state.checkpoint.checkpoint_id if state.checkpoint else "",
-            "task_id": state.task.task_id,
-            "dag_id": state.dag_id or "",
-            "attempt_count": state.retry_count + 1,
-            "error_history": list(state.error_history),
-            "patch_summaries": [],
-        }
-        # §4.6 — Pre-seed the chain context with cached upstream outputs so that
-        # steps marked `skip_if_present` are bypassed on retries.
-        if state.cached_chain_context:
-            for key in _CACHEABLE_CTX_KEYS:
-                if key in state.cached_chain_context:
-                    ctx[key] = state.cached_chain_context[key]
-        ctx = run_chain(
-            chain_spec=coder_chain,
-            initial_context=ctx,
-            cancel_token=state.cancel_token,
-            run_id=state.task.task_id,
-            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
-            location_prefix="agenti_helix/verification/verification_loop.py:node_run_coder",
+        probe = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        # §4.6 — Save upstream outputs after the first run so retries can skip them.
-        if state.cached_chain_context is None:
-            state.cached_chain_context = {
-                key: ctx[key] for key in _CACHEABLE_CTX_KEYS if key in ctx
-            }
+        if probe.returncode != 0 or (probe.stdout or "").strip().lower() != "true":
+            return ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
 
-        # §4.5 — Check if the coder requested human escalation via patch output field.
-        coder_patch = ctx.get("coder_patch") or {}
-        if isinstance(coder_patch, dict) and coder_patch.get("escalate_to_human"):
-            state.human_escalation_requested = True
-            state.human_escalation_reason = str(coder_patch.get("escalation_reason") or "Coder requested escalation")
-            log_event(
-                run_id=state.task.task_id,
-                hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
-                location="agenti_helix/verification/verification_loop.py:node_run_coder",
-                message="Coder raised escalation signal",
-                data={"task_id": state.task.task_id, "reason": state.human_escalation_reason},
-                trace_id=state.trace_id,
-                dag_id=state.dag_id,
+    chunks: List[str] = []
+    null_device = os.devnull
+    for rel in paths:
+        rel = rel.strip().replace("\\", "/")
+        if not rel or ".." in rel.split("/"):
+            continue
+        path = repo_root / rel
+        if not path.is_file():
+            continue
+        try:
+            ls = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--", rel],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-            return state
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        tracked = ls.returncode == 0
+        try:
+            if tracked:
+                diff = subprocess.run(
+                    ["git", "-C", str(repo_root), "diff", "--no-color", "HEAD", "--", rel],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            else:
+                diff = subprocess.run(
+                    ["git", "diff", "--no-color", "--no-index", null_device, rel],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(repo_root),
+                    timeout=120,
+                )
+            if diff.stdout:
+                chunks.append(diff.stdout)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
 
-        state.diff_json = ctx.get("diff_json")
-        state.coder_error = None
-        _tp = _resolve_target_path(state.task)
-        post_coder_text = _tp.read_text() if _tp.exists() else ""
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
-            location="agenti_helix/verification/verification_loop.py:node_run_coder",
-            message="Coder chain produced diff_json",
-            data={
-                "task_id": state.task.task_id,
-                "diff_json": state.diff_json,
-                "post_coder_fingerprint": _text_fingerprint(post_coder_text),
-            },
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-        record_verification_cycle_snapshot(
-            dag_id=state.dag_id,
-            task_id=state.task.task_id,
-            verification_cycle=state.retry_count + 1,
-            verification_status=cp_st,
-            code_evidence={"post_coder": _text_fingerprint(post_coder_text)},
-        )
-        return state
-    except Exception as exc:
-        if _is_cancelled(state.cancel_token):
-            if state.checkpoint is not None:
-                state.checkpoint.status = VerificationStatus.BLOCKED
-                save_checkpoint(state.checkpoint)
-            return state
+    out = "".join(chunks)
+    if len(out) > _MAX_GIT_UNIFIED_DIFF_CHARS:
+        return out[:_MAX_GIT_UNIFIED_DIFF_CHARS] + "\n... [truncated by agenti_helix: git unified diff cap]\n"
+    return out
 
-        state.diff_json = None
-        state.coder_error = f"{type(exc).__name__}: {exc}"
-        state.judge_response = {
-            "verdict": "FAIL",
-            "justification": f"Coder failed before verification: {state.coder_error}",
-            "problematic_lines": [],
-        }
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
-            location="agenti_helix/verification/verification_loop.py:node_run_coder",
-            message="Coder failed (will be treated as verification FAIL)",
-            data={"task_id": state.task.task_id, "error": state.coder_error},
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-        return state
+
+def _tool_logs_with_git_unified_diff(
+    *,
+    repo_root: Path,
+    task: EditTaskSpec,
+    diff_json: Optional[Dict[str, Any]],
+    base: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(base)
+    diff_txt = _git_unified_diff_for_paths(repo_root, _paths_for_git_diff(task, diff_json))
+    if diff_txt.strip():
+        merged["git_unified_diff"] = diff_txt
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Static checks (kept as standalone helpers — used directly by L3/L4 tests)
+# ---------------------------------------------------------------------------
 
 
 def _check_python_syntax(target_path: Path) -> List[str]:
-    """Return a list of syntax error strings, empty on success."""
     errors: List[str] = []
     try:
         py_compile.compile(str(target_path), doraise=True)
@@ -378,7 +268,6 @@ def _check_python_syntax(target_path: Path) -> List[str]:
 
 
 def _check_python_ruff(target_path: Path) -> List[str]:
-    """Run ruff (if available) and return violation strings."""
     errors: List[str] = []
     try:
         result = subprocess.run(
@@ -388,10 +277,8 @@ def _check_python_ruff(target_path: Path) -> List[str]:
             timeout=30,
         )
         if result.returncode != 0 and result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                errors.append(line)
+            errors.extend(result.stdout.strip().splitlines())
     except FileNotFoundError:
-        # ruff not installed — skip this check
         pass
     except subprocess.TimeoutExpired:
         errors.append("ruff check timed out")
@@ -399,7 +286,6 @@ def _check_python_ruff(target_path: Path) -> List[str]:
 
 
 def _check_js_ts_syntax(target_path: Path) -> List[str]:
-    """Use `node --check` for syntax-only validation of JS/TS files."""
     errors: List[str] = []
     try:
         result = subprocess.run(
@@ -413,16 +299,17 @@ def _check_js_ts_syntax(target_path: Path) -> List[str]:
             if combined:
                 errors.append(combined)
     except FileNotFoundError:
-        pass  # node not on PATH — skip
+        pass
     except subprocess.TimeoutExpired:
         errors.append("node --check timed out")
     return errors
 
 
 def _check_bandit_security(target_path: Path) -> List[str]:
-    """§4.5 — Run bandit security scan on Python files; skip gracefully if not installed.
+    """Bandit scan; returns only high-severity / high-confidence findings.
 
-    Returns critical/high severity findings only to avoid false-positive noise.
+    Bandit is optional — absence of the binary is treated as a no-op so the
+    pipeline can still complete in environments without security tooling.
     """
     errors: List[str] = []
     try:
@@ -440,31 +327,22 @@ def _check_bandit_security(target_path: Path) -> List[str]:
             text=True,
             timeout=30,
         )
-        if result.returncode not in (0, 1):  # 0=no issues, 1=issues found (not tool error)
-            return []  # Tool error (e.g., parse failure) — skip scan
+        if result.returncode not in (0, 1):
+            return []
         output = (result.stdout or "").strip()
         if output and "No issues identified" not in output:
-            # Extract only Issue lines to keep the error list compact.
             for line in output.splitlines():
                 if line.startswith(">> Issue:") or line.startswith("Issue:"):
                     errors.append(f"[SECURITY] {line}")
     except FileNotFoundError:
-        pass  # bandit not installed — skip security scan
+        pass
     except subprocess.TimeoutExpired:
-        pass  # Timeout is non-fatal; don't block the pipeline
+        pass
     return errors
 
 
 def _run_static_checks(repo_root: Path, target_file: str) -> Dict[str, Any]:
-    """
-    Run syntax, lint, and security checks on the patched target file.
-
-    Returns a dict with keys:
-      - passed: bool
-      - errors: list of error strings
-      - checks_run: list of check names that executed
-      - security_blocked: bool (True when critical security findings demand ESCALATE)
-    """
+    """Run syntax / lint / security checks on the patched target file."""
     target_path = repo_root / target_file
     if not target_path.exists():
         return {"passed": False, "errors": [f"Target file not found: {target_file}"], "checks_run": [], "security_blocked": False}
@@ -480,33 +358,195 @@ def _run_static_checks(repo_root: Path, target_file: str) -> Dict[str, Any]:
         if not errors:
             checks_run.append("ruff")
             errors.extend(_check_python_ruff(target_path))
-        # §4.5 — Security scan runs independently (even when ruff passes).
         checks_run.append("bandit")
         sec_errors = _check_bandit_security(target_path)
         if sec_errors:
             errors.extend(sec_errors)
-            security_blocked = True  # Critical security findings → force ESCALATE.
+            security_blocked = True
     elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
         checks_run.append("node_check")
         errors.extend(_check_js_ts_syntax(target_path))
 
-    return {"passed": len(errors) == 0, "errors": errors, "checks_run": checks_run, "security_blocked": security_blocked}
+    return {
+        "passed": len(errors) == 0,
+        "errors": errors,
+        "checks_run": checks_run,
+        "security_blocked": security_blocked,
+    }
 
 
-def node_run_static_checks(state: VerificationState) -> VerificationState:
-    if _is_cancelled(state.cancel_token):
-        if state.checkpoint is not None:
-            state.checkpoint.status = VerificationStatus.BLOCKED
-            save_checkpoint(state.checkpoint)
-        return state
+# ---------------------------------------------------------------------------
+# Loop steps (plain functions, no graph framework)
+# ---------------------------------------------------------------------------
+
+
+def _build_coder_intent(state: VerificationState) -> str:
+    """Combine task intent with prior judge feedback, capped to keep prompts bounded."""
+    parts: List[str] = [state.task.intent]
+    if state.feedback:
+        raw = state.feedback
+        cap = 4_000  # Match historical max_error_history_chars cap.
+        if len(raw) > cap:
+            raw = raw[-cap:]
+        parts.append(f"\n\nPrevious attempt feedback from Judge and tools:\n{raw}")
+    return "".join(parts)
+
+
+def _take_pre_checkpoint(state: VerificationState) -> None:
+    target_path = _resolve_target_path(state.task)
+    original = snapshot_file(target_path)
+    checkpoint = create_pre_checkpoint(state.task, original)
+    checkpoint.status = VerificationStatus.RUNNING
+    state.checkpoint = checkpoint
+    state.original_content = original
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id="pre_checkpoint",
+        location="agenti_helix/verification/verification_loop.py:_take_pre_checkpoint",
+        message="Created pre-checkpoint and captured original file snapshot",
+        data={
+            "task_id": state.task.task_id,
+            "target_file": state.task.target_file,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "pre_execution_fingerprint": _text_fingerprint(original),
+        },
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=VerificationStatus.RUNNING.value,
+        code_evidence={"pre_execution": _text_fingerprint(original)},
+    )
+
+
+def _run_coder(state: VerificationState) -> bool:
+    """Run the resolved coder chain. Returns False on coder error or escalation."""
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=state.checkpoint.status.value if state.checkpoint else None,
+    )
+
+    repo_root = Path(state.task.repo_path).resolve()
+    intent = _build_coder_intent(state)
+
+    try:
+        from agenti_helix.orchestration.master_orchestrator import resolve_coder_chain  # noqa: PLC0415
+        coder_chain = resolve_coder_chain(state.task)
+        ctx = {
+            "repo_root": repo_root,
+            "intent": intent,
+            "target_file": state.task.target_file,
+            "acceptance_criteria": state.task.acceptance_criteria,
+            "repo_path": state.task.repo_path,
+            "task_id": state.task.task_id,
+            "doc_url": getattr(state.task, "doc_url", "") or "",
+            "trace_id": state.trace_id,
+            "dag_id": state.dag_id,
+        }
+        ctx = run_chain(
+            chain_spec=coder_chain,
+            initial_context=ctx,
+            cancel_token=state.cancel_token,
+            run_id=state.task.task_id,
+            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
+            location_prefix="agenti_helix/verification/verification_loop.py:_run_coder",
+        )
+        coder_patch = ctx.get("coder_patch") or {}
+        if isinstance(coder_patch, dict) and coder_patch.get("escalate_to_human"):
+            reason = str(coder_patch.get("escalation_reason") or "Coder requested escalation")
+            state.judge_response = {
+                "verdict": "FAIL",
+                "justification": f"Human escalation: {reason}",
+                "problematic_lines": [],
+            }
+            target_path = repo_root / state.task.target_file
+            if state.checkpoint is not None:
+                record_post_state(
+                    state.checkpoint,
+                    post_state_ref=target_path.read_text() if target_path.exists() else "",
+                    diff=json.dumps(state.diff_json or {}, indent=2),
+                    tool_logs=_tool_logs_with_git_unified_diff(
+                        repo_root=repo_root,
+                        task=state.task,
+                        diff_json=state.diff_json,
+                        base={
+                            "judge": state.judge_response,
+                            "human_escalation": reason,
+                        },
+                    ),
+                    status=VerificationStatus.BLOCKED,
+                )
+            log_event(
+                run_id=state.task.task_id,
+                hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
+                location="agenti_helix/verification/verification_loop.py:_run_coder",
+                message="Coder raised escalation signal — BLOCKED",
+                data={"task_id": state.task.task_id, "reason": reason},
+                trace_id=state.trace_id,
+                dag_id=state.dag_id,
+            )
+            return False
+
+        state.diff_json = ctx.get("diff_json")
+        state.coder_error = None
+        target_path = _resolve_target_path(state.task)
+        post_coder_text = target_path.read_text() if target_path.exists() else ""
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_run_coder",
+            message="Coder chain produced diff_json",
+            data={
+                "task_id": state.task.task_id,
+                "diff_json": state.diff_json,
+                "post_coder_fingerprint": _text_fingerprint(post_coder_text),
+            },
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        record_verification_cycle_snapshot(
+            dag_id=state.dag_id,
+            task_id=state.task.task_id,
+            verification_cycle=state.retry_count + 1,
+            verification_status=state.checkpoint.status.value if state.checkpoint else None,
+            code_evidence={"post_coder": _text_fingerprint(post_coder_text)},
+        )
+        return True
+    except Exception as exc:
+        state.diff_json = None
+        state.coder_error = f"{type(exc).__name__}: {exc}"
+        state.judge_response = {
+            "verdict": "FAIL",
+            "justification": f"Coder failed before verification: {state.coder_error}",
+            "problematic_lines": [],
+        }
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"coder_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_run_coder",
+            message="Coder failed (will be treated as verification FAIL)",
+            data={"task_id": state.task.task_id, "error": state.coder_error},
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        return False
+
+
+def _run_static_checks_step(state: VerificationState) -> None:
     repo_root = Path(state.task.repo_path).resolve()
     logs = _run_static_checks(repo_root, state.task.target_file)
     state.static_check_logs = logs
-    post_static_text = (repo_root / state.task.target_file).read_text() if (repo_root / state.task.target_file).exists() else ""
+    target_path = repo_root / state.task.target_file
+    post_static_text = target_path.read_text() if target_path.exists() else ""
     log_event(
         run_id=state.task.task_id,
         hypothesis_id=f"static_checks_attempt_{state.retry_count + 1}",
-        location="agenti_helix/verification/verification_loop.py:node_run_static_checks",
+        location="agenti_helix/verification/verification_loop.py:_run_static_checks_step",
         message="Static checks completed",
         data={
             "task_id": state.task.task_id,
@@ -517,26 +557,18 @@ def node_run_static_checks(state: VerificationState) -> VerificationState:
         trace_id=state.trace_id,
         dag_id=state.dag_id,
     )
-    _cp = state.checkpoint
     record_verification_cycle_snapshot(
         dag_id=state.dag_id,
         task_id=state.task.task_id,
         verification_cycle=state.retry_count + 1,
-        verification_status=_cp.status.value if _cp is not None else None,
+        verification_status=state.checkpoint.status.value if state.checkpoint else None,
         code_evidence={"post_static_checks": _text_fingerprint(post_static_text)},
     )
-    return state
 
 
-def node_call_judge(state: VerificationState) -> VerificationState:
-    assert state.checkpoint is not None, "Checkpoint must be created before judge call"
-    if _is_cancelled(state.cancel_token):
-        state.checkpoint.status = VerificationStatus.BLOCKED
-        save_checkpoint(state.checkpoint)
-        return state
+def _call_judge(state: VerificationState) -> None:
+    assert state.checkpoint is not None
     repo_root = Path(state.task.repo_path).resolve()
-
-    original_snippet = state.original_content or ""
     from agenti_helix.orchestration.master_orchestrator import resolve_judge_chain  # noqa: PLC0415
     judge_chain = resolve_judge_chain(state.task)
     allowed_paths = {state.task.target_file}
@@ -548,21 +580,13 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         "repo_path": state.task.repo_path,
         "target_file": state.task.target_file,
         "acceptance_criteria": state.task.acceptance_criteria,
-        "task_input": {
-            "intent": _build_coder_intent(state),
-            "acceptance_criteria": state.task.acceptance_criteria,
-        },
-        "original_snippet": original_snippet,
+        "original_snippet": state.original_content or "",
         "static_check_logs": state.static_check_logs or {},
-        # Passed so full-pipeline judge chain can access test file paths and diff metadata.
-        "intent": _build_coder_intent(state),
+        "intent": state.task.intent,
         "diff_json": state.diff_json or {},
-        "allowed_paths": sorted(allowed_paths),
         "task_id": state.task.task_id,
-        "dag_id": state.dag_id or "",
-        "attempt_count": state.retry_count + 1,
-        "error_history": list(state.error_history),
-        "patch_summaries": [str((state.diff_json or {}).get("diff_summary") or "")],
+        "trace_id": state.trace_id,
+        "dag_id": state.dag_id,
     }
     attempt_label = f"judge_attempt_{state.retry_count + 1}"
     try:
@@ -572,15 +596,10 @@ def node_call_judge(state: VerificationState) -> VerificationState:
             cancel_token=state.cancel_token,
             run_id=state.task.task_id,
             hypothesis_id=attempt_label,
-            location_prefix="agenti_helix/verification/verification_loop.py:node_call_judge",
+            location_prefix="agenti_helix/verification/verification_loop.py:_call_judge",
         )
+        state.judge_response = ctx.get("judge_response")
     except Exception as exc:
-        if _is_cancelled(state.cancel_token):
-            state.checkpoint.status = VerificationStatus.BLOCKED
-            save_checkpoint(state.checkpoint)
-            return state
-
-        # If the judge chain fails, treat as verification FAIL.
         state.judge_response = {
             "verdict": "FAIL",
             "justification": f"Judge failed before verdict: {type(exc).__name__}: {exc}",
@@ -589,31 +608,18 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         log_event(
             run_id=state.task.task_id,
             hypothesis_id=attempt_label,
-            location="agenti_helix/verification/verification_loop.py:node_call_judge",
+            location="agenti_helix/verification/verification_loop.py:_call_judge",
             message="Judge chain failed (treated as FAIL)",
             data={"task_id": state.task.task_id, "error": state.judge_response["justification"]},
             trace_id=state.trace_id,
             dag_id=state.dag_id,
         )
-        return state
-
-    state.judge_response = ctx.get("judge_response")
-    state.chain_artifacts = {
-        key: ctx[key]
-        for key in (
-            "diff_validator_output",
-            "linter_output",
-            "type_checker_output",
-            "scribe_output",
-            "memory_writer_output",
-        )
-        if key in ctx
-    }
+        return
 
     log_event(
         run_id=state.task.task_id,
         hypothesis_id=attempt_label,
-        location="agenti_helix/verification/verification_loop.py:node_call_judge",
+        location="agenti_helix/verification/verification_loop.py:_call_judge",
         message="Judge evaluated edit",
         data={
             "task_id": state.task.task_id,
@@ -623,555 +629,449 @@ def node_call_judge(state: VerificationState) -> VerificationState:
         trace_id=state.trace_id,
         dag_id=state.dag_id,
     )
-    return state
 
 
-def node_handle_verdict(state: VerificationState) -> VerificationState:
-    assert state.checkpoint is not None, "Checkpoint must be set before verdict handling"
-    cfg = DEFAULT_CONFIG
-    verdict = (state.judge_response or {}).get("verdict", "FAIL")
-    justification = (state.judge_response or {}).get("justification", "")
-
-    if _is_cancelled(state.cancel_token):
-        # Cancellation means we stop accepting judge verdicts and treat the checkpoint as blocked.
-        state.checkpoint.status = VerificationStatus.BLOCKED
-        save_checkpoint(state.checkpoint)
-        return state
-
+def _record_security_blocked(state: VerificationState) -> None:
+    """Static-check security finding: skip judge and mark BLOCKED immediately."""
+    assert state.checkpoint is not None
     repo_root = Path(state.task.repo_path).resolve()
     target_path = repo_root / state.task.target_file
+    record_post_state(
+        state.checkpoint,
+        post_state_ref=target_path.read_text() if target_path.exists() else "",
+        diff=json.dumps(state.diff_json or {}, indent=2),
+        tool_logs=_tool_logs_with_git_unified_diff(
+            repo_root=repo_root,
+            task=state.task,
+            diff_json=state.diff_json,
+            base={
+                "security_findings": (state.static_check_logs or {}).get("errors", []),
+                "security_blocked": True,
+            },
+        ),
+        status=VerificationStatus.BLOCKED,
+    )
 
-    verdict_label = f"verdict_attempt_{state.retry_count + 1}"
 
-    if str(verdict).upper() == "PASS":
-        post_judge_body = target_path.read_text()
-        tool_logs_base = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
-        if state.chain_artifacts:
-            tool_logs_base["chain_artifacts"] = state.chain_artifacts
-        if _requires_manual_signoff(state.task):
-            # Build-mode may have written multiple files. If we have snapshots, stage a multi-file post_state_ref.
-            snapshots_dir = None
-            if isinstance(state.diff_json, dict):
-                snapshots_dir = state.diff_json.get("snapshots_dir")
-            if isinstance(snapshots_dir, str) and snapshots_dir:
-                try:
-                    sd = (repo_root / snapshots_dir).resolve()
-                    snapshots_json = json.loads((sd / "snapshots.json").read_text(encoding="utf-8"))
-                    post_ref = json.dumps({"kind": "multi_file", "snapshots_dir": snapshots_dir}, indent=2)
-                    record_post_state(
-                        state.checkpoint,
-                        post_state_ref=post_ref,
-                        diff=json.dumps(state.diff_json or {}, indent=2),
-                        tool_logs={**tool_logs_base, "snapshots_dir": snapshots_dir, "post_kind": "multi_file"},
-                        status=VerificationStatus.PASSED_PENDING_SIGNOFF,
-                    )
-                    # Roll back all files to their pre-snapshots so workspace stays clean until sign-off.
-                    _restore_paths_from_snapshots(repo_root=repo_root, snapshots=snapshots_json)
-                except Exception:
-                    # Fall back to single-file staging when snapshot application fails.
-                    record_post_state(
-                        state.checkpoint,
-                        post_state_ref=post_judge_body,
-                        diff=json.dumps(state.diff_json or {}, indent=2),
-                        tool_logs=tool_logs_base,
-                        status=VerificationStatus.PASSED_PENDING_SIGNOFF,
-                    )
-            else:
-                record_post_state(
-                    state.checkpoint,
-                    post_state_ref=post_judge_body,
-                    diff=json.dumps(state.diff_json or {}, indent=2),
-                    tool_logs=tool_logs_base,
-                    status=VerificationStatus.PASSED_PENDING_SIGNOFF,
-                )
-            record_post_state(
-                # no-op; record_post_state already persisted above
-                state.checkpoint,
-                post_state_ref=state.checkpoint.post_state_ref or post_judge_body,
-                diff=state.checkpoint.diff,
-                tool_logs=state.checkpoint.tool_logs,
-                status=VerificationStatus.PASSED_PENDING_SIGNOFF,
-            )
-            # Ensure the original target_file is also restored (snapshots may not include it).
-            pre_body = state.original_content if state.original_content is not None else state.checkpoint.pre_state_ref
-            restore_file_from_snapshot(target_path, pre_body)
-            log_event(
-                run_id=state.task.task_id,
-                hypothesis_id=verdict_label,
-                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
-                message="Judge PASS — staged post-state; workspace rolled back pending manual sign-off",
-                data={
-                    "task_id": state.task.task_id,
-                    "checkpoint_id": state.checkpoint.checkpoint_id,
-                    "post_judge_fingerprint": _text_fingerprint(post_judge_body),
-                    "workspace_after_rollback_fingerprint": _text_fingerprint(
-                        target_path.read_text() if target_path.exists() else ""
-                    ),
-                },
-                trace_id=state.trace_id,
-                dag_id=state.dag_id,
-            )
-        else:
-            record_post_state(
-                state.checkpoint,
-                post_state_ref=post_judge_body,
-                diff=json.dumps(state.diff_json or {}, indent=2),
-                tool_logs=tool_logs_base,
-                status=VerificationStatus.PASSED,
-            )
-            log_event(
-                run_id=state.task.task_id,
-                hypothesis_id=verdict_label,
-                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
-                message="Marked checkpoint PASSED",
-                data={
-                    "task_id": state.task.task_id,
-                    "checkpoint_id": state.checkpoint.checkpoint_id,
-                    "post_judge_fingerprint": _text_fingerprint(post_judge_body),
-                },
-                trace_id=state.trace_id,
-                dag_id=state.dag_id,
-            )
-        record_verification_cycle_snapshot(
+def _record_pass(state: VerificationState) -> None:
+    """Judge PASS: stage post-state, optionally roll back workspace for sign-off."""
+    assert state.checkpoint is not None
+    repo_root = Path(state.task.repo_path).resolve()
+    target_path = repo_root / state.task.target_file
+    post_judge_body = target_path.read_text()
+    base: Dict[str, Any] = {"judge": state.judge_response, "static_checks": state.static_check_logs or {}}
+    if state.supreme_court_ruling is not None:
+        # PASS_OVERRIDE path: per-attempt judge said FAIL, supreme_court said
+        # the transcript actually satisfies acceptance_criteria. Keep both
+        # signals in tool_logs so humans can audit the override.
+        base["supreme_court"] = state.supreme_court_ruling
+    tool_logs = _tool_logs_with_git_unified_diff(
+        repo_root=repo_root,
+        task=state.task,
+        diff_json=state.diff_json,
+        base=base,
+    )
+    if _patch_pipeline(state.task):
+        record_post_state(
+            state.checkpoint,
+            post_state_ref=post_judge_body,
+            diff=json.dumps(state.diff_json or {}, indent=2),
+            tool_logs=tool_logs,
+            status=VerificationStatus.PASSED_PENDING_SIGNOFF,
+        )
+        # Roll back workspace only — checkpoint metadata stays at PASSED_PENDING_SIGNOFF.
+        pre_body = state.original_content if state.original_content is not None else state.checkpoint.pre_state_ref
+        restore_file_from_snapshot(target_path, pre_body)
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_record_pass",
+            message="Judge PASS — staged post-state; workspace rolled back pending manual sign-off",
+            data={
+                "task_id": state.task.task_id,
+                "checkpoint_id": state.checkpoint.checkpoint_id,
+                "post_judge_fingerprint": _text_fingerprint(post_judge_body),
+            },
+            trace_id=state.trace_id,
             dag_id=state.dag_id,
-            task_id=state.task.task_id,
-            verification_cycle=state.retry_count + 1,
-            verification_status=state.checkpoint.status.value,
-            code_evidence={
-                "post_judge": _text_fingerprint(post_judge_body),
-                "comparison_pre_vs_post_judge": {
-                    "pre_sha256": _text_fingerprint(state.original_content or "")["sha256"],
-                    "post_judge_sha256": _text_fingerprint(post_judge_body)["sha256"],
-                    "identical": (state.original_content or "") == post_judge_body,
-                },
+        )
+    else:
+        record_post_state(
+            state.checkpoint,
+            post_state_ref=post_judge_body,
+            diff=json.dumps(state.diff_json or {}, indent=2),
+            tool_logs=tool_logs,
+            status=VerificationStatus.PASSED,
+        )
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_record_pass",
+            message="Marked checkpoint PASSED",
+            data={
+                "task_id": state.task.task_id,
+                "checkpoint_id": state.checkpoint.checkpoint_id,
+                "post_judge_fingerprint": _text_fingerprint(post_judge_body),
+            },
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+
+    record_verification_cycle_snapshot(
+        dag_id=state.dag_id,
+        task_id=state.task.task_id,
+        verification_cycle=state.retry_count + 1,
+        verification_status=state.checkpoint.status.value,
+        code_evidence={
+            "post_judge": _text_fingerprint(post_judge_body),
+            "comparison_pre_vs_post_judge": {
+                "pre_sha256": _text_fingerprint(state.original_content or "")["sha256"],
+                "post_judge_sha256": _text_fingerprint(post_judge_body)["sha256"],
+                "identical": (state.original_content or "") == post_judge_body,
+            },
+        },
+    )
+
+
+def _record_blocked_after_retries(
+    state: VerificationState,
+    *,
+    human_review: bool = False,
+) -> None:
+    """Retries exhausted with no PASS: BLOCKED.
+
+    When ``human_review`` is True, the supreme_court ruled ``ESCALATE_HUMAN``
+    — we still mark BLOCKED but stash the flag in tool_logs so dashboards /
+    downstream sign-off flows can route the task to a reviewer.
+    """
+    assert state.checkpoint is not None
+    repo_root = Path(state.task.repo_path).resolve()
+    target_path = repo_root / state.task.target_file
+    base: Dict[str, Any] = {
+        "judge": state.judge_response,
+        "static_checks": state.static_check_logs or {},
+    }
+    if state.supreme_court_ruling is not None:
+        base["supreme_court"] = state.supreme_court_ruling
+    if human_review:
+        base["human_review_required"] = True
+    record_post_state(
+        state.checkpoint,
+        post_state_ref=target_path.read_text() if target_path.exists() else "",
+        diff=json.dumps(state.diff_json or {}, indent=2),
+        tool_logs=_tool_logs_with_git_unified_diff(
+            repo_root=repo_root,
+            task=state.task,
+            diff_json=state.diff_json,
+            base=base,
+        ),
+        status=VerificationStatus.BLOCKED,
+    )
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",
+        location="agenti_helix/verification/verification_loop.py:_record_blocked_after_retries",
+        message="Marked checkpoint BLOCKED (retries exhausted)",
+        data={
+            "task_id": state.task.task_id,
+            "checkpoint_id": state.checkpoint.checkpoint_id,
+            "retry_count": state.retry_count,
+        },
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
+
+
+def _record_attempt(state: VerificationState, *, verdict_from_static: bool) -> None:
+    """Append a compact snapshot of this coder→judge attempt to ``state.attempts``.
+
+    Called exactly once per loop iteration, right after a verdict has resolved
+    (whether from static-check short-circuit or a real judge call). The shape
+    matches ``agenti_helix.agents.models.AttemptRecord`` so the retry-loop
+    agents can consume it directly.
+    """
+    jr = state.judge_response or {}
+    static_logs = state.static_check_logs or {}
+    static_errors = [str(e) for e in (static_logs.get("errors") or [])][:8]
+    diff_summary = _summarise_diff_for_attempt(state)
+    state.attempts.append(
+        {
+            "attempt_n": state.retry_count + 1,
+            "judge_verdict": str(jr.get("verdict") or "FAIL").upper(),
+            "justification": str(jr.get("justification") or "")[:500],
+            "diff_summary": diff_summary,
+            "static_errors": static_errors,
+        }
+    )
+
+
+def _summarise_diff_for_attempt(state: VerificationState) -> str:
+    """One-line description of what the attempt changed — NOT the full diff.
+
+    The retry agents don't need the full unified diff (that would blow the
+    context budget); they need to see whether each attempt touched the same
+    file, how many hunks, and roughly which region.
+    """
+    dj = state.diff_json or {}
+    files_written = dj.get("files_written") or []
+    if isinstance(files_written, list) and files_written:
+        return f"wrote {len(files_written)} file(s): " + ", ".join(str(p) for p in files_written[:3])
+    # Patch-style diff_json has filePath / startLine / endLine.
+    path = dj.get("filePath")
+    start = dj.get("startLine")
+    end = dj.get("endLine")
+    if path is not None:
+        return f"edited {path} lines {start}..{end}"
+    return "(no diff summary available)"
+
+
+def _run_memory_summarizer_into_feedback(
+    state: VerificationState,
+    *,
+    memory_store: Optional[MemoryStore] = None,
+) -> None:
+    """Replace raw judge justification in ``state.feedback`` with a focused hint.
+
+    Invoked from ``_prepare_retry`` when ``task.enable_memory_summarizer`` is
+    set. On any failure (agent raises, schema repair exhausted, memory store
+    missing, etc.) the loop silently keeps the legacy feedback — a retry hint
+    is best-effort and must never block the loop.
+    """
+    # Lazy import: avoids a structured_output → agent_runtime import cycle at
+    # module load time and keeps the dependency optional for tests that patch
+    # the verification loop without registering structured agents.
+    from agenti_helix.runtime.structured_output import run_agent_structured
+
+    store = memory_store or get_default_store()
+    jr = state.judge_response or {}
+    query_text = str(jr.get("justification") or state.feedback or "")
+    try:
+        episodes = store.query(query_text, top_k=3)
+    except Exception:
+        episodes = []
+    similar = [
+        {"error_text": ep.error_text[:500], "resolution": ep.resolution[:500]}
+        for ep in episodes
+    ]
+
+    raw_input = {
+        "task_intent": state.task.intent,
+        "target_file": state.task.target_file,
+        "acceptance_criteria": state.task.acceptance_criteria,
+        "attempts": list(state.attempts),
+        "similar_past_episodes": similar,
+    }
+
+    try:
+        hint = run_agent_structured(
+            agent_id="memory_summarizer_v1",
+            raw_input=raw_input,
+            cancel_token=state.cancel_token,
+            observe={
+                "run_id": state.task.task_id,
+                "hypothesis_id": f"memory_summarizer_attempt_{state.retry_count + 1}",
+                "location": "agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+                "trace_id": state.trace_id,
+                "dag_id": state.dag_id,
             },
         )
-        return state
+    except Exception as exc:
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id=f"memory_summarizer_attempt_{state.retry_count + 1}",
+            location="agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+            message="memory_summarizer_v1 failed — keeping legacy judge-justification feedback",
+            data={"error": f"{type(exc).__name__}: {exc}", "task_id": state.task.task_id},
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        return
 
-    # §4.3 — Append to error_history (with cap to avoid unbounded growth).
-    error_entry = f"Attempt {state.retry_count + 1}: {justification}"
-    state.error_history.append(error_entry)
-    if sum(len(e) for e in state.error_history) > cfg.max_error_history_chars * 3:
-        # Keep only the most recent entries when history grows excessively.
-        state.error_history = state.error_history[-5:]
+    root_cause = str(hint.get("root_cause_hypothesis") or "").strip()
+    actionable = str(hint.get("actionable_hint") or "").strip()
+    anti = hint.get("anti_patterns_to_avoid") or []
+    if not actionable:
+        return  # Empty hint is no hint; keep legacy feedback.
 
-    state.retry_count += 1
-    if state.retry_count >= cfg.max_retries:
-        if not cfg.supreme_court_enabled:
-            record_post_state(
-                state.checkpoint,
-                post_state_ref=target_path.read_text(),
-                diff=json.dumps(state.diff_json or {}, indent=2),
-                tool_logs={"judge": state.judge_response, "static_checks": state.static_check_logs or {}, "supreme_court_invoked": state.supreme_court_invoked},
-                status=VerificationStatus.BLOCKED,
-            )
-            log_event(
-                run_id=state.task.task_id,
-                hypothesis_id=verdict_label,
-                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
-                message="Marked checkpoint BLOCKED (retries exhausted, SC disabled)",
-                data={"task_id": state.task.task_id, "checkpoint_id": state.checkpoint.checkpoint_id, "retry_count": state.retry_count},
-                trace_id=state.trace_id,
-                dag_id=state.dag_id,
-            )
-        else:
-            # §4.4 — Route to Supreme Court instead of immediately blocking.
-            log_event(
-                run_id=state.task.task_id,
-                hypothesis_id=verdict_label,
-                location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
-                message="Retries exhausted; routing to Supreme Court",
-                data={"task_id": state.task.task_id, "retry_count": state.retry_count},
-                trace_id=state.trace_id,
-                dag_id=state.dag_id,
-            )
-        return state
+    anti_block = ""
+    if isinstance(anti, list) and anti:
+        bullets = "\n".join(f"- {str(a).strip()}" for a in anti[:5] if str(a).strip())
+        if bullets:
+            anti_block = "\nDo NOT repeat:\n" + bullets
 
-    # Capture post-patch file text before rollback so the next coder attempt can see
-    # the actual broken (or judge-rejected) workspace outcome, not only the JSON patch.
-    post_patch_body = ""
-    if target_path.exists():
-        try:
-            post_patch_body = target_path.read_text(encoding="utf-8")
-        except OSError:
-            post_patch_body = ""
+    state.feedback = "\n".join(
+        line
+        for line in [
+            "Retry hint from memory_summarizer_v1:",
+            f"Root cause: {root_cause}" if root_cause else None,
+            f"Next-step hint: {actionable}",
+            anti_block.strip() or None,
+        ]
+        if line
+    )
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id=f"memory_summarizer_attempt_{state.retry_count + 1}",
+        location="agenti_helix/verification/verification_loop.py:_run_memory_summarizer_into_feedback",
+        message="Injected memory_summarizer_v1 hint into retry feedback",
+        data={
+            "task_id": state.task.task_id,
+            "similar_episodes": len(similar),
+            "hint_chars": len(state.feedback),
+        },
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
 
+
+def _run_supreme_court(state: VerificationState) -> Optional[Dict[str, Any]]:
+    """Invoke ``supreme_court_v1`` to arbitrate an exhausted retry budget.
+
+    Returns the ruling dict on success, or ``None`` if the agent failed (in
+    which case the caller must fall back to the legacy ``CONFIRM_BLOCKED``
+    behaviour — we never let an arbitration failure swallow a genuine block).
+    """
+    from agenti_helix.runtime.structured_output import run_agent_structured
+
+    repo_root = Path(state.task.repo_path).resolve()
+    diff_text = _git_unified_diff_for_paths(
+        repo_root=repo_root,
+        paths=_paths_for_git_diff(state.task, state.diff_json),
+    )
+    static_logs = state.static_check_logs or {}
+    static_summary_bits: List[str] = []
+    if static_logs:
+        if static_logs.get("security_blocked"):
+            static_summary_bits.append("security-blocked")
+        if static_logs.get("errors"):
+            static_summary_bits.append(f"{len(static_logs['errors'])} static error(s)")
+        if static_logs.get("passed") is True:
+            static_summary_bits.append("static checks passed")
+    static_summary = "; ".join(static_summary_bits) or "no static-check signal"
+
+    raw_input = {
+        "task_intent": state.task.intent,
+        "target_file": state.task.target_file,
+        "acceptance_criteria": state.task.acceptance_criteria,
+        "final_git_diff": diff_text[:_MAX_GIT_UNIFIED_DIFF_CHARS] if diff_text else "",
+        "attempts": list(state.attempts),
+        "final_judge_verdict": state.judge_response or {},
+        "static_check_summary": static_summary,
+    }
+
+    try:
+        ruling = run_agent_structured(
+            agent_id="supreme_court_v1",
+            raw_input=raw_input,
+            cancel_token=state.cancel_token,
+            observe={
+                "run_id": state.task.task_id,
+                "hypothesis_id": "supreme_court_final",
+                "location": "agenti_helix/verification/verification_loop.py:_run_supreme_court",
+                "trace_id": state.trace_id,
+                "dag_id": state.dag_id,
+            },
+        )
+    except Exception as exc:
+        log_event(
+            run_id=state.task.task_id,
+            hypothesis_id="supreme_court_final",
+            location="agenti_helix/verification/verification_loop.py:_run_supreme_court",
+            message="supreme_court_v1 failed — falling back to CONFIRM_BLOCKED",
+            data={"error": f"{type(exc).__name__}: {exc}", "task_id": state.task.task_id},
+            trace_id=state.trace_id,
+            dag_id=state.dag_id,
+        )
+        return None
+
+    log_event(
+        run_id=state.task.task_id,
+        hypothesis_id="supreme_court_final",
+        location="agenti_helix/verification/verification_loop.py:_run_supreme_court",
+        message=f"supreme_court_v1 ruling: {ruling.get('ruling')}",
+        data={"task_id": state.task.task_id, "ruling": ruling.get("ruling")},
+        trace_id=state.trace_id,
+        dag_id=state.dag_id,
+    )
+    state.supreme_court_ruling = ruling
+    return ruling
+
+
+def _prepare_retry(state: VerificationState) -> None:
+    """Roll the workspace back to the pre-checkpoint and stash judge feedback for the next coder pass."""
+    assert state.checkpoint is not None
     rollback_to_checkpoint(
         state.task,
         state.checkpoint,
         original_content=state.original_content,
     )
-
-    feedback_lines = [
-        "Judge reported a failure.",
-        f"Justification: {justification}",
-    ]
-    if state.judge_response:
-        feedback_lines.append(
-            "\nStructured judge output (verbatim):\n"
-            + json.dumps(state.judge_response, ensure_ascii=False, indent=2)
-        )
-    # Include the rejected patch so the coder can see exactly what it tried and
-    # avoid producing the same line range again on retry.
-    if state.diff_json:
-        feedback_lines.append(
-            f"\nYour rejected patch:\n{json.dumps(state.diff_json, indent=2)}\n"
-            "You MUST choose different startLine/endLine values — do NOT repeat this patch."
-        )
-    if post_patch_body.strip():
-        cap = cfg.max_post_patch_feedback_chars
-        excerpt = post_patch_body if len(post_patch_body) <= cap else post_patch_body[:cap] + "\n… [truncated]"
-        feedback_lines.append(
-            "\nFull target file content immediately AFTER your patch was applied (before rollback). "
-            "The numbered target file in the prompt is the clean pre-image; use this block to diagnose "
-            "wrong-line replacements and syntax breakage.\n"
-            f"```text\n{excerpt}\n```"
-        )
-    state.feedback = "\n".join(feedback_lines)
+    justification = (state.judge_response or {}).get("justification", "")
+    state.feedback = "\n".join(
+        ["Judge reported a failure.", f"Justification: {justification}"]
+    )
+    if getattr(state.task, "enable_memory_summarizer", False):
+        _run_memory_summarizer_into_feedback(state)
     log_event(
         run_id=state.task.task_id,
-        hypothesis_id=verdict_label,
-        location="agenti_helix/verification/verification_loop.py:node_handle_verdict",
+        hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",
+        location="agenti_helix/verification/verification_loop.py:_prepare_retry",
         message="Rolled back and scheduled retry",
-        data={"task_id": state.task.task_id, "checkpoint_id": state.checkpoint.checkpoint_id, "retry_count": state.retry_count},
+        data={
+            "task_id": state.task.task_id,
+            "checkpoint_id": state.checkpoint.checkpoint_id,
+            "retry_count": state.retry_count + 1,
+        },
         trace_id=state.trace_id,
         dag_id=state.dag_id,
     )
     record_verification_cycle_snapshot(
         dag_id=state.dag_id,
         task_id=state.task.task_id,
-        verification_cycle=state.retry_count + 1,
+        verification_cycle=state.retry_count + 2,
         verification_status=VerificationStatus.RUNNING.value,
     )
-    return state
 
 
-def node_summarize_context(state: VerificationState) -> VerificationState:
-    """§4.3 — Compress error history via memory_summarizer_v1 before re-attempting the coder."""
-    if _is_cancelled(state.cancel_token):
-        return state
+def _finalise_after_retries(state: VerificationState) -> None:
+    """Retry budget exhausted. If ``supreme_court`` is enabled, let it arbitrate.
 
-    # Lazy import to avoid circular dependency (verification_loop ↔ orchestrator ↔ agent_runtime).
-    from agenti_helix.runtime.agent_runtime import run_agent  # noqa: PLC0415
+    Dispatch table:
+      - PASS_OVERRIDE  → promote to ``_record_pass`` (supreme_court sides with
+        the workspace state despite per-attempt FAILs).
+      - ESCALATE_HUMAN → BLOCKED with ``human_review_required`` flag set.
+      - CONFIRM_BLOCKED / agent failure / disabled → legacy BLOCKED path.
+    """
+    if not getattr(state.task, "enable_supreme_court", False):
+        _record_blocked_after_retries(state)
+        return
 
-    attempt_label = f"summarize_attempt_{state.retry_count}"
-    raw_history = "\n".join(state.error_history)
+    ruling = _run_supreme_court(state)
+    if ruling is None:
+        # Agent failed; never let arbitration errors unblock a BLOCKED task.
+        _record_blocked_after_retries(state)
+        return
 
-    try:
-        result = run_agent(
-            agent_id="memory_summarizer_v1",
-            raw_input={
-                "errors": raw_history,
-                "previous_patches": json.dumps(state.diff_json or {}),
-                "attempt": state.retry_count,
-            },
-            runtime={"temperature": 0.0},
-            cancel_token=state.cancel_token,
-            observe={
-                "run_id": state.task.task_id,
-                "hypothesis_id": attempt_label,
-                "location": "agenti_helix/verification/verification_loop.py:node_summarize_context",
-                "trace_id": state.trace_id,
-                "dag_id": state.dag_id,
-            },
-        )
-
-        compressed = result.get("compressed_summary") or result.get("output") or raw_history
-        keys = result.get("key_constraints")
-        if isinstance(keys, list) and keys:
-            bullets = "\n".join(f"- {c}" for c in keys[:8] if str(c).strip())
-            if bullets:
-                state.compressed_context = f"{compressed}\n\nConstraints the next attempt must respect:\n{bullets}"
-            else:
-                state.compressed_context = str(compressed)
-        else:
-            state.compressed_context = str(compressed)
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id=attempt_label,
-            location="agenti_helix/verification/verification_loop.py:node_summarize_context",
-            message="Memory summarizer compressed error history",
-            data={"task_id": state.task.task_id, "compressed_len": len(state.compressed_context)},
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-    except Exception as exc:
-        # Summarization is best-effort; fall back to raw feedback.
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id=attempt_label,
-            location="agenti_helix/verification/verification_loop.py:node_summarize_context",
-            message=f"Memory summarizer failed (using raw feedback): {exc}",
-            data={"task_id": state.task.task_id},
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-
-    return state
+    verdict = str(ruling.get("ruling") or "").upper()
+    if verdict == "PASS_OVERRIDE":
+        _record_pass(state)
+        return
+    if verdict == "ESCALATE_HUMAN":
+        _record_blocked_after_retries(state, human_review=True)
+        return
+    # CONFIRM_BLOCKED or anything we don't recognise → default BLOCKED.
+    _record_blocked_after_retries(state)
 
 
-def node_supreme_court(state: VerificationState) -> VerificationState:
-    """§4.4 — Invoke frontier-model arbitration as a last resort before BLOCKED."""
-    assert state.checkpoint is not None, "Checkpoint must exist for Supreme Court"
-
-    # Lazy import to avoid circular dependency.
-    from agenti_helix.runtime.agent_runtime import run_agent  # noqa: PLC0415
-
-    repo_root = Path(state.task.repo_path).resolve()
-    target_path = repo_root / state.task.target_file
-
-    log_event(
-        run_id=state.task.task_id,
-        hypothesis_id="supreme_court",
-        location="agenti_helix/verification/verification_loop.py:node_supreme_court",
-        message="Invoking Supreme Court arbitration",
-        data={"task_id": state.task.task_id, "retry_count": state.retry_count},
-        trace_id=state.trace_id,
-        dag_id=state.dag_id,
-    )
-
-    rejection_summary = "\n".join(state.error_history[-3:]) or (
-        (state.judge_response or {}).get("justification", "No rejection reasons recorded")
-    )
-
-    try:
-        result = run_agent(
-            agent_id="supreme_court_v1",
-            raw_input={
-                "original_intent": state.task.task_id,
-                "intent": state.task.intent,
-                "best_patch": json.dumps(state.diff_json or {}),
-                "rejection_reasons": rejection_summary,
-                "error_history": "\n".join(state.error_history),
-            },
-            runtime={"temperature": 0.1, "max_tokens": 8192},
-            cancel_token=state.cancel_token,
-            observe={
-                "run_id": state.task.task_id,
-                "hypothesis_id": "supreme_court",
-                "location": "agenti_helix/verification/verification_loop.py:node_supreme_court",
-                "trace_id": state.trace_id,
-                "dag_id": state.dag_id,
-            },
-        )
-        state.supreme_court_invoked = True
-
-        resolved = result.get("resolved", False)
-        if not resolved:
-            raise ValueError(result.get("reasoning", "Supreme Court could not resolve"))
-
-        # Apply the SC-arbitrated patch.
-        sc_patch = {
-            "filePath": _normalize_repo_relative_path(str(result["filePath"])),
-            "startLine": result["startLine"],
-            "endLine": result["endLine"],
-            "replacementLines": result["replacementLines"],
-        }
-        from agenti_helix.runtime.tools import tool_apply_line_patch_and_validate
-
-        allowed_paths = _supreme_court_allowed_paths(
-            repo_root=repo_root,
-            task_target_file=state.task.target_file,
-            patch_file_path=str(sc_patch["filePath"]),
-        )
-        apply_result = tool_apply_line_patch_and_validate(
-            repo_root=str(repo_root),
-            patch=sc_patch,
-            allowed_paths=allowed_paths,
-        )
-        if not apply_result.get("ok"):
-            raise ValueError(f"SC patch failed to apply: {apply_result.get('error')}")
-
-        state.diff_json = sc_patch
-        state.coder_error = None
-        state.judge_response = None  # Clear so verification runs fresh.
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id="supreme_court",
-            location="agenti_helix/verification/verification_loop.py:node_supreme_court",
-            message="Supreme Court resolved dispute; patch applied",
-            data={"task_id": state.task.task_id, "sc_patch": sc_patch},
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-
-    except Exception as exc:
-        # SC failed — roll back the workspace to the pre-checkpoint state before
-        # recording BLOCKED.  Without this, any patch the coder applied during the
-        # retry loop stays on disk, leaving the file in a broken intermediate state.
-        state.supreme_court_invoked = True
-        rollback_to_checkpoint(
-            state.task,
-            state.checkpoint,
-            original_content=state.original_content,
-        )
-        record_post_state(
-            state.checkpoint,
-            post_state_ref=target_path.read_text() if target_path.exists() else "",
-            diff=json.dumps(state.diff_json or {}, indent=2),
-            tool_logs={
-                "judge": state.judge_response,
-                "static_checks": state.static_check_logs or {},
-                "supreme_court_invoked": True,
-                "supreme_court_error": str(exc),
-            },
-            status=VerificationStatus.BLOCKED,
-        )
-        log_event(
-            run_id=state.task.task_id,
-            hypothesis_id="supreme_court",
-            location="agenti_helix/verification/verification_loop.py:node_supreme_court",
-            message="Supreme Court failed to resolve; workspace rolled back; BLOCKED",
-            data={"task_id": state.task.task_id, "error": str(exc)},
-            trace_id=state.trace_id,
-            dag_id=state.dag_id,
-        )
-
-    return state
+def _mark_blocked_for_cancel(state: VerificationState) -> None:
+    if state.checkpoint is None:
+        return
+    state.checkpoint.status = VerificationStatus.BLOCKED
+    save_checkpoint(state.checkpoint)
 
 
-def build_verification_graph() -> StateGraph:
-    graph = StateGraph(VerificationState)
-
-    graph.add_node("take_pre_checkpoint", node_take_pre_checkpoint)
-    graph.add_node("run_coder", node_run_coder)
-    graph.add_node("summarize_context", node_summarize_context)
-    graph.add_node("run_static_checks", node_run_static_checks)
-    graph.add_node("call_judge", node_call_judge)
-    graph.add_node("handle_verdict", node_handle_verdict)
-    graph.add_node("supreme_court", node_supreme_court)
-
-    graph.set_entry_point("take_pre_checkpoint")
-
-    graph.add_edge("take_pre_checkpoint", "run_coder")
-
-    def _coder_ok(state: VerificationState) -> str:
-        if _is_cancelled(state.cancel_token):
-            return END
-        # §4.5 — Human escalation short-circuits to handle_verdict (→ BLOCKED).
-        if state.human_escalation_requested:
-            state.judge_response = {
-                "verdict": "FAIL",
-                "justification": f"Human escalation: {state.human_escalation_reason}",
-                "problematic_lines": [],
-            }
-            # Force BLOCKED immediately.
-            if state.checkpoint is not None:
-                from agenti_helix.runtime.tools import tool_apply_line_patch_and_validate  # noqa
-                repo_root = Path(state.task.repo_path).resolve()
-                target_path = repo_root / state.task.target_file
-                record_post_state(
-                    state.checkpoint,
-                    post_state_ref=target_path.read_text() if target_path.exists() else "",
-                    diff=json.dumps(state.diff_json or {}, indent=2),
-                    tool_logs={
-                        "judge": state.judge_response,
-                        "human_escalation": state.human_escalation_reason,
-                    },
-                    status=VerificationStatus.BLOCKED,
-                )
-            return END
-        return "ok" if not state.coder_error else "error"
-
-    graph.add_conditional_edges(
-        "run_coder",
-        _coder_ok,
-        {
-            END: END,
-            "ok": "run_static_checks",
-            "error": "handle_verdict",
-        },
-    )
-
-    # §4.3 — After summarization, always go to coder.
-    graph.add_edge("summarize_context", "run_coder")
-
-    def _static_checks_ok(state: VerificationState) -> str:
-        if _is_cancelled(state.cancel_token):
-            return END
-        logs = state.static_check_logs or {}
-        if not logs.get("passed", True) and logs.get("errors"):
-            # §4.5 — Security findings bypass the retry loop entirely → force BLOCKED.
-            if logs.get("security_blocked") and state.checkpoint is not None:
-                repo_root = Path(state.task.repo_path).resolve()
-                target_path = repo_root / state.task.target_file
-                record_post_state(
-                    state.checkpoint,
-                    post_state_ref=target_path.read_text() if target_path.exists() else "",
-                    diff=json.dumps(state.diff_json or {}, indent=2),
-                    tool_logs={"security_findings": logs["errors"], "security_blocked": True},
-                    status=VerificationStatus.BLOCKED,
-                )
-                return END
-            state.judge_response = {
-                "verdict": "FAIL",
-                "justification": "Static checks failed: " + "; ".join(str(e) for e in logs["errors"][:5]),
-                "problematic_lines": [],
-            }
-            return "handle_verdict"
-        return "call_judge"
-
-    graph.add_conditional_edges(
-        "run_static_checks",
-        _static_checks_ok,
-        {END: END, "call_judge": "call_judge", "handle_verdict": "handle_verdict"},
-    )
-    graph.add_edge("call_judge", "handle_verdict")
-
-    def _should_retry(state: VerificationState) -> str:
-        if _is_cancelled(state.cancel_token):
-            return END
-        if state.checkpoint is not None and state.checkpoint.status in (
-            VerificationStatus.PASSED,
-            VerificationStatus.PASSED_PENDING_SIGNOFF,
-            VerificationStatus.BLOCKED,
-        ):
-            return END
-
-        if state.judge_response is None:
-            return END
-
-        verdict = str(state.judge_response.get("verdict", "FAIL")).upper()
-        if verdict == "PASS":
-            return END
-
-        cfg = DEFAULT_CONFIG
-        # §4.4 — Route to Supreme Court when retries are exhausted and SC is enabled.
-        if state.retry_count >= cfg.max_retries:
-            if cfg.supreme_court_enabled and not state.supreme_court_invoked:
-                return "supreme_court"
-            return END  # SC already tried or disabled.
-
-        # §4.3 — Trigger context summarization from the second retry onward.
-        if state.retry_count >= 1:
-            return "summarize_context"
-
-        return "run_coder"
-
-    graph.add_conditional_edges(
-        "handle_verdict",
-        _should_retry,
-        {
-            "run_coder": "run_coder",
-            "summarize_context": "summarize_context",
-            "supreme_court": "supreme_court",
-            END: END,
-        },
-    )
-
-    # §4.4 — After Supreme Court, either go to static checks (resolved) or end (blocked).
-    def _after_supreme_court(state: VerificationState) -> str:
-        if state.checkpoint is not None and state.checkpoint.status == VerificationStatus.BLOCKED:
-            return END
-        return "run_static_checks"
-
-    graph.add_conditional_edges(
-        "supreme_court",
-        _after_supreme_court,
-        {END: END, "run_static_checks": "run_static_checks"},
-    )
-
-    return graph
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def run_verification_loop(
@@ -1180,14 +1080,19 @@ def run_verification_loop(
     trace_id: Optional[str] = None,
     dag_id: Optional[str] = None,
 ) -> VerificationState:
-    graph = build_verification_graph()
-    app = graph.compile()
-    initial_state = VerificationState(
+    """Drive code → static-checks → judge → (retry|done) until a terminal status.
+
+    Terminal statuses: PASSED, PASSED_PENDING_SIGNOFF, BLOCKED. Cancellation
+    at any step short-circuits to BLOCKED.
+    """
+    cfg = DEFAULT_CONFIG
+    state = VerificationState(
         task=task,
         cancel_token=cancel_token,
         trace_id=trace_id,
         dag_id=dag_id,
     )
+
     log_event(
         run_id=task.task_id,
         hypothesis_id="loop_start",
@@ -1197,29 +1102,82 @@ def run_verification_loop(
         trace_id=trace_id,
         dag_id=dag_id,
     )
-    final_state = app.invoke(initial_state)
 
-    if isinstance(final_state, dict):
-        final_state_obj = VerificationState(**final_state)
-    else:
-        final_state_obj = final_state
-
-    status = final_state_obj.checkpoint.status.value if final_state_obj.checkpoint else None
-    log_event(
-        run_id=task.task_id,
-        hypothesis_id="loop_end",
-        location="agenti_helix/verification/verification_loop.py:run_verification_loop",
-        message="Finished verification loop",
-        data={"task_id": task.task_id, "status": status, "retry_count": final_state_obj.retry_count},
-        trace_id=trace_id,
-        dag_id=dag_id,
-    )
-
-    # Index resolved episodes into episodic memory for future retrieval.
     try:
-        index_from_verification_state(final_state_obj)
+        if _is_cancelled(cancel_token):
+            _mark_blocked_for_cancel(state)
+            return state
+
+        _take_pre_checkpoint(state)
+
+        while True:
+            if _is_cancelled(cancel_token):
+                _mark_blocked_for_cancel(state)
+                break
+
+            coder_ok = _run_coder(state)
+            if _is_cancelled(cancel_token):
+                _mark_blocked_for_cancel(state)
+                break
+
+            # Coder requested escalation → already marked BLOCKED in _run_coder.
+            if not coder_ok and state.checkpoint and state.checkpoint.status == VerificationStatus.BLOCKED:
+                break
+
+            verdict_from_static = False
+            if coder_ok:
+                _run_static_checks_step(state)
+                logs = state.static_check_logs or {}
+                if not logs.get("passed", True) and logs.get("errors"):
+                    if logs.get("security_blocked"):
+                        # Security-blocked short-circuits both the judge and
+                        # any supreme_court arbitration — we never override
+                        # a security violation.
+                        _record_security_blocked(state)
+                        break
+                    state.judge_response = {
+                        "verdict": "FAIL",
+                        "justification": "Static checks failed: " + "; ".join(str(e) for e in logs["errors"][:5]),
+                        "problematic_lines": [],
+                    }
+                    verdict_from_static = True
+                else:
+                    _call_judge(state)
+
+            _record_attempt(state, verdict_from_static=verdict_from_static)
+
+            verdict = str((state.judge_response or {}).get("verdict", "FAIL")).upper()
+            if verdict == "PASS":
+                _record_pass(state)
+                break
+
+            state.retry_count += 1
+            if state.retry_count >= cfg.max_retries:
+                _finalise_after_retries(state)
+                break
+
+            _prepare_retry(state)
+
     except Exception:
-        pass  # Memory indexing is best-effort and must never break the main loop.
+        # Loop crashes shouldn't leak to the orchestrator without a status.
+        if state.checkpoint is not None and state.checkpoint.status == VerificationStatus.RUNNING:
+            _mark_blocked_for_cancel(state)
+        raise
+    finally:
+        status = state.checkpoint.status.value if state.checkpoint else None
+        log_event(
+            run_id=task.task_id,
+            hypothesis_id="loop_end",
+            location="agenti_helix/verification/verification_loop.py:run_verification_loop",
+            message="Finished verification loop",
+            data={"task_id": task.task_id, "status": status, "retry_count": state.retry_count},
+            trace_id=trace_id,
+            dag_id=dag_id,
+        )
 
-    return final_state_obj
+    try:
+        index_from_verification_state(state)
+    except Exception:
+        pass  # Memory indexing is best-effort.
 
+    return state

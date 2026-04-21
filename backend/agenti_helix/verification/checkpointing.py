@@ -39,9 +39,19 @@ class EditTaskSpec:
     # Execution pipeline hint: "patch" (fast, single-file) or "build" (full TDD pipeline).
     # Used by master_orchestrator.resolve_coder_chain / resolve_judge_chain when chains are not explicit.
     pipeline_mode: str = "patch"
-    # Optional bespoke workflow — ordered list of agent_ids. When set, master_orchestrator
-    # synthesizes coder+judge chains dynamically, ignoring `pipeline_mode` presets.
-    workflow: Optional[List[str]] = None
+    # Optional URL for doc_fetcher-first pipelines; may also be supplied via task context API.
+    doc_url: str = ""
+    # When true, product_eng skips fetch_doc + doc_fetcher + merge (already merged at intent-compile time).
+    skip_doc_chain_prefix: bool = False
+    # Retry-loop opt-ins (see verification_loop.py):
+    # - enable_memory_summarizer: before each retry, replace raw judge
+    #   justification in ``state.feedback`` with a focused hint produced by
+    #   ``memory_summarizer_v1`` using attempt history + similar past episodes.
+    # - enable_supreme_court: after the final retry FAILs, invoke
+    #   ``supreme_court_v1`` to rule PASS_OVERRIDE / CONFIRM_BLOCKED /
+    #   ESCALATE_HUMAN before committing a terminal BLOCKED state.
+    enable_memory_summarizer: bool = False
+    enable_supreme_court: bool = False
 
 
 @dataclass
@@ -152,6 +162,21 @@ def snapshot_file(path: Path) -> str:
 def restore_file_from_snapshot(path: Path, snapshot: str) -> None:
     """Restore a file to a previous snapshot."""
     path.write_text(snapshot)
+
+
+def materialize_passed_checkpoint_to_workspace(*, task: EditTaskSpec, checkpoint: Checkpoint) -> Path:
+    """
+    Write the verified post-state from a PASSED checkpoint onto the task target file.
+
+    Used by the merge endpoint so disk always matches the checkpoint, including when the
+    patch pipeline left the workspace rolled back until sign-off.
+    """
+    if not checkpoint.post_state_ref:
+        raise ValueError("Checkpoint has no post_state_ref; cannot materialize verified content")
+    target_path = Path(task.repo_path).resolve() / task.target_file
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(checkpoint.post_state_ref, encoding="utf-8")
+    return target_path
 
 
 def apply_signed_off_checkpoint(*, task: EditTaskSpec, checkpoint: Checkpoint, signed_by: Optional[str] = None) -> None:

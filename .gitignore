@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest-git-tmp/
 .agenti_helix/
 .cursor/
 .env.local

@@ -8,12 +8,10 @@ Flag any hardcoded secrets, API keys, or destructive database queries.
 
 If the code violates any rule, you must fail it and include the exact violation with its line number in `violations`.
 
-First, reason step-by-step inside `<think>...</think>` tags — methodically check each rule against the diff.
-
-Then, after `</think>`, output a single JSON object with your audit reasoning, the pass/fail result, and the list of violations.
+Output a **single JSON object** with your audit reasoning, the pass/fail result, and the list of violations. No `<think>` block, no markdown fences, no preamble — put your reasoning inside the `audit_reasoning` field of the JSON, not before it.
 
 Inputs:
-- Coder_Output_Diff_(JSON):
+- Coder_Output_Diff_(JSON) — includes `file_snapshots` with the written source and test file contents (paths-only JSON is invalid for this audit):
 {diff_json}
 
 - Repo_Rules_Text_(lint_security_style):

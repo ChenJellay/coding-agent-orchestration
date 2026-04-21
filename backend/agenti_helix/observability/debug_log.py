@@ -27,6 +27,12 @@ def log_event(
     trace_id: Optional[str] = None,
     dag_id: Optional[str] = None,
 ) -> None:
+    """Append one JSON event to the events log.
+
+    Honors ``AGENTI_HELIX_DISABLE_LOGGING`` and ``AGENTI_HELIX_LOG_PATH`` /
+    ``AGENTI_HELIX_REPO_ROOT`` environment variables. Best-effort: silently
+    swallows OS errors so logging never breaks a running pipeline.
+    """
     if os.environ.get("AGENTI_HELIX_DISABLE_LOGGING", "").strip().lower() in {"1", "true", "yes"}:
         # #region agent log
         try:
@@ -102,7 +108,9 @@ def log_event(
     if dag_id is not None:
         payload["dagId"] = dag_id
 
-    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
-
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass

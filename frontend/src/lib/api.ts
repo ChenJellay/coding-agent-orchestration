@@ -4,7 +4,7 @@ export type FeatureColumn =
   | 'BLOCKED'
   | 'VERIFYING'
   | 'READY_FOR_REVIEW'
-  | 'COMPLETE'
+  | 'SUCCESSFUL_COMMIT'
 
 export type Feature = {
   feature_id: string
@@ -21,6 +21,8 @@ export type FeatureDetails = {
   dag: {
     dag_id: string
     macro_intent: string
+    /** Short dashboard command for titles; falls back to macro_intent when absent. */
+    user_intent_label?: string
     nodes: Record<
       string,
       {
@@ -41,7 +43,13 @@ export type FeatureDetails = {
     dag_id: string
     nodes: Record<
       string,
-      { node_id: string; status: string; attempts: number; verification_status: string | null; verification_cycle?: number }
+      {
+        node_id: string
+        status: string
+        attempts: number
+        verification_status: string | null
+        verification_cycle?: number
+      }
     >
   } | null
   metrics: {
@@ -111,6 +119,22 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T
 }
 
+function _httpErrorDetail(status: number, path: string, method: string, text: string): Error {
+  if (status === 401 || status === 403) {
+    return new Error(`Unauthorized (${status}): check VITE_API_KEY in frontend/.env.local`)
+  }
+  try {
+    const j = JSON.parse(text) as { error?: { message?: string; code?: string }; detail?: unknown }
+    const msg = j?.error?.message
+    if (typeof msg === 'string' && msg.trim()) {
+      return new Error(msg)
+    }
+  } catch {
+    /* use raw text */
+  }
+  return new Error(`HTTP ${status} ${method} ${path}${text ? `: ${text}` : ''}`)
+}
+
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
@@ -118,11 +142,8 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status} POST ${path}${text ? `: ${text}` : ''}`)
+    throw _httpErrorDetail(res.status, path, 'POST', text)
   }
   return (await res.json()) as T
 }
@@ -134,11 +155,8 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status} PUT ${path}${text ? `: ${text}` : ''}`)
+    throw _httpErrorDetail(res.status, path, 'PUT', text)
   }
   return (await res.json()) as T
 }
@@ -149,17 +167,15 @@ async function deleteJson<T>(path: string): Promise<T> {
     headers: { ..._authHeaders() },
   })
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Unauthorized (${res.status}): check VITE_API_KEY in frontend/.env.local`)
-    }
     const text = await res.text().catch(() => '')
-    throw new Error(`HTTP ${res.status} DELETE ${path}${text ? `: ${text}` : ''}`)
+    throw _httpErrorDetail(res.status, path, 'DELETE', text)
   }
   return (await res.json()) as T
 }
 
-export async function removeDagFromWorkflow(dagId: string): Promise<{ ok: true; removed_spec?: boolean; removed_state?: boolean }> {
-  return await deleteJson(`/api/dags/${encodeURIComponent(dagId)}`)
+/** Permanently removes DAG spec, state, and related checkpoints/merge records (editor role). */
+export async function deleteFeature(featureId: string): Promise<{ ok: true }> {
+  return await deleteJson<{ ok: true }>(`/api/features/${encodeURIComponent(featureId)}`)
 }
 
 export async function fetchFeatures(): Promise<Feature[]> {
@@ -310,7 +326,7 @@ export async function mergeTask(params: {
   checkpoint_id: string
   target_branch?: string
   commit_message?: string
-}): Promise<{ ok: true; mergeRef?: string }> {
+}): Promise<{ ok: true; mergeRef?: string; sha?: string | null; simulated?: boolean }> {
   return await postJson('/api/tasks/merge', params)
 }
 
@@ -332,23 +348,60 @@ export async function resumeDag(dag_id: string): Promise<{ ok: true }> {
   return await postJson(`/api/dags/${encodeURIComponent(dag_id)}/resume`, {})
 }
 
-export type PipelineMode = 'patch' | 'build' | 'product_eng' | 'diff_guard_patch' | 'secure_build_plus' | 'lint_type_gate'
+/** Base execution mode. `null` lets the LLM intent compiler decide per node. */
+export type ExecutionMode = 'patch' | 'build'
+
+/** Optional behaviour toggles layered on top of the base mode. */
+export interface ExecutionExtras {
+  /** Run the doc_fetcher prefix that distils PRD/API docs into the macro intent. */
+  doc?: boolean
+  /** Insert the diff_validator gate between the coder and the judge. */
+  diff_gate?: boolean
+  /** Run linter + type_checker agents and fold findings into the judge prompt. */
+  lint_type?: boolean
+  /**
+   * Before each retry, replace raw judge justification with a focused hint
+   * synthesised by ``memory_summarizer_v1`` from attempt history + similar
+   * past episodes.
+   */
+  memory_summarizer?: boolean
+  /**
+   * After retries are exhausted, invoke ``supreme_court_v1`` to arbitrate.
+   * ``PASS_OVERRIDE`` promotes to PASSED; ``ESCALATE_HUMAN`` marks BLOCKED
+   * with a human-review flag; ``CONFIRM_BLOCKED`` is the default.
+   */
+  supreme_court?: boolean
+}
 
 export async function startDagFromDashboard(params: {
   repo_path: string
   macro_intent: string
   agent_ids?: string[]
   dag_id?: string
-  use_llm?: boolean
-  pipeline_mode?: PipelineMode | null
+  mode?: ExecutionMode | null
+  extras?: ExecutionExtras
+  /** Raw documentation text (from upload); server writes under target repo `.agenti_helix/`. */
+  doc_text?: string
+  doc_filename?: string
+  /** Remote doc URL for doc_fetcher when not uploading text. */
+  doc_url?: string
 }): Promise<{ ok: true; dag_id: string }> {
   const body = {
     repo_path: params.repo_path,
     macro_intent: params.macro_intent,
     agent_ids: params.agent_ids ?? ['coder_patch_v1', 'judge_v1'],
     ...(params.dag_id != null ? { dag_id: params.dag_id } : {}),
-    use_llm: params.use_llm ?? false,
-    pipeline_mode: params.pipeline_mode ?? null,
+    mode: params.mode ?? null,
+    extras: {
+      doc: Boolean(params.extras?.doc),
+      diff_gate: Boolean(params.extras?.diff_gate),
+      lint_type: Boolean(params.extras?.lint_type),
+    },
+    ...(params.doc_text != null && params.doc_text !== ''
+      ? { doc_text: params.doc_text, ...(params.doc_filename ? { doc_filename: params.doc_filename } : {}) }
+      : params.doc_url != null && params.doc_url.trim() !== ''
+        ? { doc_url: params.doc_url.trim() }
+        : {}),
   }
   return await postJson<{ ok: true; dag_id: string }>('/api/dags/run', body)
 }

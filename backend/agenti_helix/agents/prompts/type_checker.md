@@ -35,18 +35,16 @@ acceptance_criteria:  {acceptance_criteria}
    - `structural` — errors require changing an interface or type contract that other code depends on (risky, flag for human review).
 
 ## Output
-First, reason step-by-step inside `<think>...</think>` tags — classify each error and plan concrete fixes.
-
-Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
+Respond with **only** a JSON object — no `<think>` block, no prose, no markdown fences. Put any reasoning into the `summary` field of the JSON, not before it.
 
 ```json
-{
+{{
   "target_file": "<echoed>",
   "language": "<echoed>",
   "type_health": "fixable",
   "error_count": 2,
   "findings": [
-    {
+    {{
       "line_number": 34,
       "column": 12,
       "error_code": "arg-type",
@@ -55,8 +53,8 @@ Then, after `</think>`, respond with **only** a JSON object — no prose, no mar
       "in_dependency": false,
       "fix_instruction": "Wrap the argument with int(): `process(int(user_input))`. Ensure user_input is always numeric before this call.",
       "blocks_acceptance": true
-    },
-    {
+    }},
+    {{
       "line_number": 61,
       "column": 5,
       "error_code": "no-untyped-def",
@@ -65,11 +63,11 @@ Then, after `</think>`, respond with **only** a JSON object — no prose, no mar
       "in_dependency": false,
       "fix_instruction": "Add `-> None:` or the appropriate return type to the function signature: `def helper(x: int) -> bool:`",
       "blocks_acceptance": false
-    }
+    }}
   ],
   "dependency_errors": [],
   "summary": "Two type errors. The arg-type error on line 34 will cause a runtime failure and must be fixed. The missing annotation on line 61 is cosmetic."
-}
+}}
 ```
 
 ## Rules

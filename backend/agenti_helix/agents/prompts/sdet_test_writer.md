@@ -8,19 +8,11 @@ Mock external dependencies (like databases or third-party APIs) using standard t
 
 Ensure the test syntax perfectly matches the repository's testing framework.
 
-Always import the component or module under test from its actual file path — never define or stub the subject of the test inline inside the test file. The whole point of TDD is that the test imports the real implementation.
+Prefer **small, focused** test files: cover acceptance criteria and a few sharp edge cases — do not enumerate every hypothetical scenario.
 
-When the repository map shows an existing `__tests__/` directory near the target file, write the test file there. If no `__tests__/` directory exists, co-locate the test next to the source file. Never invent a new test location that contradicts what the repository map shows.
+**Intent over implementation:** Assert **observable outcomes** that match the **macro intent** and acceptance criteria (e.g. the emoji appears and is centered in the viewport), not incidental details (specific variable names, exact component hierarchy, import order, or one possible CSS approach). Avoid brittle selectors, over-mocked trees, or assertions that only one coding style could satisfy — those create false failures when a correct implementation differs. Prefer stable queries (roles, labels, text) over implementation-specific hooks unless the repo already standardizes on them.
 
-For React and frontend components: test **rendered output and observable behaviour**, not CSS or styling implementation details.
-- Do NOT use `toHaveStyle(...)` to assert inline styles — jsdom does not reliably compute them.
-- Do NOT use `getByRole(...)` unless the acceptance criteria explicitly requires a specific ARIA role (e.g. `button`, `heading`). A plain `<div>` has no implicit ARIA role; asserting one will always fail.
-- DO check for meaningful text content, data-testid attributes, or element presence that verifies the acceptance criteria.
-- DO prefer `getByText`, `getByTestId`, or `queryByText` for asserting rendered content.
-
-First, reason step-by-step inside `<think>...</think>` tags — identify edge cases, plan your mocking strategy, and think through the test scenarios.
-
-Then, after `</think>`, output a single JSON object with your testing strategy and the complete test files. Each entry must contain the **full file content**.
+Output a **single JSON object** with your test plan, edge-case rationale, and the generated files. No `<think>` block, no `<redacted_thinking>` block, no markdown fences, no preamble or postamble — put your reasoning **inside the `testing_strategy` field of the JSON**, not before it. Keep `testing_strategy` to **2–4 short sentences** covering acceptance-criteria mapping, edge cases, and mocking strategy. Do not list scenarios twice or restate the inputs. Allocate the remaining output budget to `test_files[].content`.
 
 Inputs:
 - Current_DAG_Task:
@@ -37,7 +29,7 @@ Inputs:
 
 Required output format (JSON only, no markdown fences):
 {{
-  "testing_strategy": "reasoning for the test cases, edge cases covered, and mocking strategy",
+  "testing_strategy": "2-4 sentences: which acceptance criteria each test covers, the sharp edge cases included, and the mocking approach",
   "test_files": [
     {{
       "file_path": "relative/path/to/test_file",

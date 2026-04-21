@@ -2,20 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
 from agenti_helix.agents.models import IntentCompilerOutput as _IntentCompilerOutputModel
 from agenti_helix.observability.debug_log import log_event
-from agenti_helix.runtime.chain_defaults import default_intent_compiler_chain
+from agenti_helix.api.dashboard_doc import resolve_dashboard_doc_url
+from agenti_helix.runtime.chain_defaults import (
+    default_intent_compiler_chain,
+    precompile_doc_enrichment_chain,
+)
 from agenti_helix.runtime.chain_runtime import run_chain
-from agenti_helix.runtime.pipeline_presets import is_pipeline_preset
+from agenti_helix.runtime.tools import tool_build_repo_map_context, tool_fetch_doc_content
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
-from .orchestrator import DagNodeSpec, DagSpec, load_dag_spec, persist_dag_spec
+from .orchestrator import DagNodeSpec, DagSpec
 
 _MAX_COMPILE_RETRIES = 2
+
+_PRECOMPILE_DOC_ACCEPTANCE_CRITERIA = (
+    "Break the macro intent into a small DAG of verifiable coding steps, using the documentation "
+    "constraints below when deciding scope, ordering, and acceptance criteria per node."
+)
 
 
 @dataclass
@@ -27,7 +36,109 @@ class IntentNodeSpec:
     target_file: str
     acceptance_criteria: str
     pipeline_mode: str = "patch"
-    workflow: Optional[List[str]] = None
+
+
+def _coder_task_intent_for_node(
+    *,
+    node_id: str,
+    description: str,
+    acceptance_criteria: str,
+    macro_intent: str,
+    max_macro_chars: int = 600,
+) -> str:
+    """
+    Primary instructions for the coder: one node's goal and acceptance, plus a short product context line.
+
+    The full macro intent is easy to overfit; keep it as reference-only so the agent does not try to
+    implement the entire feature in one node.
+    """
+    macro_compact = " ".join(macro_intent.strip().split())
+    if len(macro_compact) > max_macro_chars:
+        macro_compact = macro_compact[: max_macro_chars - 3] + "..."
+    return (
+        f"You are implementing node **{node_id}** only. Do not expand scope beyond this node.\n\n"
+        f"### Goal\n{description.strip()}\n\n"
+        f"### Acceptance criteria\n{acceptance_criteria.strip()}\n\n"
+        f"### Product context (reference only; do not treat as a separate task list)\n{macro_compact}"
+    )
+
+
+def enrich_macro_intent_with_doc_before_compile(
+    macro_intent: str,
+    *,
+    repo_path: str,
+    dag_id: str,
+    doc_url: Optional[str] = None,
+    doc_text: Optional[str] = None,
+    doc_filename: Optional[str] = None,
+) -> Tuple[str, str, bool]:
+    """
+    When the dashboard attached a URL or uploaded doc text, resolve it, fetch content, run doc_fetcher,
+    and merge distilled constraints into `macro_intent` **before** the intent compiler plans the DAG.
+
+    Returns `(intent_for_compiler, effective_doc_url, doc_merged_into_intent)`.
+    """
+    effective_doc = resolve_dashboard_doc_url(
+        repo_path=repo_path,
+        dag_id=dag_id,
+        doc_url=doc_url,
+        doc_text=doc_text,
+        doc_filename=doc_filename,
+    )
+    url = (effective_doc or "").strip()
+    if not url:
+        return macro_intent, "", False
+
+    repo_root = Path(repo_path).resolve()
+    fd = tool_fetch_doc_content(repo_root=str(repo_root), task_id="", doc_url=url)
+    if (fd.get("fetch_error") or "").strip() and not (str(fd.get("doc_content") or "").strip()):
+        log_event(
+            run_id=dag_id,
+            hypothesis_id="INTENT",
+            location="agenti_helix/orchestration/intent_compiler.py:enrich_macro_intent_with_doc_before_compile",
+            message="Skipping pre-compile doc enrichment (fetch returned no content)",
+            data={"fetch_error": fd.get("fetch_error")},
+        )
+        return macro_intent, effective_doc, False
+
+    rctx = tool_build_repo_map_context(repo_root=str(repo_root))
+    paths = list(rctx.get("allowed_paths") or [])
+    target_file = paths[0] if paths else "."
+
+    initial_context: Dict[str, Any] = {
+        "repo_root": str(repo_root),
+        "task_id": f"{dag_id}:intent-precompile",
+        "doc_url": url,
+        "macro_intent": macro_intent,
+        "target_file": target_file,
+        "acceptance_criteria": _PRECOMPILE_DOC_ACCEPTANCE_CRITERIA,
+    }
+    macro_before = macro_intent.strip()
+    try:
+        final_ctx = run_chain(
+            chain_spec=precompile_doc_enrichment_chain(),
+            initial_context=initial_context,
+            cancel_token=None,
+            run_id=dag_id,
+            hypothesis_id="INTENT",
+            location_prefix="agenti_helix/orchestration/intent_compiler.py:precompile_doc",
+        )
+    except Exception as exc:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id="INTENT",
+            location="agenti_helix/orchestration/intent_compiler.py:enrich_macro_intent_with_doc_before_compile",
+            message="Pre-compile doc chain failed; compiling without doc enrichment",
+            data={"error": str(exc)[:500]},
+        )
+        return macro_intent, effective_doc, False
+
+    merged = final_ctx.get("macro_intent")
+    if isinstance(merged, str) and merged.strip():
+        out = merged.strip()
+        doc_merged = out != macro_before
+        return out, effective_doc, doc_merged
+    return macro_intent, effective_doc, False
 
 
 def _resolve_target_file(repo_root: Path, target_file: str) -> str:
@@ -108,18 +219,9 @@ def compile_macro_intent_with_llm(
     repo_path: str,
     *,
     dag_id: Optional[str] = None,
-    base_url: Optional[str] = None,
-    timeout_seconds: float = 90.0,
+    user_intent_label: Optional[str] = None,
 ) -> DagSpec:
     repo_root = Path(repo_path).resolve()
-    if base_url:
-        log_event(
-            run_id="intent",
-            hypothesis_id="LLM",
-            location="agenti_helix/orchestration/intent_compiler.py:compile_macro_intent_with_llm",
-            message="llm_base_url ignored (in-process chain runtime mode)",
-            data={"base_url": base_url},
-        )
 
     last_error: str = ""
     typed: Dict[str, object] = {}
@@ -166,7 +268,9 @@ def compile_macro_intent_with_llm(
 
     nodes_raw = typed.get("nodes") or []
     edges_raw = typed.get("edges") or []
-    dag_identifier = str(typed.get("dag_id") or dag_id or "dag-llm-intent")
+    # Caller-supplied dag_id (dashboard / CLI) must win over the optional id in LLM JSON,
+    # otherwise we persist two different `*.json` specs and the UI shows duplicate DAGs.
+    dag_identifier = str(dag_id or typed.get("dag_id") or "dag-llm-intent")
 
     intent_nodes: List[IntentNodeSpec] = []
     for item in nodes_raw:
@@ -184,8 +288,7 @@ def compile_macro_intent_with_llm(
                 description=str(item.get("description") or ""),
                 target_file=str(item.get("target_file") or ""),
                 acceptance_criteria=str(item.get("acceptance_criteria") or ""),
-                pipeline_mode=str(item.get("pipeline_mode") or "patch"),
-                workflow=workflow_list,
+                pipeline_mode=str(item.get("pipeline_mode") or "patch").strip() or "patch",
             )
         )
 
@@ -199,22 +302,18 @@ def compile_macro_intent_with_llm(
     dag_nodes: Dict[str, DagNodeSpec] = {}
     for n in intent_nodes:
         resolved_target = _resolve_target_file(repo_root, n.target_file)
-        # Accept named presets plus "patch", "build", or "custom". A bespoke `workflow` list is only honored
-        # when `pipeline_mode == "custom"` (explicit opt-in), otherwise we fall back to
-        # the named preset and ignore any stray workflow list the LLM emitted.
-        if n.pipeline_mode in ("patch", "build", "custom") or is_pipeline_preset(n.pipeline_mode):
-            pipeline_mode = n.pipeline_mode
-        else:
-            pipeline_mode = "patch"
-        workflow = n.workflow if pipeline_mode == "custom" else None
         task = EditTaskSpec(
             task_id=f"{dag_identifier}:{n.node_id}",
-            intent=f"{macro_intent}\n\nSubtask: {n.description}",
+            intent=_coder_task_intent_for_node(
+                node_id=n.node_id,
+                description=n.description,
+                acceptance_criteria=n.acceptance_criteria,
+                macro_intent=macro_intent,
+            ),
             target_file=resolved_target,
             acceptance_criteria=n.acceptance_criteria,
             repo_path=str(repo_root),
-            pipeline_mode=pipeline_mode,
-            workflow=workflow,
+            pipeline_mode=n.pipeline_mode,
         )
         dag_nodes[n.node_id] = DagNodeSpec(
             node_id=n.node_id,
@@ -222,95 +321,14 @@ def compile_macro_intent_with_llm(
             task=task,
         )
 
+    display_label = (user_intent_label if user_intent_label is not None else macro_intent).strip()
     spec = DagSpec(
         dag_id=dag_identifier,
         macro_intent=macro_intent,
         nodes=dag_nodes,
         edges=edges,
+        user_intent_label=display_label,
     )
-    persist_dag_spec(spec)
-    return spec
-
-
-def compile_macro_intent_deterministic(
-    macro_intent: str,
-    repo_path: str,
-    *,
-    dag_id: Optional[str] = None,
-) -> DagSpec:
-    repo_root = Path(repo_path).resolve()
-    dag_identifier = dag_id or "dag-demo-header"
-
-    node1 = DagNodeSpec(
-        node_id="N1-change-color",
-        description="Update header button background color to green.",
-        task=EditTaskSpec(
-            task_id="header-color-primary",
-            intent=macro_intent + "\n\nSubtask: Change the header button background color to green.",
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header has exactly one visible button whose background color is green. "
-                "No unrelated logic is modified."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    node2 = DagNodeSpec(
-        node_id="N2-refine-styles",
-        description="Refine header button styling to remain accessible and consistent.",
-        task=EditTaskSpec(
-            task_id="header-style-refine",
-            intent=(
-                macro_intent
-                + "\n\nSubtask: Ensure the header button styling is consistent and accessible "
-                "(contrast preserved, padding and radius intact)."
-            ),
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header button remains green with good contrast, spacing, and radius. "
-                "Structure of Header component is preserved."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    node3 = DagNodeSpec(
-        node_id="N3-verify-structure",
-        description="Verify Header markup still renders a single primary button.",
-        task=EditTaskSpec(
-            task_id="header-structure-verify",
-            intent=(
-                macro_intent
-                + "\n\nSubtask: Confirm the Header component still renders a single primary button "
-                "inside a header wrapper with padding styles."
-            ),
-            target_file="src/components/header.js",
-            acceptance_criteria=(
-                "Header component renders one primary button inside a header element; "
-                "styling changes must not introduce extra buttons or remove the wrapper."
-            ),
-            repo_path=str(repo_root),
-        ),
-    )
-
-    nodes: Dict[str, DagNodeSpec] = {
-        node1.node_id: node1,
-        node2.node_id: node2,
-        node3.node_id: node3,
-    }
-    edges: List[Tuple[str, str]] = [
-        (node1.node_id, node2.node_id),
-        (node2.node_id, node3.node_id),
-    ]
-
-    spec = DagSpec(
-        dag_id=dag_identifier,
-        macro_intent=macro_intent,
-        nodes=nodes,
-        edges=edges,
-    )
-    persist_dag_spec(spec)
     return spec
 
 
@@ -319,30 +337,18 @@ def compile_macro_intent_to_dag(
     repo_path: str,
     *,
     dag_id: Optional[str] = None,
-    use_llm: bool = True,
-    llm_base_url: Optional[str] = None,
+    user_intent_label: Optional[str] = None,
 ) -> DagSpec:
     """
-    Compile `macro_intent` into a `DagSpec`.
+    Compile `macro_intent` into a `DagSpec` via the LLM intent compiler.
 
-    When `use_llm=True` (default), the LLM intent compiler is used and a
-    `ValueError` is raised if it fails after all retries — callers must handle
-    this rather than silently falling back to the demo stub.
-
-    When `use_llm=False`, the deterministic demo compiler runs; this is only
-    appropriate for the demo repo layout (src/components/header.js). Callers
-    should not use `use_llm=False` in production.
+    Raises `ValueError` if the LLM intent compiler fails after all retries.
+    Callers must handle this; there is no deterministic fallback.
     """
-    if use_llm:
-        return compile_macro_intent_with_llm(
-            macro_intent,
-            repo_path,
-            dag_id=dag_id,
-            base_url=llm_base_url,
-        )
-    return compile_macro_intent_deterministic(
+    return compile_macro_intent_with_llm(
         macro_intent,
         repo_path,
         dag_id=dag_id,
+        user_intent_label=user_intent_label,
     )
 

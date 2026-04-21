@@ -1,60 +1,37 @@
+"""
+Single entry point for resolving coder/judge chains for a task.
+
+The verification loop calls ``resolve_coder_chain`` and ``resolve_judge_chain``
+once per cycle; both delegate to ``runtime.run_plan`` so chain composition
+lives in a single place.
+
+Resolution priority:
+  1. Explicit ``task.coder_chain`` / ``task.judge_chain`` overrides (API).
+  2. ``RunPlan`` derived from ``task.pipeline_mode`` (legacy bridge for the
+     existing dashboard ``mode`` + ``extras`` API surface).
+"""
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from agenti_helix.runtime.chain_defaults import (
-    build_workflow_coder_chain,
-    build_workflow_judge_chain,
-    default_coder_chain,
-    default_judge_chain,
-    default_full_pipeline_coder_chain,
-    default_full_pipeline_judge_chain,
+from agenti_helix.runtime.run_plan import (
+    build_coder_chain,
+    build_judge_chain,
+    plan_from_legacy_mode,
 )
 from agenti_helix.runtime.pipeline_presets import get_pipeline_workflow, is_pipeline_preset
 from agenti_helix.verification.checkpointing import EditTaskSpec
 
 
 def resolve_coder_chain(task: EditTaskSpec) -> Dict[str, Any]:
-    """
-    Choose the coder chain for a task.
-
-    Priority:
-      1. Explicit `task.coder_chain` (user override via API).
-      2. Bespoke `task.workflow` — dynamic chain synthesized from agent_ids.
-      3. `task.pipeline_mode == "build"` → full TDD pipeline.
-      4. Default → single-file patch chain.
-    """
     if task.coder_chain:
         return task.coder_chain
-    workflow = getattr(task, "workflow", None)
-    if workflow:
-        return build_workflow_coder_chain(list(workflow), task)
-    pipeline_mode = getattr(task, "pipeline_mode", "patch")
-    if is_pipeline_preset(pipeline_mode):
-        return build_workflow_coder_chain(get_pipeline_workflow(str(pipeline_mode)), task)
-    if pipeline_mode == "build":
-        return default_full_pipeline_coder_chain(task)
-    return default_coder_chain(task)
+    plan = plan_from_legacy_mode(getattr(task, "pipeline_mode", "patch"))
+    return build_coder_chain(task, plan)
 
 
 def resolve_judge_chain(task: EditTaskSpec) -> Dict[str, Any]:
-    """
-    Choose the judge chain for a task.
-
-    Priority:
-      1. Explicit `task.judge_chain` (user override via API).
-      2. Bespoke `task.workflow` — dynamic chain synthesized from agent_ids.
-      3. `task.pipeline_mode == "build"` → full TDD judge pipeline.
-      4. Default → snippet-comparison judge chain.
-    """
     if task.judge_chain:
         return task.judge_chain
-    workflow = getattr(task, "workflow", None)
-    if workflow:
-        return build_workflow_judge_chain(list(workflow), task)
-    pipeline_mode = getattr(task, "pipeline_mode", "patch")
-    if is_pipeline_preset(pipeline_mode):
-        return build_workflow_judge_chain(get_pipeline_workflow(str(pipeline_mode)), task)
-    if pipeline_mode == "build":
-        return default_full_pipeline_judge_chain(task)
-    return default_judge_chain(task)
+    plan = plan_from_legacy_mode(getattr(task, "pipeline_mode", "patch"))
+    return build_judge_chain(task, plan)

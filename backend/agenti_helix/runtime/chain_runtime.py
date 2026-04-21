@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from agenti_helix.api.job_registry import TaskCancelledError
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.agent_runtime import run_agent
+from agenti_helix.runtime.structured_output import is_structured_agent, run_agent_structured
 from agenti_helix.runtime.tools import TOOL_REGISTRY
 
 
@@ -99,17 +100,8 @@ def run_chain(
         if not isinstance(input_bindings, dict):
             raise ValueError(f"Invalid step.input_bindings at index={idx}")
 
-        # Skip this step if its output is already present in the context (cache hit).
-        # Callers mark expensive upstream steps (e.g. context_librarian, sdet) with
-        # `"skip_if_present": true` so that coder retries bypass them.
-        if step.get("skip_if_present") and output_key in ctx:
-            log_event(
-                run_id=run_id,
-                hypothesis_id=hypothesis_id,
-                location=f"{location_prefix}:{step_id}",
-                message="Step skipped (output already in context)",
-                data={"output_key": output_key, "step_index": idx},
-            )
+        skip_key = step.get("skip_if_nonempty_key")
+        if isinstance(skip_key, str) and skip_key.strip() and ctx.get(skip_key):
             continue
 
         bound_inputs = _resolve_binding(input_bindings, ctx)
@@ -154,7 +146,8 @@ def run_chain(
                 v = ctx.get(key)
                 if isinstance(v, str) and v:
                     observe[key] = v
-            out = run_agent(
+            agent_caller = run_agent_structured if is_structured_agent(agent_id) else run_agent
+            out = agent_caller(
                 agent_id=agent_id,
                 raw_input=bound_inputs,
                 runtime=runtime,

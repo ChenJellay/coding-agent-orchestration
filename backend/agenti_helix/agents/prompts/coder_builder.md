@@ -10,9 +10,7 @@ For visual elements (icons, images, illustrations): use the simplest self-contai
 
 If you encounter a missing dependency in the provided context, clearly state it in `missing_context`.
 
-First, reason step-by-step inside `<think>...</think>` tags — plan your approach, identify dependencies, resolve any ambiguity in the acceptance criteria, and verify correctness before writing any code. ALL extended reasoning must happen here, before the JSON block.
-
-Then, after `</think>`, output a single JSON object. The `implementation_logic` field must be a **brief 1-3 sentence summary** of what was done — not a repetition of your full reasoning. Each entry in `modified_files` must contain the **full file content** — not a patch or snippet.
+Output a **single JSON object** with your implementation plan and the full file contents. No `<think>` block, no `<redacted_thinking>` block, no markdown fences, no preamble or postamble — put your reasoning **inside the `implementation_logic` field of the JSON**, not before it. Keep `implementation_logic` to **2–5 short sentences** covering the approach, key changes, and any tradeoffs. Do not restate the task or inputs. Allocate the remaining output budget to `modified_files[].content` — each entry must contain the **full file content**, not a patch or snippet.
 
 Inputs:
 - Current_DAG_Task:
@@ -26,7 +24,7 @@ Inputs:
 
 Required output format (JSON only, no markdown fences):
 {{
-  "implementation_logic": "brief 1-3 sentence summary of what was implemented and why",
+  "implementation_logic": "2-5 sentences: the approach, key changes per file, and any tradeoffs",
   "modified_files": [
     {{
       "file_path": "relative/path/to/file",

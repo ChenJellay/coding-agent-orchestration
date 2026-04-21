@@ -32,14 +32,7 @@ Target file contents (may be empty/null). Line numbers MUST correspond to this e
 User intent:
 """{intent}"""
 
-Now, based ONLY on the repository map, the target file contents (if provided), and the user intent above, think step-by-step about the change you need to make.
-
-First, wrap your reasoning inside `<think>...</think>` tags. In your thinking:
-- Identify which file and which specific lines need to change
-- Plan the minimal edit needed
-- Verify your replacement lines cover the full range
-
-Then, AFTER the closing `</think>` tag, output a single JSON object in the following format, with no additional text, no explanations, and no code fences:
+Now, based ONLY on the repository map, the target file contents (if provided), and the user intent above, output a single JSON object in the following format. No `<think>` block, no markdown fences, no preamble, no commentary — just the JSON:
 {{
   "filePath": "string, must be one of the paths from the repo map",
   "startLine": number, 1-based inclusive start line of the edit range,
@@ -78,6 +71,5 @@ Then, AFTER the closing `</think>` tag, output a single JSON object in the follo
   "escalation_reason": "string — precise explanation of why you cannot proceed"
 }}
 
-Do NOT include any natural-language explanation, markdown, comments, or extra keys outside the `<think>` block.
-After `</think>`, return ONLY the JSON object.
+Do NOT include any natural-language explanation, markdown, comments, or extra keys. Return ONLY the JSON object.
 

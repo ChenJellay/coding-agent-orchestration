@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agenti_helix.api.paths import HelixPaths
+from agenti_helix.verification import checkpointing as cp_mod
 from agenti_helix.verification.checkpointing import (
     Checkpoint,
     EditTaskSpec,
@@ -14,9 +16,15 @@ from agenti_helix.verification.checkpointing import (
 )
 
 
+def _isolate_helix_paths(monkeypatch, tmp_path: Path) -> None:
+    """Redirect checkpoint storage to ``tmp_path`` so tests don't pick up
+    workspace-level state from previous runs."""
+    monkeypatch.setattr(cp_mod, "PATHS", HelixPaths(repo_root=tmp_path))
+
+
 def test_create_and_persist_checkpoint(tmp_path: Path, monkeypatch) -> None:
-    # Use a temporary working directory for checkpoint files and target file.
     monkeypatch.chdir(tmp_path)
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     repo = tmp_path / "demo-repo"
     repo.mkdir()
@@ -55,6 +63,7 @@ def test_create_and_persist_checkpoint(tmp_path: Path, monkeypatch) -> None:
 
 def test_rollback_restores_file(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _isolate_helix_paths(monkeypatch, tmp_path)
 
     repo = tmp_path / "demo-repo"
     repo.mkdir()

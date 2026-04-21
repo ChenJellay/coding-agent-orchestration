@@ -74,6 +74,17 @@ Open [http://localhost:5173](http://localhost:5173) and click **"Run command"** 
 
 The DAG will compile, agents will execute, and you can review the diff and verdict in the tri-pane review panel.
 
+### Headless eval (no UI)
+
+With Judge + API running and `AGENTI_HELIX_REPO_ROOT` pointing at `demo-repo/` (the default when using `./scripts/start-dev.sh`):
+
+```bash
+python scripts/eval/headless_eval.py --tags stable
+python scripts/eval/headless_eval.py --tags all
+```
+
+`stable` runs S1–S3, S5–S7 (memory summarizer, supreme court, cascade, security, build). `all` also includes the LLM escalation scenario (S4). Writes `demo-repo/.agenti_helix/eval/last-run.json` and `last-run.md`. See `demo-repo/eval/scenarios.json` and `deliverables/06_evaluation_plan.md`.
+
 ---
 
 ## 1. Overview

@@ -3,7 +3,8 @@ L1.4 — Dependency graph and focused context tool tests.
 
 Verifies that:
 - build_dependency_graph resolves relative imports correctly.
-- get_focused_files returns the target file and its 1-hop deps.
+- get_focused_files returns the target file and its import deps, and when depth>0
+  also files that import those files (e.g. tests importing the module under edit).
 - tool_get_focused_context returns the correct subset + full allowed_paths.
 - Absolute / third-party imports are not resolved.
 """
@@ -84,12 +85,33 @@ def test_focused_files_includes_1_hop_deps():
     assert "src/b.js" in paths
 
 
+def test_focused_files_includes_importers_when_depth_positive():
+    """Tests that import a module but are not imported from the app entry must appear in AST focus."""
+    rm = _make_map(
+        _f("src/index.js", imports=["./components/header"]),
+        _f("src/components/header.js"),
+        _f("src/components/header.test.js", imports=["./header"]),
+    )
+    focused = get_focused_files(rm, ["src/index.js"], depth=2)
+    paths = {f.path for f in focused}
+    assert "src/components/header.test.js" in paths
+    assert "src/components/header.js" in paths
+
+
 def test_focused_files_depth_zero_no_deps():
     rm = _make_map(_f("src/a.js", imports=["./b"]), _f("src/b.js"))
     focused = get_focused_files(rm, ["src/a.js"], depth=0)
     paths = {f.path for f in focused}
     assert "src/a.js" in paths
     assert "src/b.js" not in paths
+
+
+def test_focused_files_depth_zero_excludes_reverse_importers():
+    """Depth 0 stays entry-only even if another file imports the target."""
+    rm = _make_map(_f("src/a.js"), _f("src/b.js", imports=["./a"]))
+    focused = get_focused_files(rm, ["src/a.js"], depth=0)
+    paths = {f.path for f in focused}
+    assert paths == {"src/a.js"}
 
 
 def test_focused_files_unknown_target_skipped():

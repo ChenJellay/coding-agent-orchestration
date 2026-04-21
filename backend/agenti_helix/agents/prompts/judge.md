@@ -14,14 +14,16 @@ Your task:
 - If it does not, return verdict "FAIL" and explain why.
 - Optionally, list up to 5 specific 1-based line numbers in the edited snippet that are problematic. Do NOT enumerate every line — pick only the lines where the actual error originates. If the error is a missing brace or a global parse failure, list only the line(s) where the syntax breaks, not every line in the file.
 
-First, reason step-by-step inside `<think>...</think>` tags. Then, after `</think>`, output ONLY the JSON below (no markdown fences, no extra text):
+Output **only** the JSON object below — no `<think>` block, no markdown fences, no preamble, no commentary:
 {{
   "verdict": "PASS" | "FAIL",
-  "justification": "short explanation string",
+  "justification": "short explanation string (one sentence)",
   "problematic_lines": [1, 2, 3]
 }}
 
-**JSON string rules (critical):** `justification` is a JSON string value. It must NOT contain raw double-quote characters (`"`). When you mention code or attribute names that use double quotes, either use single quotes in prose (e.g. `color: 'yellow'`) or escape every double-quote as `\\"`. Triple-quote `"""` is forbidden inside the JSON object. Do not paste JSON or code samples that contain unescaped `"` inside this field — paraphrase or use single-quoted tokens instead.
+**Brevity (critical):** This is a classification task. Aim for a one-sentence `justification`. Do not narrate your reasoning — emit the verdict directly.
+
+**JSON string rules (critical):** `justification` is a JSON string value. It must NOT contain raw double-quote characters (`"`). When you mention code or attribute names that use double quotes, either use single quotes in prose (e.g. `color: 'yellow'`) or escape every double-quote as `\\"`. Triple-quote `"""` is forbidden inside the JSON object.
 
 Acceptance criteria:
 """{acceptance_criteria}"""

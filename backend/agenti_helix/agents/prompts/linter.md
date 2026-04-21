@@ -30,18 +30,16 @@ acceptance_criteria:{acceptance_criteria}
 5. Sort: errors first, then warnings, then info. Within each tier, sort by line_number ascending.
 
 ## Output
-First, reason step-by-step inside `<think>...</think>` tags — parse the linter output and cross-reference against acceptance criteria.
-
-Then, after `</think>`, respond with **only** a JSON object — no prose, no markdown fences.
+Respond with **only** a JSON object — no `<think>` block, no prose, no markdown fences. Put any reasoning into the `summary` field of the JSON, not before it.
 
 ```json
-{
+{{
   "target_file": "<echoed>",
   "language": "<echoed>",
   "finding_count": 3,
   "has_errors": true,
   "findings": [
-    {
+    {{
       "line_number": 12,
       "column": 5,
       "rule_id": "TS2345",
@@ -49,10 +47,10 @@ Then, after `</think>`, respond with **only** a JSON object — no prose, no mar
       "message": "Argument of type 'string' is not assignable to parameter of type 'number'.",
       "fix_hint": "Cast the argument with Number() or change the parameter type to string.",
       "blocks_acceptance": true
-    }
+    }}
   ],
   "summary": "2 errors and 1 warning. The type error on line 12 will likely cause the judge to fail this task."
-}
+}}
 ```
 
 ## Rules

@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from agenti_helix.api.auth import Role, require_editor
 from agenti_helix.api.errors import raise_http_error
+from agenti_helix.runtime.pipeline_presets import PIPELINE_MODES
 from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
 from agenti_helix.api.job_registry import CancelToken, cancel_running_job_for_task, start_background_job
 from agenti_helix.api.paths import PATHS, iter_jsonl, read_json
@@ -20,7 +22,10 @@ from agenti_helix.api.task_context_store import load_task_context, render_task_c
 from agenti_helix.api.task_lookup import find_task_ref, persist_dag_state, try_load_dag_state
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.orchestration.orchestrator import DagNodeStatus, execute_dag, load_dag_spec, persist_dag_spec
-from agenti_helix.orchestration.intent_compiler import compile_macro_intent_to_dag
+from agenti_helix.orchestration.intent_compiler import (
+    compile_macro_intent_to_dag,
+    enrich_macro_intent_with_doc_before_compile,
+)
 from agenti_helix.runtime.chain_defaults import default_coder_chain, default_judge_chain
 from agenti_helix.verification.checkpointing import (
     EditTaskSpec,
@@ -28,6 +33,7 @@ from agenti_helix.verification.checkpointing import (
     VerificationStatus,
     apply_signed_off_checkpoint,
     load_checkpoint,
+    materialize_passed_checkpoint_to_workspace,
     rollback_to_checkpoint,
 )
 from agenti_helix.verification.verification_loop import run_verification_loop
@@ -37,63 +43,58 @@ from agenti_helix.api.git_ops import real_git_commit
 router = APIRouter()
 
 
-@router.delete("/api/dags/{dag_id}")
-def remove_dag_from_workflow(dag_id: str, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
-    """Remove a DAG from the control-plane workflow.
-
-    - Cancels any running background jobs for its nodes (best-effort).
-    - Deletes the persisted DAG spec + DAG state from disk.
-    """
-    spec_path = PATHS.dags_dir / f"{dag_id}.json"
-    state_path = PATHS.dags_dir / f"{dag_id}_state.json"
-
-    removed_spec = False
-    removed_state = False
-
-    # Best-effort cancel: parse nodes -> task_ids, then cancel jobs keyed by dag_id|node_id|task_id.
-    if spec_path.exists():
+def _repo_rel_path(*, repo_root: Path, task_repo: Path, rel_or_abs: str) -> str:
+    """Express ``rel_or_abs`` as a path relative to ``repo_root`` for git staging."""
+    rel_or_abs = rel_or_abs.strip().replace("\\", "/").lstrip("/")
+    if not rel_or_abs:
+        return ""
+    p = Path(rel_or_abs)
+    if p.is_absolute():
         try:
-            spec = read_json(spec_path)
-            nodes = spec.get("nodes") if isinstance(spec, dict) else None
-            if isinstance(nodes, dict):
-                for node_id, node_data in nodes.items():
-                    if not isinstance(node_data, dict):
-                        continue
-                    task = node_data.get("task")
-                    if not isinstance(task, dict):
-                        continue
-                    tid = task.get("task_id")
-                    if isinstance(tid, str) and tid:
-                        cancel_running_job_for_task(dag_id=dag_id, node_id=str(node_id), task_id=tid)
+            return p.resolve().relative_to(repo_root).as_posix()
+        except ValueError:
+            return rel_or_abs
+    try:
+        return (task_repo / rel_or_abs).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return rel_or_abs
+
+
+def _merge_stage_paths(*, repo_root: Path, task: EditTaskSpec, checkpoint: Checkpoint) -> List[str]:
+    """Paths relative to the git root to include in a merge commit (primary file + diff metadata)."""
+    task_repo = Path(task.repo_path).resolve()
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        raw = raw.strip()
+        if not raw:
+            return
+        rel = _repo_rel_path(repo_root=repo_root, task_repo=task_repo, rel_or_abs=raw)
+        if rel and rel not in seen:
+            seen.add(rel)
+            ordered.append(rel)
+
+    if task.target_file:
+        add(str(task.target_file))
+
+    if checkpoint.diff:
+        try:
+            d = json.loads(checkpoint.diff)
+            if isinstance(d, dict):
+                fp = d.get("filePath")
+                if isinstance(fp, str):
+                    add(fp)
+                for key in ("files_written", "test_file_paths"):
+                    lst = d.get(key)
+                    if isinstance(lst, list):
+                        for item in lst:
+                            if isinstance(item, str):
+                                add(item)
         except Exception:
             pass
 
-    if spec_path.exists():
-        try:
-            spec_path.unlink()
-            removed_spec = True
-        except OSError as exc:
-            raise_http_error(code="dag_delete_failed", message=f"Could not delete DAG spec: {exc}", status_code=500)
-
-    if state_path.exists():
-        try:
-            state_path.unlink()
-            removed_state = True
-        except OSError as exc:
-            raise_http_error(code="dag_state_delete_failed", message=f"Could not delete DAG state: {exc}", status_code=500)
-
-    if not removed_spec and not removed_state:
-        raise_http_error(code="dag_not_found", message=f"No persisted DAG found for dag_id={dag_id!r}", status_code=404)
-
-    invalidate_features_and_triage_caches()
-    log_event(
-        run_id=dag_id,
-        hypothesis_id="workflow_removed",
-        location="agenti_helix/api/task_commands_routes.py:remove_dag_from_workflow",
-        message="DAG removed from workflow (spec/state deleted)",
-        data={"dag_id": dag_id, "removed_spec": removed_spec, "removed_state": removed_state},
-    )
-    return {"ok": True, "removed_spec": removed_spec, "removed_state": removed_state}
+    return ordered
 
 
 def _ensure_dag_state_initialized(*, dag_id: str) -> Dict[str, Any]:
@@ -298,28 +299,114 @@ class EditIntentRequestBody(BaseModel):
     macro_intent: str
 
 
+class ExecutionExtras(BaseModel):
+    """Optional behaviour toggles layered on top of the base mode (RunPlan flags)."""
+
+    doc: bool = Field(
+        default=False,
+        description="Run the doc_fetcher prefix that distils PRD/API docs into the macro intent.",
+    )
+    diff_gate: bool = Field(
+        default=False,
+        description="Insert the diff_validator gate between the coder and the judge.",
+    )
+    lint_type: bool = Field(
+        default=False,
+        description="Run the linter + type_checker agents and fold their findings into the judge prompt.",
+    )
+    memory_summarizer: bool = Field(
+        default=False,
+        description=(
+            "Before each retry, replace raw judge justification with a focused hint synthesised by "
+            "memory_summarizer_v1 from attempt history + similar past episodes."
+        ),
+    )
+    supreme_court: bool = Field(
+        default=False,
+        description=(
+            "After retries are exhausted, invoke supreme_court_v1 to arbitrate: PASS_OVERRIDE promotes "
+            "to PASSED; ESCALATE_HUMAN marks BLOCKED with human_review_required; CONFIRM_BLOCKED is the default."
+        ),
+    )
+
+
+# Reverse map: a RunPlan tuple → the legacy pipeline_mode string EditTaskSpec uses.
+# Kept in lockstep with PIPELINE_MODES; any combination not in this table is rejected
+# upstream so the chain resolvers always see a valid mode.
+def _runplan_to_legacy_mode(*, gather_doc: bool, write_tests: bool, diff_gate: bool, lint_type_gate: bool) -> Optional[str]:
+    key = (gather_doc, write_tests, diff_gate, lint_type_gate)
+    return {
+        (False, False, False, False): "patch",
+        (False, False, True, False): "diff_guard_patch",
+        (False, True, False, False): "build",
+        (False, True, True, False): "secure_build_plus",
+        (True, True, True, False): "product_eng",
+        (False, True, False, True): "lint_type_gate",
+    }.get(key)
+
+
+def _resolve_internal_pipeline_mode(
+    mode: Optional[str],
+    extras: ExecutionExtras,
+) -> Optional[str]:
+    """
+    Translate the dashboard ``(mode, extras)`` payload into a legacy
+    ``pipeline_mode`` string that ``EditTaskSpec`` carries through the loop.
+
+    Today the chain resolver still keys off ``pipeline_mode``; this is the
+    single conversion site so everything else can think in terms of RunPlan.
+    """
+    if mode is None:
+        return None
+    base = mode.strip().lower()
+    if base not in {"patch", "build"}:
+        raise ValueError(f"Unknown mode={mode!r}; expected 'patch', 'build', or null.")
+
+    write_tests = base == "build"
+    legacy = _runplan_to_legacy_mode(
+        gather_doc=bool(extras.doc),
+        write_tests=write_tests,
+        diff_gate=bool(extras.diff_gate),
+        lint_type_gate=bool(extras.lint_type),
+    )
+    if legacy is None:
+        raise ValueError(
+            f"Unsupported combination: mode={base!r}, extras={extras.model_dump()}. "
+            "Run the dashboard with one of the supported presets, or omit conflicting toggles."
+        )
+    return legacy
+
+
 class ExecuteDagFromDashboardRequestBody(BaseModel):
     repo_path: str = Field(description="Absolute or relative path to the target repository root.")
     macro_intent: str = Field(description="Helix command / macro intent that compiles into a DAG.")
     agent_ids: List[str] = Field(
-        description="Selected agents. When pipeline_mode is set, agent_ids are informational only.",
+        description="Selected agents. When mode is set, agent_ids are informational only.",
         default=["coder_patch_v1", "judge_v1"],
     )
     dag_id: Optional[str] = Field(default=None, description="Optional DAG id (feature id).")
-    use_llm: bool = Field(
-        default=False,
-        description="When true, compile intent via LLM (needs inference; can block POST until complete). "
-        "When false or omitted, use the fast deterministic demo compiler (writes DAG immediately).",
-    )
-    pipeline_mode: Optional[str] = Field(
+    mode: Optional[str] = Field(
         default=None,
         description=(
-            "Override pipeline for all DAG nodes: "
-            '"patch" (fast single-file, coder_patch_v1 + judge_v1) or '
-            '"build" (full TDD pipeline: librarian → sdet → coder_builder → governor → judge_evaluator), '
-            '"product_eng", "diff_guard_patch", "secure_build_plus", or "lint_type_gate". '
-            "When null, the orchestrator assigns pipeline_mode per node (requires use_llm=true)."
+            'Base execution mode: "patch" for fast single-file line-patches, "build" for full TDD. '
+            "Set to null to let the LLM intent compiler pick per node."
         ),
+    )
+    extras: ExecutionExtras = Field(
+        default_factory=ExecutionExtras,
+        description="Optional behaviour toggles (doc, diff_gate, lint_type).",
+    )
+    doc_url: Optional[str] = Field(
+        default=None,
+        description="Optional documentation URL for doc_fetcher (extras.doc). Ignored when doc_text is set.",
+    )
+    doc_text: Optional[str] = Field(
+        default=None,
+        description="Optional uploaded documentation body; written under .agenti_helix/ and referenced via file URI.",
+    )
+    doc_filename: Optional[str] = Field(
+        default=None,
+        description="Original filename for uploaded doc (used to pick .md/.txt extension).",
     )
 
 
@@ -463,7 +550,7 @@ def edit_dag_intent(dag_id: str, body: EditIntentRequestBody) -> Dict[str, Any]:
             body.macro_intent,
             repo_path=repo_root,
             dag_id=dag_id,
-            use_llm=True,
+            user_intent_label=body.macro_intent.strip(),
         )
     except Exception as exc:
         raise_http_error(
@@ -521,29 +608,59 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     UI entrypoint for starting a new DAG from:
       - a selected local repository (`repo_path`)
       - a command (`macro_intent`)
-      - optional `pipeline_mode` override ("patch" | "build")
+      - an execution `mode` ("patch" or "build", or null to let the LLM decide)
+      - optional `extras` toggles (doc, diff_gate, lint_type)
 
-    When `pipeline_mode` is "build", the full TDD pipeline
+    When mode is "build", the full TDD pipeline
     (librarian → sdet → coder_builder → governor → judge_evaluator) runs per node.
-    When "patch" (default), the fast single-file coder_patch_v1 + judge_v1 chain runs.
-    When null and use_llm=true, the orchestrator assigns pipeline_mode per node.
+    When "patch", the fast single-file coder_patch_v1 + judge_v1 chain runs.
+    When null, the orchestrator assigns the pipeline per node based on the LLM compiler's output.
     """
     dag_id = body.dag_id or f"dag-ui-run-{int(time.time())}"
 
-    # Capture body fields for use inside the closure (avoid late-binding issues).
     _macro_intent = body.macro_intent
     _repo_path = body.repo_path
-    _use_llm = body.use_llm
-    _pipeline_mode = body.pipeline_mode
+    try:
+        _pipeline_mode = _resolve_internal_pipeline_mode(body.mode, body.extras)
+    except ValueError as exc:
+        raise_http_error(code="invalid_mode", message=str(exc), status_code=400)
+    if _pipeline_mode is not None and _pipeline_mode not in PIPELINE_MODES:
+        raise_http_error(
+            code="invalid_pipeline_mode",
+            message=f"Resolved pipeline_mode={_pipeline_mode!r} is not in {sorted(PIPELINE_MODES)}",
+            status_code=500,
+        )
+    _doc_url_opt = (body.doc_url or "").strip() or None
+    _doc_text = body.doc_text
+    _doc_filename = body.doc_filename
 
     def _compile_and_execute(_cancel_token: object) -> None:
-        """Compile the DAG spec (possibly via LLM) and execute it — all in the background."""
+        """Compile the DAG spec via LLM and execute it — all in the background."""
         try:
-            spec = compile_macro_intent_to_dag(
+            macro_for_compile, effective_doc, doc_merged_at_compile = enrich_macro_intent_with_doc_before_compile(
                 _macro_intent,
                 repo_path=_repo_path,
                 dag_id=dag_id,
-                use_llm=_use_llm,
+                doc_url=_doc_url_opt,
+                doc_text=_doc_text,
+                doc_filename=_doc_filename,
+            )
+        except ValueError as exc:
+            log_event(
+                run_id=dag_id,
+                hypothesis_id="orchestrator",
+                location="agenti_helix/api/task_commands_routes.py:run_dag_from_dashboard",
+                message="Dashboard doc attachment rejected — DAG will not run",
+                data={"error": str(exc)},
+            )
+            return
+
+        try:
+            spec = compile_macro_intent_to_dag(
+                macro_for_compile,
+                repo_path=_repo_path,
+                dag_id=dag_id,
+                user_intent_label=_macro_intent.strip(),
             )
         except Exception as exc:
             log_event(
@@ -555,12 +672,30 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
             )
             return
 
-        # Apply pipeline_mode override when provided.
-        for _node_id, node in spec.nodes.items():
-            if _pipeline_mode is not None:
+        # Intent JSON may name a different dag_id than the dashboard assigned; features + UI key off `dag_id`.
+        spec.dag_id = dag_id
+        for nid, node in spec.nodes.items():
+            node.task.task_id = f"{dag_id}:{nid}"
+
+        if effective_doc:
+            for node in spec.nodes.values():
+                node.task.doc_url = effective_doc
+                if doc_merged_at_compile:
+                    node.task.skip_doc_chain_prefix = True
+
+        if _pipeline_mode is not None:
+            for node in spec.nodes.values():
                 node.task.pipeline_mode = _pipeline_mode
-            elif not _use_llm:
-                node.task.pipeline_mode = "patch"
+
+        # Retry-loop opt-ins are orthogonal to pipeline_mode (they govern the
+        # loop's behaviour *after* per-attempt judge returns, not the coder
+        # chain). Apply unconditionally when enabled in extras.
+        if body.extras.memory_summarizer or body.extras.supreme_court:
+            for node in spec.nodes.values():
+                if body.extras.memory_summarizer:
+                    node.task.enable_memory_summarizer = True
+                if body.extras.supreme_court:
+                    node.task.enable_supreme_court = True
 
         # Ensure the DAG id and task ids align with the UI-requested feature id so UI polling is consistent.
         # The intent compiler may emit its own `dag_id` (e.g. a slug), but the dashboard run expects `dag_id`.
@@ -574,7 +709,13 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
         execute_dag(spec)
 
     start_background_job(
-        meta={"dag_id": dag_id, "action": "ui-run", "pipeline_mode": body.pipeline_mode},
+        meta={
+            "dag_id": dag_id,
+            "action": "ui-run",
+            "mode": body.mode,
+            "extras": body.extras.model_dump(),
+            "pipeline_mode": _pipeline_mode,
+        },
         target=_compile_and_execute,
     )
 
@@ -768,26 +909,34 @@ def merge_task_to_main(body: MergeRequestBody, _role: Role = Depends(require_edi
     if checkpoint.status != VerificationStatus.PASSED:
         raise_http_error(code="checkpoint_not_verified", message="Checkpoint is not in PASSED state", status_code=409)
 
-    # §4.6 — Real git commit (or simulation when AGENTI_HELIX_GIT_COMMIT_ENABLED is unset).
-    repo_path = str(PATHS.repo_root) if hasattr(PATHS, "repo_root") else str(PATHS.agenti_root.parent)
-    # Derive target files from the checkpoint diff when available.
-    target_files: List[str] = []
-    if checkpoint.diff:
-        try:
-            diff_obj = json.loads(checkpoint.diff)
-            if diff_obj.get("filePath"):
-                target_files = [diff_obj["filePath"]]
-        except Exception:
-            pass
+    try:
+        materialize_passed_checkpoint_to_workspace(task=ref.task, checkpoint=checkpoint)
+    except ValueError as exc:
+        raise_http_error(code="checkpoint_materialize_failed", message=str(exc), status_code=409)
 
-    commit_result = real_git_commit(
-        repo_path=repo_path,
-        target_files=target_files,
-        commit_message=body.commit_message or f"feat(agenti): {ref.task.intent[:80] if hasattr(ref.task, 'intent') else body.task_id}",
-        trace_id=getattr(checkpoint, "trace_id", None),
-        dag_id=ref.dag_id,
-        intent_summary=getattr(ref.task, "intent", None) if hasattr(ref, "task") else None,
-    )
+    # §4.6 — Real git commit (or simulation when AGENTI_HELIX_GIT_COMMIT_ENABLED is unset).
+    repo_root_path = PATHS.repo_root.resolve()
+    target_files = _merge_stage_paths(repo_root=repo_root_path, task=ref.task, checkpoint=checkpoint)
+    if not target_files:
+        raise_http_error(
+            code="merge_no_target_files",
+            message="Could not resolve target file paths for merge (missing task.target_file).",
+            status_code=500,
+        )
+
+    try:
+        commit_result = real_git_commit(
+            repo_path=str(repo_root_path),
+            target_files=target_files,
+            commit_message=body.commit_message
+            or f"feat(agenti): {ref.task.intent[:80] if hasattr(ref.task, 'intent') else body.task_id}",
+            trace_id=getattr(checkpoint, "trace_id", None),
+            dag_id=ref.dag_id,
+            intent_summary=getattr(ref.task, "intent", None) if hasattr(ref, "task") else None,
+            target_branch=body.target_branch or "main",
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        raise_http_error(code="merge_commit_failed", message=str(exc), status_code=500)
 
     merges_dir = PATHS.agenti_root / "merges"
     merges_dir.mkdir(parents=True, exist_ok=True)
@@ -820,6 +969,8 @@ def merge_task_to_main(body: MergeRequestBody, _role: Role = Depends(require_edi
         message=f"Merged to main{simulated_note}",
         data={"task_id": body.task_id, "checkpoint_id": body.checkpoint_id, "mergeRef": merge_ref, "sha": commit_result.get("sha")},
     )
+
+    invalidate_features_and_triage_caches()
 
     return {"ok": True, "mergeRef": merge_ref, "sha": commit_result.get("sha"), "simulated": commit_result.get("simulated", True)}
 

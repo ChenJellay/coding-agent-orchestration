@@ -28,8 +28,8 @@ def _mlx_inference_timeout() -> Optional[float]:
 
 
 def _mlx_stream_progress_interval() -> int:
-    """How many tokens between llm_progress event writes (0 = disabled)."""
-    return int(os.environ.get("AGENTI_HELIX_MLX_PROGRESS_INTERVAL", "50"))
+    """How many tokens between on_progress callbacks / llm_progress events (0 = disabled)."""
+    return int(os.environ.get("AGENTI_HELIX_MLX_PROGRESS_INTERVAL", "0"))
 
 
 def _mlx_enable_thinking() -> bool:
@@ -170,7 +170,7 @@ class MLXLocalInferenceBackend:
         - Wraps the prompt in a Qwen3/3.5 no-think chat template so the model
           skips extended reasoning and emits the answer directly.
         - Uses stream_generate so we can fire on_progress callbacks every
-          AGENTI_HELIX_MLX_PROGRESS_INTERVAL tokens (default 50).
+          AGENTI_HELIX_MLX_PROGRESS_INTERVAL tokens (default 0 = off).
         - Enforces AGENTI_HELIX_MLX_TIMEOUT_SECONDS (default 300 s) by checking
           elapsed time inside the streaming loop, then raising TimeoutError.
         """

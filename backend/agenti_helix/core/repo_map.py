@@ -102,6 +102,17 @@ def build_dependency_graph(repo_map: RepoMap) -> Dict[str, List[str]]:
     return graph
 
 
+def _reverse_import_graph(dep_graph: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Map each file path -> repo files that *import* it (relative edges only)."""
+    rev: Dict[str, List[str]] = {}
+    for src, deps in dep_graph.items():
+        for d in deps:
+            rev.setdefault(d, []).append(src)
+    for k in rev:
+        rev[k] = sorted(set(rev[k]))
+    return rev
+
+
 def get_focused_files(
     repo_map: RepoMap,
     target_files: List[str],
@@ -110,6 +121,11 @@ def get_focused_files(
     """
     Return `RepoMapFile` entries for `target_files` plus their import
     dependencies up to `depth` hops.  Files not found in the map are skipped.
+
+    When ``depth > 0``, also includes files that *import* any file already in the
+    focused set (one hop reverse). This pulls in co-located tests (e.g.
+    ``header.test.js`` importing ``header.js``) even though the app entry does
+    not import the test file.
     """
     dep_graph = build_dependency_graph(repo_map)
     file_index: Dict[str, RepoMapFile] = {f.path: f for f in repo_map.files}
@@ -129,6 +145,14 @@ def get_focused_files(
         frontier = next_frontier
 
     visited.update(frontier)
+
+    if depth > 0:
+        rev = _reverse_import_graph(dep_graph)
+        extra: Set[str] = set()
+        for path in list(visited):
+            for src in rev.get(path, []):
+                extra.add(src)
+        visited.update(extra)
 
     result: List[RepoMapFile] = []
     for path in sorted(visited):

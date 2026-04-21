@@ -1,54 +1,43 @@
+"""
+Backwards-compat shim around ``runtime.run_plan``.
+
+The old API (``PIPELINE_MODES``, ``resolve_preset_chains``,
+``preset_fallback_build_chains``) is still consumed by tests and the
+``task_commands_routes`` validation path. New code should call
+``runtime.run_plan.build_coder_chain`` / ``build_judge_chain`` directly.
+"""
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, FrozenSet, Optional, Tuple
+
+from agenti_helix.runtime.chain_defaults import (
+    default_full_pipeline_coder_chain,
+    default_full_pipeline_judge_chain,
+)
+from agenti_helix.runtime.run_plan import (
+    _LEGACY_MODE_TO_PLAN,
+    build_coder_chain,
+    build_judge_chain,
+    plan_from_legacy_mode,
+)
+from agenti_helix.verification.checkpointing import EditTaskSpec
+
+# Dashboard / API pipeline_mode strings (kept in sync with frontend types).
+PIPELINE_MODES: FrozenSet[str] = frozenset(_LEGACY_MODE_TO_PLAN.keys())
 
 
-PIPELINE_PRESETS: Dict[str, List[str]] = {
-    "product_eng": [
-        "doc_fetcher_v1",
-        "context_librarian_v1",
-        "sdet_v1",
-        "coder_builder_v1",
-        "security_governor_v1",
-        "diff_validator_v1",
-        "judge_evaluator_v1",
-        "scribe_v1",
-        "memory_writer_v1",
-    ],
-    "diff_guard_patch": [
-        "coder_patch_v1",
-        "diff_validator_v1",
-        "judge_v1",
-        "scribe_v1",
-        "memory_writer_v1",
-    ],
-    "secure_build_plus": [
-        "context_librarian_v1",
-        "sdet_v1",
-        "coder_builder_v1",
-        "security_governor_v1",
-        "diff_validator_v1",
-        "judge_evaluator_v1",
-        "judge_v1",
-        "scribe_v1",
-        "memory_writer_v1",
-    ],
-    "lint_type_gate": [
-        "context_librarian_v1",
-        "sdet_v1",
-        "coder_builder_v1",
-        "linter_v1",
-        "type_checker_v1",
-        "judge_evaluator_v1",
-        "scribe_v1",
-        "memory_writer_v1",
-    ],
-}
+def resolve_preset_chains(task: EditTaskSpec) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """
+    Return (coder_chain, judge_chain) for a named legacy preset, or None for
+    ``patch`` / ``build`` (which the master orchestrator handles directly).
+    """
+    mode = (getattr(task, "pipeline_mode", None) or "patch").strip().lower()
+    if mode in {"patch", "build"}:
+        return None
+    plan = plan_from_legacy_mode(mode)
+    return build_coder_chain(task, plan), build_judge_chain(task, plan)
 
 
-def is_pipeline_preset(name: str | None) -> bool:
-    return bool(name and name in PIPELINE_PRESETS)
-
-
-def get_pipeline_workflow(name: str) -> List[str]:
-    return list(PIPELINE_PRESETS[name])
+def preset_fallback_build_chains(task: EditTaskSpec) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Resolve coder/judge chains for legacy ``build`` mode (validation helpers)."""
+    return default_full_pipeline_coder_chain(task), default_full_pipeline_judge_chain(task)
