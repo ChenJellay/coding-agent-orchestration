@@ -1600,9 +1600,10 @@ function FeatureDagPage() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 12, alignItems: 'start' }}>
         <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12, minHeight: 340 }}>
           <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 10 }}>DAG</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {Object.keys(nodes).length === 0 ? <div style={{ color: 'var(--muted)', fontSize: 12 }}>No DAG nodes found.</div> : null}
             {Object.keys(nodes).map((nodeId) => {
+              const n = nodes[nodeId]
               const s = stateNodes[nodeId]
               const tone = nodeTone(s?.status, s?.verification_status ?? null)
               const tryLabel =
@@ -1611,8 +1612,9 @@ function FeatureDagPage() {
                   : s?.attempts
                     ? ` · ${s.attempts}x`
                     : ''
+              const desc = String(n?.description ?? '').trim()
               return (
-                <span
+                <div
                   key={nodeId}
                   role="button"
                   tabIndex={0}
@@ -1622,10 +1624,19 @@ function FeatureDagPage() {
                       navigate(`/features/${encodeURIComponent(featureId ?? '')}/nodes/${encodeURIComponent(nodeId)}`)
                     }
                   }}
-                  style={{ cursor: 'pointer' }}
+                  style={{
+                    cursor: 'pointer',
+                    border: '1px solid var(--border)',
+                    borderRadius: 12,
+                    padding: 10,
+                    background: 'var(--bg)',
+                  }}
                 >
                   <NodePill tone={tone} label={`${nodeId}${tryLabel}`} />
-                </span>
+                  {desc ? (
+                    <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8, whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>{desc}</div>
+                  ) : null}
+                </div>
               )
             })}
           </div>
@@ -1644,8 +1655,12 @@ function FeatureDagPage() {
               <div style={{ fontSize: 12, color: 'var(--muted)' }}>v1 derives from node task target files:</div>
               <ul style={{ margin: '6px 0 0', paddingLeft: 18, fontSize: 12 }}>
                 {Object.values(nodes).map((n) => (
-                  <li key={n.node_id} style={{ marginBottom: 4 }}>
-                    <span style={{ fontFamily: 'var(--mono)' }}>{n.task.target_file}</span>
+                  <li key={n.node_id} style={{ marginBottom: 10 }}>
+                    <div style={{ fontFamily: 'var(--mono)', fontWeight: 650 }}>{n.node_id}</div>
+                    <div style={{ fontFamily: 'var(--mono)', marginTop: 2 }}>{n.task.target_file}</div>
+                    {String(n.description ?? '').trim() ? (
+                      <div style={{ color: 'var(--muted)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>{String(n.description).trim()}</div>
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -1716,7 +1731,9 @@ function TaskInterventionPage() {
     }
   }, [featureId, nodeId, refreshTick, nodeTick])
 
-  const task = feature?.dag.nodes?.[nodeId ?? '']?.task
+  const dagNode = feature?.dag.nodes?.[nodeId ?? '']
+  const task = dagNode?.task
+  const nodeDescription = String(dagNode?.description ?? '').trim()
   const latestCp = (checkpoints ?? [])[0] ?? null
   const briefing =
     extractBriefingFromCheckpoint(latestCp) ??
@@ -1776,6 +1793,13 @@ function TaskInterventionPage() {
         <div style={{ border: '1px solid var(--border)', borderRadius: 12, background: 'var(--panel)', padding: 10, color: 'var(--muted)', fontSize: 12 }}>
           {actionNote}
         </div>
+      ) : null}
+
+      {nodeDescription ? (
+        <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--panel)', padding: 12 }}>
+          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>Node goal (intent compiler)</div>
+          <div style={{ fontSize: 13, whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>{nodeDescription}</div>
+        </section>
       ) : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 380px) 1fr', gap: 12, alignItems: 'start' }}>
@@ -1900,6 +1924,7 @@ function SignoffTripanePage() {
   }, [featureId, taskInputTick])
 
   const tasks = Object.values(feature?.dag.nodes ?? {}).map((n) => n.task)
+  const dagNodeEntries = Object.entries(feature?.dag.nodes ?? {})
   const acceptance = tasks.map((t) => `- ${t.acceptance_criteria}`).join('\n')
 
   useEffect(() => {
@@ -2127,6 +2152,24 @@ function SignoffTripanePage() {
           ) : (
             <div style={{ color: 'var(--muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>{feature?.dag.macro_intent ?? '—'}</div>
           )}
+          <div style={{ fontWeight: 650, fontSize: 13, margin: '14px 0 8px' }}>DAG nodes (intent compiler)</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {dagNodeEntries.length === 0 ? (
+              <div style={{ color: 'var(--muted)', fontSize: 12 }}>—</div>
+            ) : (
+              dagNodeEntries.map(([id, n]) => (
+                <div
+                  key={id}
+                  style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg)', padding: 8 }}
+                >
+                  <div style={{ fontFamily: 'var(--mono)', fontSize: 11, fontWeight: 650 }}>{id}</div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'pre-wrap', marginTop: 4, lineHeight: 1.45 }}>
+                    {String(n.description ?? '').trim() || '—'}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
           <div style={{ fontWeight: 650, fontSize: 13, margin: '14px 0 8px' }}>Acceptance criteria</div>
           <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: 12, color: 'var(--muted)' }}>{acceptance || '—'}</pre>
           {!editMode ? (
@@ -2197,6 +2240,7 @@ function SignoffDiffBlock({
 }) {
   const [cp, setCp] = useState<Checkpoint | null>(null)
   const [displayTargetFile, setDisplayTargetFile] = useState<string | null>(null)
+  const [displayNodeMeta, setDisplayNodeMeta] = useState<{ nodeId: string; description: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -2208,6 +2252,7 @@ function SignoffDiffBlock({
         if (nodeEntries.length === 0) {
           setCp(null)
           setDisplayTargetFile(null)
+          setDisplayNodeMeta(null)
           onLatestCheckpoint?.(null)
           onPendingSignoff?.(null)
           return
@@ -2263,9 +2308,14 @@ function SignoffDiffBlock({
             ? feature.dag.nodes[displayNodeId].task.target_file
             : null
 
+        const metaNodeId = displayNodeId ?? ''
+        const metaDesc =
+          metaNodeId && feature?.dag?.nodes?.[metaNodeId] ? String(feature.dag.nodes[metaNodeId].description ?? '').trim() : ''
+
         if (!cancelled) {
           setCp(display)
           setDisplayTargetFile(tf)
+          setDisplayNodeMeta(displayNodeId ? { nodeId: displayNodeId, description: metaDesc } : null)
           onLatestCheckpoint?.(mergeEligible)
           onPendingSignoff?.(pending)
         }
@@ -2282,6 +2332,16 @@ function SignoffDiffBlock({
   if (error) return <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 10 }}>{error}</div>
   return (
     <div style={{ marginTop: 10 }}>
+      {displayNodeMeta ? (
+        <div style={{ marginBottom: 10, fontSize: 12, lineHeight: 1.45 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 650, fontSize: 11 }}>{displayNodeMeta.nodeId}</div>
+          {displayNodeMeta.description ? (
+            <div style={{ color: 'var(--muted)', whiteSpace: 'pre-wrap', marginTop: 4 }}>{displayNodeMeta.description}</div>
+          ) : (
+            <div style={{ color: 'var(--muted)', marginTop: 4, fontStyle: 'italic' }}>No node description on file.</div>
+          )}
+        </div>
+      ) : null}
       <ExtractedDiff cp={cp} targetFile={displayTargetFile} />
     </div>
   )

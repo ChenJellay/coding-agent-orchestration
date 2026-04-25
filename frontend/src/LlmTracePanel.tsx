@@ -189,6 +189,7 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
 
   type TraceData = {
     agent_id?: string
+    skipped?: boolean
     prompt?: string
     prompt_truncated?: boolean
     raw_output?: string
@@ -246,7 +247,8 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
           {[...traces].reverse().map((e) => {
             const key = eventKey(e)
             const agent = (e.data as { agent_id?: string })?.agent_id ?? 'agent'
-            const line = `${formatTs(e.timestamp)} · ${agent}`
+            const skipped = Boolean((e.data as TraceData).skipped)
+            const line = `${formatTs(e.timestamp)} · ${agent}${skipped ? ' (skipped)' : ''}`
             return (
               <option key={key} value={key}>
                 {line}
@@ -277,6 +279,12 @@ export function LlmTracePanel({ collapsed, onToggleCollapsed }: LlmTracePanelPro
             {data.error ? (
               <div className="llmTraceMetaError">
                 <span className="llmTraceMetaMuted">Parse / validation</span> {data.error}
+              </div>
+            ) : null}
+            {data.skipped ? (
+              <div className="llmTraceMetaWide llmTraceWarn">
+                No LLM call for this step — it was skipped because an upstream gate already set the chain
+                context (see prompt text).
               </div>
             ) : null}
           </div>

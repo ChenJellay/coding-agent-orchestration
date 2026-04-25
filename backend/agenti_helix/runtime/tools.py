@@ -14,6 +14,7 @@ from urllib.request import Request, url2pathname, urlopen
 
 from agenti_helix.api.task_context_store import load_task_context
 from agenti_helix.core.ast_parser import parse_file
+from agenti_helix.core.git_unified_diff import build_git_unified_diff, collect_diff_paths
 from agenti_helix.core.diff_builder import LinePatch, apply_line_patch_to_file
 from agenti_helix.core.repo_map import generate_repo_map, get_focused_files
 from agenti_helix.core.repo_scanner import detect_language
@@ -29,6 +30,73 @@ _JEST_CONFIG_FILENAMES = (
     "jest.config.cts",
     "jest.config.json",
 )
+
+_TEST_FILE_PATH_RE = re.compile(
+    r"(^|/)(.+?\.)?(test|spec)\.(mjs|cjs|js|jsx|ts|tsx|mts|cts)$",
+    re.IGNORECASE,
+)
+
+
+def _path_looks_like_unit_test(rel: str) -> bool:
+    rel = rel.strip().replace("\\", "/")
+    if ".." in rel.split("/"):
+        return False
+    return bool(_TEST_FILE_PATH_RE.search(rel))
+
+
+def _destructive_test_rewrite_reason(*, old: str, new: str) -> Optional[str]:
+    """Block wholesale replacement of an existing test file (framework swap or mass delete).
+
+    Opt out with ``AGENTI_HELIX_DISABLE_TEST_REWRITE_GUARD=1`` for experiments / eval harnesses.
+    """
+    if os.environ.get("AGENTI_HELIX_DISABLE_TEST_REWRITE_GUARD", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    if not old.strip() or not new.strip():
+        return None
+    old_lc = old.lower()
+    new_lc = new.lower()
+    old_lines = old.count("\n") + 1
+    new_lines = new.count("\n") + 1
+    # Large existing suite shrunk to a stub — almost always a model mistake on "add component" tasks.
+    if old_lines >= 15 and new_lines < max(5, int(old_lines * 0.28)):
+        return (
+            f"Refusing write: existing test file had ~{old_lines} lines; new content has ~{new_lines} lines "
+            "(>72% reduction). Update tests in place; do not replace the whole file or swap the runner."
+        )
+    vitest_import_new = "from 'vitest'" in new_lc or 'from "vitest"' in new_lc
+    vitest_import_old = "from 'vitest'" in old_lc or 'from "vitest"' in old_lc
+    jest_signal_old = (
+        "@jest/" in old_lc
+        or "jest-dom" in old_lc
+        or re.search(r"\bjest\.", old_lc) is not None
+        or "from '@jest/globals'" in old_lc
+        or 'from "@jest/globals"' in old_lc
+    )
+    if vitest_import_new and not vitest_import_old and jest_signal_old:
+        return (
+            "Refusing write: imports switch toward Vitest on a file that previously used Jest-style APIs. "
+            "Unless the task explicitly migrates the test runner, keep the repo's framework and edit tests incrementally."
+        )
+    return None
+
+
+def _ensure_test_edit_safe(repo_root_path: Path, rel: str, new_content: str) -> None:
+    """Raise ``ValueError`` when replacing an on-disk test file looks structurally destructive."""
+    rel = rel.strip().replace("\\", "/")
+    if not rel or ".." in rel.split("/"):
+        return
+    if not _path_looks_like_unit_test(rel):
+        return
+    path = repo_root_path / rel
+    if not path.is_file():
+        return
+    try:
+        old = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    reason = _destructive_test_rewrite_reason(old=old, new=new_content)
+    if reason:
+        raise ValueError(f"{rel}: {reason}")
 
 
 def _truncate_for_snapshot(text: str, max_chars: int = _MAX_FILE_SNAPSHOT_CHARS) -> str:
@@ -341,6 +409,7 @@ def tool_write_all_files(
                 existed = target.exists()
                 snapshots["pre_meta"][file_path] = {"existed": existed, "read_failed": True}
                 snapshots["pre"][file_path] = None
+        _ensure_test_edit_safe(repo_root_path, file_path, content)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         files_written.append(file_path)
@@ -362,6 +431,7 @@ def tool_write_all_files(
                 existed = target.exists()
                 snapshots["pre_meta"][file_path] = {"existed": existed, "read_failed": True}
                 snapshots["pre"][file_path] = None
+        _ensure_test_edit_safe(repo_root_path, file_path, content)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         test_file_paths.append(file_path)
@@ -397,6 +467,7 @@ def tool_write_all_files(
     result: Dict[str, Any] = {
         "files_written": files_written,
         "test_file_paths": test_file_paths,
+        "diff_validator_allowed_paths": sorted(set(files_written + test_file_paths)),
         "file_snapshots": file_snapshots,
         "diff_summary": (
             f"Wrote {len(files_written)} code file(s) and {len(test_file_paths)} test file(s): "
@@ -708,6 +779,7 @@ def tool_map_evaluator_verdict(
     pass_tests: Optional[bool],
     evaluation_reasoning: str = "",
     feedback_for_coder: str = "",
+    audit_reasoning: str = "",
     is_safe: bool = True,
     violations: Optional[List[str]] = None,
     diff_validator_output: Optional[Dict[str, Any]] = None,
@@ -752,10 +824,23 @@ def tool_map_evaluator_verdict(
         )
     else:
         verdict = "FAIL"
-        justification = feedback_for_coder or evaluation_reasoning or "Tests failed."
+        fb = str(feedback_for_coder or "").strip()
+        ev = str(evaluation_reasoning or "").strip()
+        if fb and ev:
+            justification = f"Action for next edit:\n{fb}\n\nAnalysis:\n{ev}"
+        else:
+            justification = fb or ev or "Tests failed."
     extras = [part for part in [validator_summary if validator_verdict == "WARN" else "", lint_summary, type_summary] if part]
     if extras:
         justification = (justification + "\n\nAdditional checks:\n- " + "\n- ".join(extras)).strip()
+    # Surface security governor reasoning on failing test rounds when rules passed (helps retries).
+    if verdict == "FAIL" and is_safe:
+        ar = str(audit_reasoning or "").strip()
+        if ar:
+            cap = 1_200
+            if len(ar) > cap:
+                ar = ar[:cap] + "\n… [security governor audit truncated]"
+            justification = (justification.rstrip() + "\n\nSecurity governor (is_safe=true):\n" + ar).strip()
     return {"verdict": verdict, "justification": justification, "problematic_lines": []}
 
 
@@ -849,9 +934,23 @@ def tool_merge_doc_into_intent(*, intent: str, doc_fetcher_output: Dict[str, Any
     return "\n".join(parts).strip()
 
 
-def tool_get_git_unified_diff(*, repo_root: str | Path) -> Dict[str, Any]:
-    """Return `git diff` against HEAD for the working tree (best-effort)."""
+def tool_get_git_unified_diff(
+    *,
+    repo_root: str | Path,
+    target_file: str = "",
+    diff_json: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a unified diff for task-scoped paths (tracked vs HEAD, untracked vs /dev/null).
+
+    Plain ``git diff HEAD`` omits untracked files, which falsely triggers the
+    diff validator when the coder adds a new file. When ``target_file`` or
+    ``diff_json`` supply paths, use the same capture as checkpoint ``tool_logs``.
+    """
     repo = Path(repo_root).resolve()
+    paths = collect_diff_paths(target_file, diff_json)
+    if paths:
+        out = build_git_unified_diff(repo, paths).strip()
+        return {"git_diff": out or "(empty diff)", "git_ok": True}
     try:
         r = subprocess.run(
             ["git", "diff", "HEAD"],

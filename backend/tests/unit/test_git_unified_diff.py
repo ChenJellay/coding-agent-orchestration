@@ -11,6 +11,7 @@ from typing import Iterator
 
 import pytest
 
+from agenti_helix.runtime.tools import tool_get_git_unified_diff
 from agenti_helix.verification.checkpointing import EditTaskSpec
 from agenti_helix.verification.verification_loop import (
     _git_unified_diff_for_paths,
@@ -149,6 +150,29 @@ def test_tool_logs_merge_includes_git_when_non_empty(workspace_tmp_path: Path) -
     )
     assert "git_unified_diff" in logs
     assert "a.txt" in logs["git_unified_diff"]
+
+
+def test_tool_get_git_unified_diff_includes_untracked_target(workspace_tmp_path: Path) -> None:
+    """Regression: diff_validator used plain ``git diff HEAD``, which omits untracked files."""
+    _git_init(workspace_tmp_path)
+    root_readme = workspace_tmp_path / "README.md"
+    root_readme.write_text("# x\n", encoding="utf-8")
+    _run_git(["add", "README.md"], cwd=workspace_tmp_path)
+    _run_git(["commit", "-m", "init"], cwd=workspace_tmp_path)
+
+    new_js = workspace_tmp_path / "src" / "new.js"
+    new_js.parent.mkdir(parents=True, exist_ok=True)
+    new_js.write_text("export const x = 1;\n", encoding="utf-8")
+
+    out = tool_get_git_unified_diff(
+        repo_root=str(workspace_tmp_path),
+        target_file="src/new.js",
+        diff_json={},
+    )
+    assert out["git_ok"] is True
+    assert out["git_diff"] != "(empty diff)"
+    assert "new.js" in out["git_diff"]
+    assert "export const x" in out["git_diff"]
 
 
 def test_git_unified_diff_not_git_repo_returns_empty(tmp_path: Path) -> None:

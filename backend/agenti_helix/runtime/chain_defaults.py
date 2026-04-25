@@ -346,6 +346,7 @@ def _step_map_evaluator_verdict(*, skip_key: str | None = None) -> Dict[str, Any
             "pass_tests": {"$ref": "judge_eval.pass_tests"},
             "evaluation_reasoning": {"$ref": "judge_eval.evaluation_reasoning"},
             "feedback_for_coder": {"$ref": "judge_eval.feedback_for_coder"},
+            "audit_reasoning": {"$ref": "governor_output.audit_reasoning"},
             "is_safe": {"$ref": "governor_output.is_safe"},
             "violations": {"$ref": "governor_output.violations"},
         },
@@ -361,7 +362,11 @@ def _step_git_diff_hdr() -> Dict[str, Any]:
         id="git_diff_hdr",
         output_key="git_diff_hdr",
         tool_name="get_git_unified_diff",
-        input_bindings={"repo_root": {"$ref": "repo_root"}},
+        input_bindings={
+            "repo_root": {"$ref": "repo_root"},
+            "target_file": {"$ref": "target_file"},
+            "diff_json": {"$ref": "diff_json"},
+        },
     )
 
 
@@ -952,6 +957,7 @@ def build_workflow_judge_chain(workflow: List[str], task: Any | None = None) -> 
             "feedback_for_coder": {"$ref": "judge_eval.feedback_for_coder"},
         }
         if has_governor:
+            map_bindings["audit_reasoning"] = {"$ref": "governor_output.audit_reasoning"}
             map_bindings["is_safe"] = {"$ref": "governor_output.is_safe"}
             map_bindings["violations"] = {"$ref": "governor_output.violations"}
         if has_diff_validator:

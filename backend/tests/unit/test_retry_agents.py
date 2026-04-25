@@ -134,10 +134,10 @@ def test_memory_summarizer_rewrites_feedback_between_retries(tmp_path: Path, mon
     assert any(c["agent_id"] == "memory_summarizer_v1" for c in calls), (
         "memory_summarizer_v1 was never invoked between retries"
     )
-    # Final feedback is the hint, not the raw judge justification.
+    # Summarizer hint is appended after cumulative judge rounds (may still mention raw justifications).
     assert "actionable_hint" not in state.feedback  # we strip schema noise
+    assert "Retry hint from memory_summarizer_v1" in state.feedback
     assert "edit only the button style block" in state.feedback
-    assert "stubbed FAIL" not in state.feedback
     # Attempts were recorded ordered, with verdicts.
     assert len(state.attempts) >= 2
     assert state.attempts[0]["judge_verdict"] == "FAIL"
@@ -173,8 +173,9 @@ def test_memory_summarizer_failure_keeps_legacy_feedback(tmp_path: Path, monkeyp
     state = vloop.run_verification_loop(task)
     assert state.checkpoint is not None
     assert state.checkpoint.status is VerificationStatus.BLOCKED
-    # Legacy feedback was retained through the retry.
-    assert "Judge reported a failure" in state.feedback
+    # Cumulative judge feedback was retained when summarizer errored.
+    assert "After judge round" in state.feedback
+    assert "stubbed FAIL" in state.feedback
 
 
 # --- supreme_court_v1 ------------------------------------------------------

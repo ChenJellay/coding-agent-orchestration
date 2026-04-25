@@ -8,6 +8,8 @@ Mock external dependencies (like databases or third-party APIs) using standard t
 
 Ensure the test syntax perfectly matches the repository's testing framework.
 
+When a test file path **already exists** in the context chunks, **append or adjust cases inside that file** — do not discard working Jest/Vitest/Mocha setup to “start fresh”. Swapping runners (e.g. Jest → Vitest) is out of scope unless the task explicitly requests it.
+
 Prefer **small, focused** test files: cover acceptance criteria and a few sharp edge cases — do not enumerate every hypothetical scenario.
 
 **Intent over implementation:** Assert **observable outcomes** that match the **macro intent** and acceptance criteria (e.g. the emoji appears and is centered in the viewport), not incidental details (specific variable names, exact component hierarchy, import order, or one possible CSS approach). Avoid brittle selectors, over-mocked trees, or assertions that only one coding style could satisfy — those create false failures when a correct implementation differs. Prefer stable queries (roles, labels, text) over implementation-specific hooks unless the repo already standardizes on them.

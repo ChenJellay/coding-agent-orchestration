@@ -6,6 +6,8 @@ Write clean, modular, and highly performant code.
 
 Do not modify any logic outside the scope of the assigned task.
 
+**Tests:** Put new or updated tests in `test_files` from the SDET step when the pipeline provides them. If you must touch an existing `*.test.*` / `*.spec.*` file in `modified_files`, **extend it in place** — keep the same test runner and imports the file already uses (e.g. Jest vs Vitest). Never replace an entire established suite with a fresh scaffold or a different framework unless the task text explicitly orders a migration.
+
 For visual elements (icons, images, illustrations): use the simplest self-contained representation first — an emoji character (e.g. 🦆) in a `<span>` or `<div>` is always preferred over hand-drawn SVG. Only use inline SVG when the acceptance criteria explicitly requires it, and even then keep it minimal (a few basic shapes at most). Never generate SVG paths with many coordinate points — they produce token-heavy output that truncates JSON.
 
 If you encounter a missing dependency in the provided context, clearly state it in `missing_context`.

@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import py_compile
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agenti_helix.core.git_unified_diff import build_git_unified_diff, collect_diff_paths
 from agenti_helix.observability.debug_log import log_event
 from agenti_helix.sandbox.manager import log_sandbox_status_for_task
 from agenti_helix.runtime.chain_runtime import run_chain
@@ -145,99 +145,32 @@ def _patch_pipeline(task: EditTaskSpec) -> bool:
     return mode in ("patch", "diff_guard_patch")
 
 
-# Cap embedded git diff in checkpoint JSON (UI / control plane).
-_MAX_GIT_UNIFIED_DIFF_CHARS = 512_000
+def _diff_json_for_judge_gate(dj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ensure ``diff_validator_allowed_paths`` exists (older ``diff_json`` blobs may omit it)."""
+    if not isinstance(dj, dict):
+        return {}
+    if dj.get("diff_validator_allowed_paths"):
+        return dj
+    merged: List[str] = []
+    for key in ("files_written", "test_file_paths"):
+        lst = dj.get(key)
+        if isinstance(lst, list):
+            merged.extend(str(p) for p in lst if isinstance(p, str) and p.strip())
+    if not merged:
+        return dj
+    out = dict(dj)
+    out["diff_validator_allowed_paths"] = sorted(set(merged))
+    return out
 
 
 def _paths_for_git_diff(task: EditTaskSpec, diff_json: Optional[Dict[str, Any]]) -> List[str]:
     """Repo-relative paths to include in a unified diff."""
-    paths: List[str] = []
-    seen: set[str] = set()
-
-    def add(raw: str) -> None:
-        raw = raw.strip().replace("\\", "/")
-        if not raw or raw in seen or ".." in raw.split("/"):
-            return
-        seen.add(raw)
-        paths.append(raw)
-
-    if task.target_file:
-        add(str(task.target_file))
-    if not isinstance(diff_json, dict):
-        return paths
-    fp = diff_json.get("filePath")
-    if isinstance(fp, str):
-        add(fp)
-    for key in ("files_written", "test_file_paths"):
-        lst = diff_json.get(key)
-        if isinstance(lst, list):
-            for item in lst:
-                if isinstance(item, str):
-                    add(item)
-    return paths
+    return collect_diff_paths(task.target_file or "", diff_json)
 
 
 def _git_unified_diff_for_paths(repo_root: Path, paths: List[str]) -> str:
     """Best-effort unified diff (working tree vs HEAD for tracked, vs /dev/null for untracked)."""
-    if not paths:
-        return ""
-    repo_root = repo_root.resolve()
-    try:
-        probe = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if probe.returncode != 0 or (probe.stdout or "").strip().lower() != "true":
-            return ""
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return ""
-
-    chunks: List[str] = []
-    null_device = os.devnull
-    for rel in paths:
-        rel = rel.strip().replace("\\", "/")
-        if not rel or ".." in rel.split("/"):
-            continue
-        path = repo_root / rel
-        if not path.is_file():
-            continue
-        try:
-            ls = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--", rel],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            continue
-        tracked = ls.returncode == 0
-        try:
-            if tracked:
-                diff = subprocess.run(
-                    ["git", "-C", str(repo_root), "diff", "--no-color", "HEAD", "--", rel],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-            else:
-                diff = subprocess.run(
-                    ["git", "diff", "--no-color", "--no-index", null_device, rel],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(repo_root),
-                    timeout=120,
-                )
-            if diff.stdout:
-                chunks.append(diff.stdout)
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            continue
-
-    out = "".join(chunks)
-    if len(out) > _MAX_GIT_UNIFIED_DIFF_CHARS:
-        return out[:_MAX_GIT_UNIFIED_DIFF_CHARS] + "\n... [truncated by agenti_helix: git unified diff cap]\n"
-    return out
+    return build_git_unified_diff(repo_root, paths)
 
 
 def _tool_logs_with_git_unified_diff(
@@ -389,7 +322,9 @@ def _build_coder_intent(state: VerificationState) -> str:
         cap = 4_000  # Match historical max_error_history_chars cap.
         if len(raw) > cap:
             raw = raw[-cap:]
-        parts.append(f"\n\nPrevious attempt feedback from Judge and tools:\n{raw}")
+        parts.append(
+            "\n\nCumulative feedback from prior judge / security / tool rounds (oldest to newest):\n" + raw
+        )
     return "".join(parts)
 
 
@@ -584,7 +519,7 @@ def _call_judge(state: VerificationState) -> None:
         "original_snippet": state.original_content or "",
         "static_check_logs": state.static_check_logs or {},
         "intent": state.task.intent,
-        "diff_json": state.diff_json or {},
+        "diff_json": _diff_json_for_judge_gate(state.diff_json),
         "task_id": state.task.task_id,
         "trace_id": state.trace_id,
         "dag_id": state.dag_id,
@@ -799,7 +734,7 @@ def _record_attempt(state: VerificationState, *, verdict_from_static: bool) -> N
         {
             "attempt_n": state.retry_count + 1,
             "judge_verdict": str(jr.get("verdict") or "FAIL").upper(),
-            "justification": str(jr.get("justification") or "")[:500],
+            "justification": str(jr.get("justification") or "")[:1500],
             "diff_summary": diff_summary,
             "static_errors": static_errors,
         }
@@ -831,17 +766,19 @@ def _run_memory_summarizer_into_feedback(
     *,
     memory_store: Optional[MemoryStore] = None,
 ) -> None:
-    """Replace raw judge justification in ``state.feedback`` with a focused hint.
+    """Append a focused summarizer hint after cumulative judge/security feedback.
 
     Invoked from ``_prepare_retry`` when ``task.enable_memory_summarizer`` is
     set. On any failure (agent raises, schema repair exhausted, memory store
-    missing, etc.) the loop silently keeps the legacy feedback — a retry hint
-    is best-effort and must never block the loop.
+    missing, etc.) the loop silently keeps the cumulative feedback — a retry
+    hint is best-effort and must never block the loop.
     """
     # Lazy import: avoids a structured_output → agent_runtime import cycle at
     # module load time and keeps the dependency optional for tests that patch
     # the verification loop without registering structured agents.
     from agenti_helix.runtime.structured_output import run_agent_structured
+
+    preserved_cumulative = (state.feedback or "").strip()
 
     store = memory_store or get_default_store()
     jr = state.judge_response or {}
@@ -900,7 +837,7 @@ def _run_memory_summarizer_into_feedback(
         if bullets:
             anti_block = "\nDo NOT repeat:\n" + bullets
 
-    state.feedback = "\n".join(
+    hint_body = "\n".join(
         line
         for line in [
             "Retry hint from memory_summarizer_v1:",
@@ -909,6 +846,9 @@ def _run_memory_summarizer_into_feedback(
             anti_block.strip() or None,
         ]
         if line
+    )
+    state.feedback = (
+        f"{preserved_cumulative}\n\n{hint_body}".strip() if preserved_cumulative else hint_body
     )
     log_event(
         run_id=state.task.task_id,
@@ -1006,10 +946,24 @@ def _prepare_retry(state: VerificationState) -> None:
         state.checkpoint,
         original_content=state.original_content,
     )
-    justification = (state.judge_response or {}).get("justification", "")
-    state.feedback = "\n".join(
-        ["Judge reported a failure.", f"Justification: {justification}"]
+    jr = state.judge_response or {}
+    justification = str(jr.get("justification", "") or "").strip()
+    # ``retry_count`` was incremented before this call — it equals the number of
+    # completed coder→judge rounds that have failed so far.
+    round_n = max(1, int(state.retry_count))
+    new_block = "\n".join(
+        line
+        for line in [
+            f"--- After judge round {round_n} ---",
+            justification,
+        ]
+        if line
     )
+    prior = (state.feedback or "").strip()
+    if prior:
+        state.feedback = f"{prior}\n\n{new_block}"
+    else:
+        state.feedback = new_block
     if getattr(state.task, "enable_memory_summarizer", False):
         _run_memory_summarizer_into_feedback(state)
     log_event(

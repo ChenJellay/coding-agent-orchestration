@@ -13,7 +13,7 @@ allowed_paths:        {allowed_paths}
 repo_rules_text:      {repo_rules_text}
 ```
 
-**git_diff** is a unified diff (`git diff HEAD`) of all changes made since the last checkpoint.
+**git_diff** is a unified diff for task paths (tracked files vs `HEAD`, new untracked files vs `/dev/null`). Plain `git diff HEAD` omits untracked files, so this feed includes them when the coder adds files not yet in git.
 **allowed_paths** is the list of files the coder was permitted to touch.
 **repo_rules_text** is the contents of `.agenti_helix/rules.json` (may be empty).
 
@@ -22,7 +22,7 @@ repo_rules_text:      {repo_rules_text}
 2. **Deletion check**: Identify any removed lines (`-` prefix) that look unintentional — e.g. deleted function signatures, removed import blocks, stripped comments that are load-bearing documentation.
 3. **Drift check**: Compare the overall shape of the diff against `intent`. Does it change more than what was asked? Does it fail to change anything related to the task?
 4. **Rules check**: Scan `repo_rules_text` for any prohibition relevant to the diff (e.g. "no console.log in production", "no eval()", banned imports). Flag violations.
-5. **Structural regression**: Look for: removed export statements, changed function signatures, deleted tests, removed type annotations — any change that would break callers.
+5. **Structural regression**: Look for: removed export statements, changed function signatures, deleted tests, removed type annotations — any change that would break callers. For `*.test.*` / `*.spec.*` files: **`BLOCK`** if the diff removes most of an existing suite (large block deletions) or replaces Jest-style imports/APIs with a different runner (e.g. new `vitest` imports where the file previously used `@jest/globals` / `jest-dom`) **without** the `intent` explicitly asking for a migration. Prefer incremental edits that keep the current framework.
 6. Assign an overall verdict: `"PASS"`, `"WARN"`, or `"BLOCK"`.
    - `PASS` — diff is clean, scoped, and safe.
    - `WARN` — minor concerns that the coder should address but won't prevent acceptance.
@@ -53,7 +53,7 @@ Respond with **only** a JSON object — no `<think>` block, no prose, no markdow
 ```
 
 ## Rules
-- If `git_diff` is empty or whitespace-only, set `verdict: "BLOCK"` and explain in `summary` that no changes were detected — the coder may have failed to apply the patch.
+- If `git_diff` is empty or whitespace-only, set `verdict: "BLOCK"` and explain in `summary` that no changes were detected for the allowed task paths — the coder may have failed to apply the patch, or edits landed outside `allowed_paths`.
 - `BLOCK` immediately if any file outside `allowed_paths` is modified (scope violation).
 - `BLOCK` if an export, public function signature, or test is deleted without explicit mention in `intent`.
 - `WARN` for style-only issues (whitespace, comment removal) unless repo_rules explicitly prohibit them.

@@ -95,7 +95,9 @@ PRESET_DELIBERATIVE = RunPlan(memory_summarizer=True, supreme_court=True)
 
 def _allowed_paths_ref(*, write_tests: bool) -> str:
     """Where the diff_validator should look for the allowed-paths set."""
-    return "diff_json.files_written" if write_tests else "repo_map_ctx.allowed_paths"
+    # TDD runs touch both implementation and tests — scope must include both lists
+    # so the validator can reason about regressions in either (see ``diff_validator_allowed_paths``).
+    return "diff_json.diff_validator_allowed_paths" if write_tests else "repo_map_ctx.allowed_paths"
 
 
 def build_coder_chain(task: Optional[EditTaskSpec], plan: RunPlan) -> Dict[str, Any]:

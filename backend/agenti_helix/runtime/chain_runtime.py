@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any, Dict, Optional
 
 from agenti_helix.api.job_registry import TaskCancelledError
@@ -8,6 +9,12 @@ from agenti_helix.observability.debug_log import log_event
 from agenti_helix.runtime.agent_runtime import run_agent
 from agenti_helix.runtime.structured_output import is_structured_agent, run_agent_structured
 from agenti_helix.runtime.tools import TOOL_REGISTRY
+
+
+def _llm_trace_logs_enabled() -> bool:
+    """Match ``agent_runtime`` — skip-trace rows only emit when LLM tracing is on."""
+    v = os.environ.get("AGENTI_HELIX_LLM_TRACE", "1").strip().lower()
+    return v not in {"0", "false", "no", "off"}
 
 
 def _is_cancelled(cancel_token: Any | None) -> bool:
@@ -102,6 +109,36 @@ def run_chain(
 
         skip_key = step.get("skip_if_nonempty_key")
         if isinstance(skip_key, str) and skip_key.strip() and ctx.get(skip_key):
+            # Skipped agents produce no ``run_agent`` call, so the LLM I/O panel would
+            # show a gap (e.g. diff_validator BLOCK → judge_evaluator never runs). Emit a
+            # synthetic ``llm_trace`` so operators see the agent id and why it was skipped.
+            if step_type == "agent" and _llm_trace_logs_enabled():
+                agent_id = step.get("agent_id")
+                if isinstance(agent_id, str) and agent_id:
+                    tid = ctx.get("trace_id") if isinstance(ctx.get("trace_id"), str) else None
+                    did = ctx.get("dag_id") if isinstance(ctx.get("dag_id"), str) else None
+                    log_event(
+                        run_id=run_id,
+                        hypothesis_id=hypothesis_id,
+                        location=f"{location_prefix}:{step_id}",
+                        message="LLM inference (skipped)",
+                        data={
+                            "kind": "llm_trace",
+                            "agent_id": agent_id,
+                            "skipped": True,
+                            "skip_key": skip_key,
+                            "prompt": (
+                                f"This agent step did not run because `{skip_key}` was already set in the "
+                                "chain context. Typical case: `diff_validator_v1` returned verdict BLOCK, "
+                                "so `apply_diff_validator_gate` wrote `judge_response` and downstream judge "
+                                "agents (`judge_evaluator_v1`, etc.) are skipped by design."
+                            ),
+                            "raw_output": "",
+                            "parsed_output_json": "null",
+                        },
+                        trace_id=tid,
+                        dag_id=did,
+                    )
             continue
 
         bound_inputs = _resolve_binding(input_bindings, ctx)

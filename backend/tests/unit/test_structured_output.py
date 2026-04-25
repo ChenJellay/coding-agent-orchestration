@@ -221,3 +221,79 @@ def test_chain_runtime_routes_every_agent_through_structured(monkeypatch: pytest
         "No agent should fall through to plain run_agent — every agent must go through "
         "the JSON-mode + repair wrapper."
     )
+
+
+def test_skipped_agent_emits_llm_trace_for_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ``skip_if_nonempty_key`` fires, no inference runs — but we still log one ``llm_trace``."""
+    from agenti_helix.runtime import chain_runtime
+
+    log_calls: list[dict[str, Any]] = []
+
+    def fake_log(**kwargs: Any) -> None:
+        log_calls.append(kwargs)
+
+    def never_structured(**_kwargs: Any) -> Dict[str, Any]:
+        raise AssertionError("skipped agent must not call run_agent_structured")
+
+    monkeypatch.setattr(chain_runtime, "log_event", fake_log)
+    monkeypatch.setattr(chain_runtime, "run_agent_structured", never_structured)
+    monkeypatch.setenv("AGENTI_HELIX_LLM_TRACE", "1")
+
+    chain_runtime.run_chain(
+        chain_spec={
+            "steps": [
+                {
+                    "type": "agent",
+                    "id": "judge_evaluator",
+                    "output_key": "je_out",
+                    "agent_id": "judge_evaluator_v1",
+                    "skip_if_nonempty_key": "judge_response",
+                    "input_bindings": {},
+                }
+            ]
+        },
+        initial_context={"judge_response": {"verdict": "FAIL"}},
+        cancel_token=None,
+        run_id="run",
+        hypothesis_id="hyp",
+        location_prefix="test_prefix",
+    )
+
+    traces = [c for c in log_calls if isinstance(c.get("data"), dict) and c["data"].get("kind") == "llm_trace"]
+    assert len(traces) == 1
+    d = traces[0]["data"]
+    assert d.get("skipped") is True
+    assert d.get("agent_id") == "judge_evaluator_v1"
+
+
+def test_skipped_agent_no_synthetic_trace_when_llm_trace_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agenti_helix.runtime import chain_runtime
+
+    log_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(chain_runtime, "log_event", lambda **kwargs: log_calls.append(kwargs))
+    monkeypatch.setattr(chain_runtime, "run_agent_structured", lambda **_k: {"ok": True})
+    monkeypatch.setenv("AGENTI_HELIX_LLM_TRACE", "0")
+
+    chain_runtime.run_chain(
+        chain_spec={
+            "steps": [
+                {
+                    "type": "agent",
+                    "id": "judge_evaluator",
+                    "output_key": "je_out",
+                    "agent_id": "judge_evaluator_v1",
+                    "skip_if_nonempty_key": "judge_response",
+                    "input_bindings": {},
+                }
+            ]
+        },
+        initial_context={"judge_response": {"verdict": "FAIL"}},
+        cancel_token=None,
+        run_id="run",
+        hypothesis_id="hyp",
+        location_prefix="test_prefix",
+    )
+
+    traces = [c for c in log_calls if isinstance(c.get("data"), dict) and c["data"].get("kind") == "llm_trace"]
+    assert traces == []

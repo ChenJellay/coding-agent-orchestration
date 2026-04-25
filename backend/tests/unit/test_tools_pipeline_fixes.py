@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agenti_helix.agents.render import load_prompt_template, render_prompt
 from agenti_helix.orchestration.intent_compiler import (
     _coder_task_intent_for_node,
     enrich_macro_intent_with_doc_before_compile,
 )
+
 from agenti_helix.runtime.tools import (
     _discover_jest_config,
     _js_tests_likely_need_jsdom,
@@ -118,6 +121,7 @@ def test_write_all_files_includes_snapshots_in_diff_json_str(tmp_path: Path) -> 
     )
     assert "file_snapshots" in out
     assert len(out["file_snapshots"]) == 2
+    assert out["diff_validator_allowed_paths"] == ["src/a.js", "src/a.test.js"]
     parsed = json.loads(out["diff_json_str"])
     assert "file_snapshots" in parsed
     paths = {s["path"] for s in parsed["file_snapshots"]}
@@ -153,3 +157,56 @@ def test_jsdom_heuristic_plain_node(tmp_path: Path) -> None:
     t = tmp_path / "plain.test.js"
     t.write_text("const assert = require('assert');\n", encoding="utf-8")
     assert _js_tests_likely_need_jsdom(tmp_path, ["plain.test.js"]) is False
+
+
+def test_write_all_files_blocks_mass_delete_in_existing_test(tmp_path: Path) -> None:
+    p = tmp_path / "src" / "index.test.js"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"// line {i}\n" for i in range(1, 22))
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(ValueError, match="Refusing write"):
+        tool_write_all_files(
+            repo_root=tmp_path,
+            modified_files=[{"file_path": "src/index.test.js", "content": "it('x', () => {});\n"}],
+        )
+
+
+def test_write_all_files_blocks_jest_to_vitest_import_swap(tmp_path: Path) -> None:
+    p = tmp_path / "src" / "index.test.js"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "import { describe, it, expect } from '@jest/globals';\n"
+        "describe('app', () => { it('loads', () => { expect(1).toBe(1); }); });\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Vitest"):
+        tool_write_all_files(
+            repo_root=tmp_path,
+            modified_files=[
+                {
+                    "file_path": "src/index.test.js",
+                    "content": "import { describe, it, expect } from 'vitest';\n"
+                    "describe('app', () => { it('loads', () => { expect(1).toBe(1); }); });\n",
+                }
+            ],
+        )
+
+
+def test_write_all_files_allows_guard_bypass_via_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENTI_HELIX_DISABLE_TEST_REWRITE_GUARD", "1")
+    p = tmp_path / "src" / "index.test.js"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"// line {i}\n" for i in range(1, 22))
+    p.write_text(body, encoding="utf-8")
+    out = tool_write_all_files(
+        repo_root=tmp_path,
+        modified_files=[{"file_path": "src/index.test.js", "content": "it('x', () => {});\n"}],
+    )
+    assert out["files_written"] == ["src/index.test.js"]
+
+
+def test_diff_json_for_judge_gate_backfills_allowed_paths() -> None:
+    from agenti_helix.verification.verification_loop import _diff_json_for_judge_gate
+
+    out = _diff_json_for_judge_gate({"files_written": ["src/a.js"], "test_file_paths": ["src/a.test.js"]})
+    assert out["diff_validator_allowed_paths"] == ["src/a.js", "src/a.test.js"]
