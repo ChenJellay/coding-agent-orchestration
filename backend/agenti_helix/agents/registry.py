@@ -107,6 +107,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="code_searcher.md",
         input_model=BaseModel,
         output_model=models.CodeSearcherOutput,
+        max_output_tokens=2048,
     ),
     "doc_fetcher_v1": AgentSpec(
         agent_id="doc_fetcher_v1",
@@ -228,6 +229,7 @@ _AGENTS: Dict[str, AgentSpec] = {
         prompt_filename="memory_writer.md",
         input_model=BaseModel,
         output_model=models.MemoryWriterOutput,
+        max_output_tokens=1024,
     ),
     "supreme_court_v1": AgentSpec(
         agent_id="supreme_court_v1",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -12,7 +13,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from agenti_helix.api.auth import Role, require_editor
+from agenti_helix.api.auth import Role, require_auth, require_editor
+from agenti_helix.api.repo_run_lock import hold_repo_execution_lock
 from agenti_helix.api.errors import raise_http_error
 from agenti_helix.runtime.pipeline_presets import PIPELINE_MODES
 from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
@@ -41,6 +43,22 @@ from agenti_helix.api.git_ops import real_git_commit
 
 
 router = APIRouter()
+
+
+def _validate_dashboard_repo_path(repo_path: str) -> str:
+    """When ``AGENTI_HELIX_ALLOWED_REPO_ROOTS`` is set, reject paths outside those prefixes."""
+    p = Path(repo_path).expanduser().resolve()
+    raw = (os.environ.get("AGENTI_HELIX_ALLOWED_REPO_ROOTS") or "").strip()
+    if not raw:
+        return str(p)
+    allowed = [Path(x.strip()).expanduser().resolve() for x in raw.split(",") if x.strip()]
+    if not any(p == a or p.is_relative_to(a) for a in allowed):
+        raise_http_error(
+            code="repo_not_allowed",
+            message=f"repo_path must be under one of: {[str(a) for a in allowed]}",
+            status_code=403,
+        )
+    return str(p)
 
 
 def _repo_rel_path(*, repo_root: Path, task_repo: Path, rel_or_abs: str) -> str:
@@ -91,7 +109,7 @@ def _merge_stage_paths(*, repo_root: Path, task: EditTaskSpec, checkpoint: Check
                         for item in lst:
                             if isinstance(item, str):
                                 add(item)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
     return ordered
@@ -226,7 +244,8 @@ def _run_rerun_job(
         )
         return
 
-    final_state = run_verification_loop(task_to_run, cancel_token=cancel_token)
+    with hold_repo_execution_lock([str(task_to_run.repo_path)]):
+        final_state = run_verification_loop(task_to_run, cancel_token=cancel_token)
     cp = getattr(final_state, "checkpoint", None)
     cp_status = getattr(cp, "status", None)
 
@@ -440,7 +459,7 @@ class SignoffApplyRequestBody(BaseModel):
 
 
 @router.post("/api/tasks/rerun")
-def rerun_task(body: RerunRequestBody) -> Dict[str, Any]:
+def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     try:
         ref = find_task_ref(task_id=body.task_id, feature_id=body.feature_id, node_id=body.node_id)
     except KeyError:
@@ -477,7 +496,7 @@ def rerun_task(body: RerunRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/abort")
-def abort_task(body: AbortRequestBody) -> Dict[str, Any]:
+def abort_task(body: AbortRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     try:
         ref = find_task_ref(task_id=body.task_id, feature_id=body.feature_id, node_id=body.node_id)
     except KeyError:
@@ -510,7 +529,7 @@ def abort_task(body: AbortRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/context")
-def attach_task_context(body: TaskContextRequestBody) -> Dict[str, Any]:
+def attach_task_context(body: TaskContextRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     # Do not fetch remote URLs server-side; we only persist the reference + notes.
     save_task_context(task_id=body.task_id, doc_url=body.doc_url, notes=body.notes)
     log_event(
@@ -524,7 +543,7 @@ def attach_task_context(body: TaskContextRequestBody) -> Dict[str, Any]:
 
 
 @router.post("/api/tasks/apply-and-rerun")
-def apply_and_rerun(body: ApplyAndRerunRequestBody) -> Dict[str, Any]:
+def apply_and_rerun(body: ApplyAndRerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     if body.doc_url:
         save_task_context(task_id=body.task_id, doc_url=body.doc_url, notes=None)
 
@@ -542,7 +561,7 @@ def apply_and_rerun(body: ApplyAndRerunRequestBody) -> Dict[str, Any]:
 
 
 @router.put("/api/dags/{dag_id}/intent")
-def edit_dag_intent(dag_id: str, body: EditIntentRequestBody) -> Dict[str, Any]:
+def edit_dag_intent(dag_id: str, body: EditIntentRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
     # Recompile DAG spec and run it (background) so UI can poll.
     repo_root = str(PATHS.repo_root)
     try:
@@ -619,7 +638,7 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
     dag_id = body.dag_id or f"dag-ui-run-{int(time.time())}"
 
     _macro_intent = body.macro_intent
-    _repo_path = body.repo_path
+    _repo_path = _validate_dashboard_repo_path(body.repo_path)
     try:
         _pipeline_mode = _resolve_internal_pipeline_mode(body.mode, body.extras)
     except ValueError as exc:
@@ -723,7 +742,9 @@ def run_dag_from_dashboard(body: ExecuteDagFromDashboardRequestBody, _role: Role
 
 
 @router.put("/api/dags/{dag_id}/nodes/{node_id}/chains")
-def update_node_chains(dag_id: str, node_id: str, body: UpdateNodeChainsRequestBody) -> Dict[str, Any]:
+def update_node_chains(
+    dag_id: str, node_id: str, body: UpdateNodeChainsRequestBody, _role: Role = Depends(require_editor)
+) -> Dict[str, Any]:
     spec_path = PATHS.dags_dir / f"{dag_id}.json"
     if not spec_path.exists():
         raise_http_error(code="dag_not_found", message="DAG not found", status_code=404)
@@ -772,7 +793,11 @@ def update_node_chains(dag_id: str, node_id: str, body: UpdateNodeChainsRequestB
 
 
 @router.get("/api/memory")
-def get_episodic_memory(query: str = "", limit: int = 25) -> Dict[str, Any]:
+def get_episodic_memory(
+    query: str = "",
+    limit: int = 25,
+    _role: Role = Depends(require_auth),
+) -> Dict[str, Any]:
     """
     Return episodic memory episodes.
 

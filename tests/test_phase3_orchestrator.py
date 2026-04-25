@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from agenti_helix.api.paths import HelixPaths
 from agenti_helix.verification.checkpointing import Checkpoint, EditTaskSpec, VerificationStatus
 from agenti_helix.orchestration import orchestrator as orch
 from agenti_helix.orchestration.orchestrator import DagNodeSpec, DagSpec, persist_dag_spec

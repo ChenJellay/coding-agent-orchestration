@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from collections import defaultdict
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from agenti_helix.runtime.agent_runtime import run_agent
 from agenti_helix.agents.registry import get_agent
@@ -31,6 +38,50 @@ class JudgeResponseBody(BaseModel):
     problematic_lines: List[int]
 
 
+_rate_lock = Lock()
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _client_host(request: Request) -> str:
+    c = request.client
+    return c[0] if c else "unknown"
+
+
+def _rate_limited(host: str, limit: int) -> bool:
+    if limit <= 0:
+        return False
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets[host]
+        bucket[:] = [t for t in bucket if now - t < 60.0]
+        if len(bucket) >= limit:
+            return True
+        bucket.append(now)
+    return False
+
+
+class JudgeSecurityMiddleware(BaseHTTPMiddleware):
+    """Optional shared token + per-IP POST rate limit (see env vars)."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        path = request.url.path
+        if path in ("/docs", "/openapi.json", "/redoc", "/"):
+            return await call_next(request)
+        expected = (os.environ.get("AGENTI_HELIX_JUDGE_SERVICE_TOKEN") or "").strip()
+        if expected:
+            if request.headers.get("X-Agenti-Helix-Judge-Token") != expected:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        try:
+            limit = int(os.environ.get("AGENTI_HELIX_JUDGE_RATE_LIMIT_PER_MIN", "240") or "240")
+        except ValueError:
+            limit = 240
+        if request.method == "POST" and _rate_limited(_client_host(request), limit):
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        return await call_next(request)
+
+
 app = FastAPI(title="Local Judge Service", version="0.1.0")
 
 # D2: Restrict CORS to the control-plane API only; never expose to browsers directly.
@@ -39,8 +90,11 @@ app.add_middleware(
     allow_origins=["http://127.0.0.1:8001", "http://localhost:8001"],
     allow_credentials=False,
     allow_methods=["POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-Agenti-Helix-Judge-Token"],
 )
+
+# Outermost: token + rate limit before CORS-wrapped routes.
+app.add_middleware(JudgeSecurityMiddleware)
 
 
 class IntentCompilerRequestBody(BaseModel):

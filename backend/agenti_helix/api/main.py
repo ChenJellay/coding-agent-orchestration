@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agenti_helix.agents.registry import get_agent_detail, list_agents
-from agenti_helix.api.auth import Role, require_auth, require_editor
+from agenti_helix.api.auth import Role, require_auth, require_auth_sse_friendly, require_editor
 from agenti_helix.api.response_caches import (
     CACHE_AVAILABLE as _CACHE_AVAILABLE,
     FEATURES_CACHE as _FEATURES_CACHE,
@@ -61,6 +62,13 @@ def _repo_root_from_env() -> Path:
 
 
 PATHS = HelixPaths(repo_root=_repo_root_from_env())
+
+
+def _cors_allow_origins() -> List[str]:
+    raw = (os.environ.get("AGENTI_HELIX_CORS_ORIGINS") or "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 
 def _read_json(path: Path) -> Any:
@@ -132,6 +140,7 @@ FeatureColumn = Literal[
     "VERIFYING",
     "READY_FOR_REVIEW",
     "SUCCESSFUL_COMMIT",
+    "COMPLETE",
 ]
 
 
@@ -392,7 +401,7 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=_cors_allow_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         # D1: Include Authorization header in CORS to allow Bearer token from browser.
@@ -404,7 +413,7 @@ def create_app() -> FastAPI:
         return {"ok": True, "repo_root": str(PATHS.repo_root)}
 
     @app.get("/api/dags")
-    def list_dags() -> List[Dict[str, Any]]:
+    def list_dags(_role: Role = Depends(require_auth)) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for dag_id in _list_dag_ids():
             spec = _try_read_json(PATHS.dags_dir / f"{dag_id}.json") or {}
@@ -414,11 +423,11 @@ def create_app() -> FastAPI:
         return out
 
     @app.get("/api/dags/{dag_id}")
-    def get_dag(dag_id: str) -> Dict[str, Any]:
+    def get_dag(dag_id: str, _role: Role = Depends(require_auth)) -> Dict[str, Any]:
         return _load_dag_spec(dag_id)
 
     @app.get("/api/dags/{dag_id}/state")
-    def get_dag_state(dag_id: str) -> Dict[str, Any]:
+    def get_dag_state(dag_id: str, _role: Role = Depends(require_auth)) -> Dict[str, Any]:
         state = _load_dag_state(dag_id)
         if state is None:
             raise HTTPException(status_code=404, detail="DAG state not found")
@@ -432,6 +441,7 @@ def create_app() -> FastAPI:
         dagId: Optional[str] = None,
         sinceTs: Optional[int] = None,
         limit: int = Query(default=500, ge=1, le=5000),
+        _role: Role = Depends(require_auth),
     ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for e in _iter_jsonl(PATHS.events_path):
@@ -461,13 +471,14 @@ def create_app() -> FastAPI:
         return f"{ts}:{rid}:{msg}:{agent}"
 
     @app.get("/api/events/stream")
-    def stream_events(
+    async def stream_events(
         runId: Optional[str] = None,
         hypothesisId: Optional[str] = None,
         traceId: Optional[str] = None,
         dagId: Optional[str] = None,
         sinceTs: Optional[int] = None,
         heartbeatSeconds: float = Query(default=15.0, ge=1.0, le=60.0),
+        _role: Role = Depends(require_auth_sse_friendly),
     ) -> StreamingResponse:
         """
         Server-sent events stream of events.jsonl.
@@ -476,7 +487,7 @@ def create_app() -> FastAPI:
         provide near-real-time UI updates without adding a persistent queue.
         """
 
-        def gen() -> Iterator[bytes]:
+        async def gen() -> AsyncIterator[bytes]:
             last_heartbeat = time.time()
             last_seen_ts = sinceTs if sinceTs is not None else None
             # Keep a small sliding window to dedupe repeats across polls.
@@ -524,26 +535,33 @@ def create_app() -> FastAPI:
                     payload = json.dumps(e, ensure_ascii=False)
                     yield f"event: event\ndata: {payload}\n\n".encode("utf-8")
 
-                time.sleep(0.8)
+                await asyncio.sleep(0.8)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.get("/api/checkpoints")
-    def get_checkpoints(task_id: Optional[str] = None, limit: int = Query(default=200, ge=1, le=2000)) -> List[Dict[str, Any]]:
+    def get_checkpoints(
+        task_id: Optional[str] = None,
+        limit: int = Query(default=200, ge=1, le=2000),
+        _role: Role = Depends(require_auth),
+    ) -> List[Dict[str, Any]]:
         items = _list_checkpoints()
         if task_id is not None:
             items = [c for c in items if c.get("task_id") == task_id]
         return items[:limit]
 
     @app.get("/api/checkpoints/{checkpoint_id}")
-    def get_checkpoint(checkpoint_id: str) -> Dict[str, Any]:
+    def get_checkpoint(checkpoint_id: str, _role: Role = Depends(require_auth)) -> Dict[str, Any]:
         path = PATHS.checkpoints_dir / f"{checkpoint_id}.json"
         if not path.exists():
             raise HTTPException(status_code=404, detail="Checkpoint not found")
         return _read_json(path)
 
     @app.get("/api/features")
-    def get_features(limit: int = Query(default=200, ge=1, le=2000)) -> List[Dict[str, Any]]:
+    def get_features(
+        limit: int = Query(default=200, ge=1, le=2000),
+        _role: Role = Depends(require_auth),
+    ) -> List[Dict[str, Any]]:
         # D5: 5-second TTL cache reduces disk I/O under polling load.
         cache_key = f"features:{limit}"
         if _CACHE_AVAILABLE and cache_key in _FEATURES_CACHE:
@@ -554,7 +572,7 @@ def create_app() -> FastAPI:
         return result
 
     @app.get("/api/features/{feature_id}")
-    def get_feature(feature_id: str) -> Dict[str, Any]:
+    def get_feature(feature_id: str, _role: Role = Depends(require_auth)) -> Dict[str, Any]:
         spec = _try_read_json(PATHS.dags_dir / f"{feature_id}.json")
         if spec is None:
             raise HTTPException(status_code=404, detail="Feature (DAG) not found")
@@ -586,7 +604,10 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     @app.get("/api/triage")
-    def get_triage(limit: int = Query(default=200, ge=1, le=2000)) -> Dict[str, Any]:
+    def get_triage(
+        limit: int = Query(default=200, ge=1, le=2000),
+        _role: Role = Depends(require_auth),
+    ) -> Dict[str, Any]:
         # D5: 5-second TTL cache to reduce disk I/O under polling load.
         cache_key = f"triage:{limit}"
         if _CACHE_AVAILABLE and cache_key in _TRIAGE_CACHE:
@@ -597,11 +618,11 @@ def create_app() -> FastAPI:
         return {"items": items}
 
     @app.get("/api/agents")
-    def get_agents() -> Dict[str, Any]:
+    def get_agents(_role: Role = Depends(require_auth)) -> Dict[str, Any]:
         return {"agents": list_agents()}
 
     @app.get("/api/agents/{agent_id}")
-    def get_agent(agent_id: str) -> Dict[str, Any]:
+    def get_agent(agent_id: str, _role: Role = Depends(require_auth)) -> Dict[str, Any]:
         try:
             return get_agent_detail(agent_id)
         except KeyError:
@@ -625,12 +646,12 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     @app.get("/api/compute")
-    def get_compute() -> Dict[str, Any]:
+    def get_compute(_role: Role = Depends(require_auth)) -> Dict[str, Any]:
         events = list(_iter_jsonl(PATHS.events_path))
         return {"event_count": len(events)}
 
     @app.get("/api/repo-map")
-    def get_repo_map() -> JSONResponse:
+    def get_repo_map(_role: Role = Depends(require_auth)) -> JSONResponse:
         candidates = [
             PATHS.repo_root / "repo_map.json",
             PATHS.repo_root / "repo_map.jsonl",
@@ -655,7 +676,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/rules")
-    def get_rules() -> Dict[str, Any]:
+    def get_rules(_role: Role = Depends(require_auth)) -> Dict[str, Any]:
         rules = _try_read_json(PATHS.rules_path)
         return rules if isinstance(rules, dict) else {"rules": []}
 
@@ -663,6 +684,7 @@ def create_app() -> FastAPI:
     def get_blame(
         file: str = Query(..., description="Repo-relative file path to blame"),
         line: int = Query(..., ge=1, description="1-based line number"),
+        _role: Role = Depends(require_auth),
     ) -> Dict[str, Any]:
         """§4.6 — Semantic Git Blame.
 

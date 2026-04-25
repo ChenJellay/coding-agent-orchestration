@@ -24,7 +24,7 @@ D5 — Polling Performance:
 - _CACHE_AVAILABLE is set based on cachetools availability
 
 D7 — Requirements completeness:
-- requirements.txt contains pydantic, httpx, cachetools
+- requirements.txt contains pydantic, httpx, cachetools, pytest
 """
 from __future__ import annotations
 
@@ -225,3 +225,4 @@ def test_requirements_txt_has_pydantic_httpx_cachetools():
     assert "cachetools" in content, "requirements.txt must list cachetools"
     assert "gitpython" in content, "requirements.txt must list gitpython"
     assert "bandit" in content, "requirements.txt must list bandit"
+    assert "pytest" in content, "requirements.txt must list pytest"

@@ -86,6 +86,7 @@ def test_diff_gate_inserts_validator_before_judge() -> None:
     plan = RunPlan(diff_gate=True)
     chain = build_judge_chain(_task(), plan)
     ids = _ids(chain)
+    assert ids.index("load_rules") < ids.index("diff_validator")
     assert "diff_validator" in ids
     assert ids.index("diff_validator") < ids.index("judge")
     # On BLOCK, the snippet steps must short-circuit on judge_response.
@@ -99,6 +100,14 @@ def test_full_tdd_judge_has_run_tests_and_evaluator() -> None:
     assert "run_tests" in ids
     assert "judge_evaluator" in ids
     assert "map_verdict" in ids
+
+
+def test_full_tdd_preset_loads_rules_before_diff_gate() -> None:
+    """PRESET_FULL_TDD enables diff_gate; diff_validator must not resolve refs before rules exist."""
+    chain = build_judge_chain(_task(), PRESET_FULL_TDD)
+    ids = _ids(chain)
+    assert ids.index("load_rules") < ids.index("diff_validator")
+    assert ids.index("diff_validator") < ids.index("run_tests")
 
 
 def test_lint_type_gate_overlays_linter_and_typechecker() -> None:

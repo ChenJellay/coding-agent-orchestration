@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -61,10 +62,14 @@ class JudgeClient:
         """
         url = f"{self._base_url}/judge"
         payload = json.dumps(asdict(request)).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        token = (os.environ.get("AGENTI_HELIX_JUDGE_SERVICE_TOKEN") or "").strip()
+        if token:
+            headers["X-Agenti-Helix-Judge-Token"] = token
         http_request = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
 

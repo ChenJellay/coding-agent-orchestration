@@ -24,6 +24,16 @@ class LibrarianOutput(BaseModel):
 
 
 # ---------------------------------------------------------
+# 2. Code Searcher (precision retrieval)
+# ---------------------------------------------------------
+class CodeSearcherOutput(BaseModel):
+    """Structured output for ``code_searcher_v1``."""
+
+    summary: str = Field(default="", description="Brief rationale for the listed matches")
+    results: List[Dict[str, Any]] = Field(default_factory=list, description="Ranked file/symbol hits")
+
+
+# ---------------------------------------------------------
 # 3. The SDET & 4. The Coder (Shared Output Format)
 # ---------------------------------------------------------
 class CodeFile(BaseModel):
@@ -305,4 +315,18 @@ class SupremeCourtOutput(BaseModel):
         allowed = {"PASS_OVERRIDE", "CONFIRM_BLOCKED", "ESCALATE_HUMAN"}
         out["ruling"] = r if r in allowed else "CONFIRM_BLOCKED"
         return out
+
+
+# Registry uses historical names for linter / type-checker agents.
+LinterOutput = LinterAgentOutput
+TypeCheckerOutput = TypeCheckerAgentOutput
+
+
+class MemoryWriterOutput(BaseModel):
+    """Structured output for ``memory_writer_v1``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    written: int = Field(default=0, description="Number of memory entries written")
+    message: str = Field(default="", description="Optional human-readable status")
 

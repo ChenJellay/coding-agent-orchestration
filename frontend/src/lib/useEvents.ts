@@ -41,6 +41,8 @@ export function useEventTick(filter?: EventTickFilter, fallbackPollMs = 10000): 
     const qs = new URLSearchParams()
     if (dagId) qs.set('dagId', dagId)
     if (runId) qs.set('runId', runId)
+    const apiKey = import.meta.env.VITE_API_KEY as string | undefined
+    if (apiKey) qs.set('access_token', apiKey)
     // Start the cursor at "now" so the initial connection doesn't replay every
     // historical event in events.jsonl (which would cause N immediate tick++).
     qs.set('sinceTs', String(Math.floor(Date.now() / 1000)))

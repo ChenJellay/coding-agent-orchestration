@@ -143,7 +143,6 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 }
 
 function DashboardPage() {
-  const navigate = useNavigate()
   const REPO_PRESETS = useMemo(
     () => [
       { label: 'demo-repo', value: '../demo-repo' },
@@ -256,6 +255,7 @@ function DashboardPage() {
       VERIFYING: 0,
       READY_FOR_REVIEW: 0,
       SUCCESSFUL_COMMIT: 0,
+      COMPLETE: 0,
     }
     for (const f of features ?? []) base[f.column] = (base[f.column] ?? 0) + 1
     return base
@@ -710,6 +710,20 @@ function DashboardPage() {
           </div>
           <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>Signed off (all nodes passed)</div>
         </div>
+        <div
+          style={{
+            border: '1px solid rgba(37, 99, 235, 0.35)',
+            borderRadius: 14,
+            background: 'rgba(37, 99, 235, 0.06)',
+            padding: 12,
+          }}
+        >
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 6 }}>Merged to main</div>
+          <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: 'rgba(37, 99, 235, 1)' }}>
+            {counts.COMPLETE}
+          </div>
+          <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 4 }}>Recorded merge / complete</div>
+        </div>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12, alignItems: 'start' }}>
@@ -1098,6 +1112,7 @@ const KANBAN_COLUMNS: Array<{ id: FeatureColumn; label: string; help: string }> 
   { id: 'VERIFYING', label: 'Verifying', help: 'Judges running' },
   { id: 'READY_FOR_REVIEW', label: 'Ready for Review', help: 'Awaiting sign-off' },
   { id: 'SUCCESSFUL_COMMIT', label: 'Successful commits', help: 'Signed off — all nodes passed verification' },
+  { id: 'COMPLETE', label: 'Complete', help: 'Merged to main (or recorded complete)' },
 ]
 
 function formatEta(seconds: number | null): string {
@@ -1115,7 +1130,7 @@ function triageSeverityTone(sev: TriageItem['severity']): { border: string; text
 
 function FeatureCard({ feature, onDeleted }: { feature: Feature; onDeleted?: () => void }) {
   const navigate = useNavigate()
-  const success = feature.column === 'SUCCESSFUL_COMMIT'
+  const success = feature.column === 'SUCCESSFUL_COMMIT' || feature.column === 'COMPLETE'
   const [removing, setRemoving] = useState(false)
 
   async function handleRemove(e: React.MouseEvent) {
@@ -2275,7 +2290,6 @@ function SignoffDiffBlock({
 function TriageInboxPage() {
   const [items, setItems] = useState<TriageItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const navigate = useNavigate()
 
   const reloadTriage = useCallback(async () => {
     try {
@@ -2635,7 +2649,7 @@ function FeaturesKanbanPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <PageTitle
         title="Features"
-        subtitle="System-state Kanban: Scoping → Orchestrating → Blocked → Verifying → Ready for Review → Successful commits"
+        subtitle="System-state Kanban through Complete (includes merged-to-main)"
       />
 
       {error ? <ErrorBox title="Failed to load features from API. Is the API server running?" error={error} /> : null}

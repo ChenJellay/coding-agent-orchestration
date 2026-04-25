@@ -33,6 +33,7 @@ EXPECTED_AGENT_BUDGETS: Dict[str, int] = {
     "coder_patch_v1": 1024,
     "intent_compiler_v1": 4096,
     "context_librarian_v1": 2048,
+    "code_searcher_v1": 2048,
     "sdet_v1": 4096,
     "coder_builder_v1": 8192,
     "security_governor_v1": 1536,
@@ -43,6 +44,7 @@ EXPECTED_AGENT_BUDGETS: Dict[str, int] = {
     "linter_v1": 2048,
     "type_checker_v1": 2048,
     "memory_summarizer_v1": 1024,
+    "memory_writer_v1": 1024,
     "supreme_court_v1": 1536,
 }
 

@@ -5,6 +5,7 @@ export type FeatureColumn =
   | 'VERIFYING'
   | 'READY_FOR_REVIEW'
   | 'SUCCESSFUL_COMMIT'
+  | 'COMPLETE'
 
 export type Feature = {
   feature_id: string

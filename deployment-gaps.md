@@ -244,24 +244,31 @@ Cooperative cancellation via `TaskCancelledError` wired through `chain_runtime` 
 ## Cross-Cutting Deployment Concerns
 
 ### D1 — Authentication & Authorization  
-**Status:** ✅ **Implemented**
+**Status:** ✅ **Implemented** (route-level as of audit follow-up)
 
 `backend/agenti_helix/api/auth.py`:
-- `require_auth` FastAPI dependency validates `Authorization: Bearer <token>` against `AGENTI_HELIX_API_KEY`
-- `require_editor` dependency adds role gating for mutation endpoints
-- Two roles: `editor` (full access) and `viewer` (read-only via `AGENTI_HELIX_VIEWER_API_KEY`)
-- Auth bypassed in dev mode when `AGENTI_HELIX_API_KEY` is unset; enforced with `AGENTI_HELIX_AUTH_ENABLED=true`
-- `PUT /api/agents/{agent_id}/prompt`, `POST /api/dags/run`, `POST /api/tasks/merge` require `editor` role
-- CORS `allow_headers` updated to include `Authorization`
-- Frontend `api.ts`: `_authHeaders()` injects `Bearer ${VITE_API_KEY}` centrally; 401/403 surfaces clear error message
+- `require_auth` validates `Authorization: Bearer <token>` against `AGENTI_HELIX_API_KEY` / `AGENTI_HELIX_VIEWER_API_KEY`
+- `require_auth_sse_friendly` adds optional `access_token` query (browser `EventSource` cannot set headers)
+- `require_editor` gates all mutating routes (editor role only)
+- Auth bypassed when no API key is configured **unless** `AGENTI_HELIX_AUTH_ENABLED=true`
+
+**Control-plane (`api/main.py`):** all `GET` routes except `/api/health` use `Depends(require_auth)`; `DELETE /api/features/{id}` and `PUT /api/agents/.../prompt` use `require_editor`.
+
+**Task router (`api/task_commands_routes.py`):** `require_editor` on rerun, abort, context, apply-and-rerun, edit intent, node chains, DAG run, sign-off, resume, merge; `require_auth` on `GET /api/memory`.
+
+**CORS:** `AGENTI_HELIX_CORS_ORIGINS` (comma-separated) overrides default Vite dev origins.
+
+**Frontend:** `api.ts` `_authHeaders()`; `useEvents.ts` passes `access_token` when `VITE_API_KEY` is set.
 
 ---
 
 ### D2 — Judge Service Isolation  
-**Status:** ✅ **Implemented**
+**Status:** ✅ **Implemented** (hardening extended)
 
 `judge_server.py`:
 - `CORSMiddleware` restricted to `["http://127.0.0.1:8001", "http://localhost:8001"]`; wildcard `"*"` removed
+- Optional `AGENTI_HELIX_JUDGE_SERVICE_TOKEN`: requests must send matching `X-Agenti-Helix-Judge-Token` (control plane sets this via `judge_client.py`)
+- Per-IP POST rate limit: `AGENTI_HELIX_JUDGE_RATE_LIMIT_PER_MIN` (default 240/min)
 - Raw `print()` debug statements replaced with structured `log_event()` calls
 - Deployment note: bind to `127.0.0.1` via `--host 127.0.0.1` uvicorn flag (enforced in `scripts/start-dev.sh`)
 
@@ -313,7 +320,7 @@ Cooperative cancellation via `TaskCancelledError` wired through `chain_runtime` 
 **Status:** ✅ **Implemented**
 
 - `backend/agenti_helix/__init__.py` docstring updated: removed `single_agent` reference; reflects current `runtime/`, `memory/`, `agents/`, `api/`, `core/`, `verification/`, `orchestration/`, `observability/` layout
-- `requirements.txt` now explicitly lists `pydantic>=2.0`, `httpx>=0.27`, `cachetools>=5.3`, `gitpython>=3.1.0`, `bandit>=1.7.0`
+- `requirements.txt` now explicitly lists `pydantic>=2.0`, `httpx>=0.27`, `cachetools>=5.3`, `gitpython>=3.1.0`, `bandit>=1.7.0`, `pytest>=8.0`
 
 ---
 
@@ -325,7 +332,7 @@ Cooperative cancellation via `TaskCancelledError` wired through `chain_runtime` 
 |----|--------|---------|--------|
 | D1 | Authentication on all API endpoints | `api/main.py`, `api/auth.py`, `frontend/src/lib/api.ts` | ✅ Done |
 | D2 | Judge service CORS isolation; remove debug prints | `verification/judge_server.py` | ✅ Done |
-| §4.2 | Ephemeral sandbox (Docker) | `runtime/tools.py`, new `sandbox/` package | ❌ Remaining |
+| §4.2 | Ephemeral sandbox (Docker) | `sandbox/manager.py` (gate + log hook); full executor | ⚠️ Gate only — Docker not wired |
 
 ### P1 — High-Impact Gaps (limits blueprint-stated value propositions)
 

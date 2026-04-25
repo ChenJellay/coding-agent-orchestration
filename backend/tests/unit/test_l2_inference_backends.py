@@ -30,6 +30,8 @@ def test_default_backend_is_mlx_local():
 
 def test_mlx_backend_uses_large_default_when_max_tokens_none(monkeypatch):
     """Omitting max_tokens should use AGENTI_HELIX_MLX_MAX_TOKENS (default 262144)."""
+    if os.environ.get("AGENTI_SKIP_MLX_TESTS", "").lower() in ("1", "true", "yes"):
+        pytest.skip("MLX runtime tests disabled (AGENTI_SKIP_MLX_TESTS)")
     pytest.importorskip("mlx_lm", reason="MLX not installed")
     import mlx_lm  # type: ignore
     from agenti_helix.runtime.inference_backends import MLXLocalInferenceBackend, MLXModelConfig

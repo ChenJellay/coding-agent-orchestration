@@ -42,7 +42,14 @@ Key variables:
 | `OPENAI_API_KEY` | Optional — only if `AGENTI_HELIX_BACKEND_TYPE=openai` (default is local MLX for all agents) |
 
 | `VITE_API_BASE_URL` | Frontend → backend URL (default: `http://127.0.0.1:8001`) |
+| `VITE_API_KEY` | Same value as `AGENTI_HELIX_API_KEY` when auth is enabled (sent on API calls and SSE `access_token`) |
 | `AGENTI_HELIX_API_KEY` | Bearer token for API auth (optional in dev mode) |
+| `AGENTI_HELIX_CORS_ORIGINS` | Comma-separated browser origins for the control-plane API (defaults to Vite dev URLs) |
+| `AGENTI_HELIX_ALLOWED_REPO_ROOTS` | Optional comma-separated absolute path prefixes; dashboard `repo_path` must sit under one of them |
+| `AGENTI_HELIX_JUDGE_SERVICE_TOKEN` | Optional shared secret; judge service requires header `X-Agenti-Helix-Judge-Token` when set |
+| `AGENTI_HELIX_SANDBOX_ENABLED` | When `true`, logs that Docker isolation is requested (executor not yet wired) |
+
+**Control-plane vs target repo:** `AGENTI_HELIX_REPO_ROOT` is where `.agenti_helix/` (DAG specs, state, events) is stored. The dashboard **Run command** field `repo_path` is the workspace agents edit; keep both pointed at the same tree unless you intend a split layout.
 
 ### 3. Start all services
 
@@ -84,6 +91,18 @@ python scripts/eval/headless_eval.py --tags all
 ```
 
 `stable` runs S1–S3, S5–S7 (memory summarizer, supreme court, cascade, security, build). `all` also includes the LLM escalation scenario (S4). Writes `demo-repo/.agenti_helix/eval/last-run.json` and `last-run.md`. See `demo-repo/eval/scenarios.json` and `deliverables/06_evaluation_plan.md`.
+
+### Tests (CI / local)
+
+From the repository root (with dev dependencies installed):
+
+```bash
+pip install -r requirements.txt
+cd frontend && npm install && npm run lint && npm run build && cd ..
+PYTHONPATH=backend pytest backend/tests tests -q
+```
+
+GitHub Actions runs the same Python and frontend checks on push and pull request.
 
 ---
 
@@ -157,7 +176,7 @@ The 5 phases below build these layers incrementally, starting from a single reli
 
 - **Local Judge Model Integration**
   - Spin up a **local quantized 8B model** (e.g. Qwen Coder 8B 4/8-bit) behind a thin API.
-  "uvicorn phase2.judge_server:app --host 127.0.0.1 --port 8000"
+  `python -m uvicorn agenti_helix.verification.judge_server:app --host 127.0.0.1 --port 8000`
   - Define a strict system prompt:
     - Role: **binary judge**, not coder.
     - Inputs: acceptance criteria, original snippet, edited snippet, language, and any test/lint logs.
@@ -375,7 +394,7 @@ export VITE_API_BASE_URL="http://127.0.0.1:8001"
   - Checkpointing + rollback.
   - Local quantized Judge service and strict prompt.
   - Verification loop with retries and halt conditions.
-  - LangGraph-based implementation in `phase2/verification_loop.py` with a demo CLI in `phase2/cli.py`.
+  - Verification loop in [`backend/agenti_helix/verification/verification_loop.py`](backend/agenti_helix/verification/verification_loop.py); judge HTTP service in [`backend/agenti_helix/verification/judge_server.py`](backend/agenti_helix/verification/judge_server.py).
 
 - **Phase 3**
   - Intent Engine → 3–5 node DAG compiler.

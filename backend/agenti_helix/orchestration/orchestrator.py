@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agenti_helix.observability.debug_log import log_event
+from agenti_helix.api.repo_run_lock import hold_repo_execution_lock
 from agenti_helix.api.paths import PATHS
 from agenti_helix.api.task_lookup import try_load_dag_state
 from agenti_helix.verification.checkpointing import EditTaskSpec, VerificationStatus
@@ -232,6 +234,13 @@ def _requeue_retryable_nodes(
 
 
 def execute_dag(spec: DagSpec) -> DagExecutionResult:
+    """Acquire per-workspace locks so concurrent runs cannot corrupt the same tree."""
+    repo_paths = [str(n.task.repo_path) for n in spec.nodes.values()]
+    with hold_repo_execution_lock(repo_paths):
+        return _execute_dag_body(spec)
+
+
+def _execute_dag_body(spec: DagSpec) -> DagExecutionResult:
     """
     Execute a DAG by routing each node through the verification loop.
 
@@ -249,7 +258,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         log_event(
             run_id=spec.dag_id,
             hypothesis_id="dag_requeue",
-            location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+            location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
             message="Re-queued failed/escalated nodes for retry (persisted state from prior run)",
             data={"dag_id": spec.dag_id, "node_ids": requeued},
             trace_id=trace_id,
@@ -268,7 +277,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
     log_event(
         run_id=spec.dag_id,
         hypothesis_id="dag_start",
-        location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+        location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
         message="Starting DAG execution",
         data={"dag_id": spec.dag_id, "macro_intent": spec.macro_intent, "nodes": list(spec.nodes.keys()), "edges": spec.edges},
         trace_id=trace_id,
@@ -302,7 +311,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         log_event(
             run_id=spec.dag_id,
             hypothesis_id=node_id,
-            location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+            location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
             message="Starting node execution",
             data={"node_id": node_id, "description": node_spec.description, "task_id": node_spec.task.task_id},
             trace_id=trace_id,
@@ -333,7 +342,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
                 log_event(
                     run_id=spec.dag_id,
                     hypothesis_id=node_id,
-                    location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+                    location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
                     message="DAG paused — judge-approved patch staged; awaiting manual sign-off before downstream nodes",
                     data={"node_id": node_id, "task_id": node_spec.task.task_id},
                     trace_id=trace_id,
@@ -342,7 +351,21 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
             else:
                 node_state.status = DagNodeStatus.FAILED
                 failed_nodes.append(node_id)
-        except Exception:
+        except Exception as exc:
+            log_event(
+                run_id=spec.dag_id,
+                hypothesis_id=node_id,
+                location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
+                message="Node execution raised — marking FAILED",
+                data={
+                    "node_id": node_id,
+                    "task_id": node_spec.task.task_id,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc()[:8000],
+                },
+                trace_id=trace_id,
+                dag_id=spec.dag_id,
+            )
             node_state.status = DagNodeStatus.FAILED
             node_state.verification_status = None
             failed_nodes.append(node_id)
@@ -350,7 +373,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
         log_event(
             run_id=spec.dag_id,
             hypothesis_id=node_id,
-            location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+            location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
             message="Finished node execution",
             data={
                 "node_id": node_id,
@@ -370,7 +393,7 @@ def execute_dag(spec: DagSpec) -> DagExecutionResult:
     log_event(
         run_id=spec.dag_id,
         hypothesis_id="dag_end",
-        location="agenti_helix/orchestration/orchestrator.py:execute_dag",
+        location="agenti_helix/orchestration/orchestrator.py:_execute_dag_body",
         message="Finished DAG execution",
         data={"dag_id": spec.dag_id, "failed_nodes": failed_nodes, "trace_id": trace_id},
         trace_id=trace_id,

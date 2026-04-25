@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agenti_helix.observability.debug_log import log_event
+from agenti_helix.sandbox.manager import log_sandbox_status_for_task
 from agenti_helix.runtime.chain_runtime import run_chain
 from agenti_helix.api.task_lookup import record_verification_cycle_snapshot
 from agenti_helix.memory.indexer import index_from_verification_state
@@ -1102,6 +1103,7 @@ def run_verification_loop(
         trace_id=trace_id,
         dag_id=dag_id,
     )
+    log_sandbox_status_for_task(task.task_id, trace_id=trace_id, dag_id=dag_id)
 
     try:
         if _is_cancelled(cancel_token):

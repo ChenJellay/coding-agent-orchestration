@@ -118,7 +118,8 @@ def build_judge_chain(task: Optional[EditTaskSpec], plan: RunPlan) -> Dict[str, 
 
     Layering order (each step opts out via ``skip_if_nonempty_key="judge_response"``
     once the diff gate fires):
-      1. Optional diff_validator gate (sets ``judge_response`` on BLOCK).
+      1. Optional diff_validator gate (``load_rules`` then gate steps; sets
+         ``judge_response`` on BLOCK).
       2. Body — TDD pipeline (run_tests + governor + evaluator + map) or
          patch-style snippet judge_v1.
       3. Optional lint_type overlay (TDD only).
@@ -131,19 +132,14 @@ def build_judge_chain(task: Optional[EditTaskSpec], plan: RunPlan) -> Dict[str, 
     if not plan.diff_gate:
         return {"steps": body}
 
-    # diff_validator needs `rules.repo_rules_text`; the TDD body already loads
-    # rules, but the patch body does not. Hoist a load_rules step in front.
-    needs_rules = not plan.write_tests
-    gate = diff_validator_gate_steps(allowed_paths_ref=_allowed_paths_ref(write_tests=plan.write_tests))
-    if needs_rules:
-        from agenti_helix.runtime.chain_defaults import _step_load_rules  # local to avoid cycle on edits
+    # diff_validator_gate_steps bind `repo_rules_text` to `rules.repo_rules_text`.
+    # That must exist before the gate runs — the TDD body's `load_rules` step runs
+    # only after `run_tests`, so full TDD + diff_gate still needs a hoisted load.
+    from agenti_helix.runtime.chain_defaults import _step_load_rules  # local to avoid cycle on edits
 
-        gate = [_step_load_rules()] + gate
-
-    if plan.write_tests and not plan.lint_type_gate:
-        # Need diff context (write_tests body uses `diff_json.files_written` from
-        # write_files which has already run by the time judge starts).
-        pass
+    gate = [_step_load_rules()] + diff_validator_gate_steps(
+        allowed_paths_ref=_allowed_paths_ref(write_tests=plan.write_tests)
+    )
 
     return {"steps": gate + body}
 

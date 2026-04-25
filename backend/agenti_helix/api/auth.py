@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from typing import Literal, Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Query, status
 
 
 Role = Literal["editor", "viewer"]
@@ -91,6 +91,19 @@ def require_auth(authorization: Optional[str] = Header(default=None)) -> Role:
             detail="Invalid or expired API token",
         )
     return role
+
+
+def require_auth_sse_friendly(
+    authorization: Optional[str] = Header(default=None),
+    access_token: Optional[str] = Query(
+        default=None,
+        description="Same value as Bearer token; for EventSource clients that cannot set headers.",
+    ),
+) -> Role:
+    """Like ``require_auth`` but accepts ``access_token`` query for SSE (browser EventSource)."""
+    if access_token and not authorization:
+        authorization = f"Bearer {access_token}"
+    return require_auth(authorization=authorization)
 
 
 def require_editor(role: Role = Depends(require_auth)) -> Role:
