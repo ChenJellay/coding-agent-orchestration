@@ -333,6 +333,52 @@ def tool_build_ast_context(
     return full
 
 
+def _sdet_context_chars_per_file() -> int:
+    raw = os.environ.get("AGENTI_HELIX_SDET_CONTEXT_CHARS_PER_FILE", "10000").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 10_000
+    return max(2_000, min(n, 80_000))
+
+
+def tool_truncate_file_contexts_for_sdet(
+    *,
+    file_contexts_json: str,
+    max_chars_per_file: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Shrink librarian file payloads before SDET so input+schema leave room for output JSON.
+
+    Full implementation files can be huge; SDET only needs enough to assert imports/APIs.
+    Coder_builder still receives the full ``file_contexts`` from ``load_file_contents``.
+    """
+    lim = max_chars_per_file if max_chars_per_file and max_chars_per_file > 0 else _sdet_context_chars_per_file()
+    suffix = "\n\n… [truncated for SDET context budget]\n"
+    try:
+        rows = json.loads(file_contexts_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"file_contexts_json": file_contexts_json, "truncated_files": []}
+    if not isinstance(rows, list):
+        return {"file_contexts_json": file_contexts_json, "truncated_files": []}
+    truncated: List[str] = []
+    out_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        content = item.get("content")
+        if isinstance(content, str) and len(content) > lim:
+            fp = str(item.get("file_path") or item.get("path") or "")
+            if fp:
+                truncated.append(fp)
+            item["content"] = content[: max(0, lim - len(suffix))] + suffix
+        out_rows.append(item)
+    return {
+        "file_contexts_json": json.dumps(out_rows, indent=2),
+        "truncated_files": truncated,
+    }
+
+
 def tool_load_file_contents(
     *,
     repo_root: str | Path,
@@ -1289,6 +1335,7 @@ TOOL_REGISTRY: Dict[str, Any] = {
     # Full TDD pipeline tools
     "build_ast_context": tool_build_ast_context,
     "load_file_contents": tool_load_file_contents,
+    "truncate_file_contexts_for_sdet": tool_truncate_file_contexts_for_sdet,
     "write_all_files": tool_write_all_files,
     "run_tests": tool_run_tests,
     "load_rules": tool_load_rules,

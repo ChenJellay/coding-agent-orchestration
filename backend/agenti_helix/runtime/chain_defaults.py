@@ -140,6 +140,16 @@ def _step_load_files() -> Dict[str, Any]:
     )
 
 
+def _step_clip_context_for_sdet() -> Dict[str, Any]:
+    """Trim file payloads for SDET only — keeps coder_builder on full ``file_contexts``."""
+    return _tool(
+        id="clip_context_for_sdet",
+        output_key="sdet_context_clipped",
+        tool_name="truncate_file_contexts_for_sdet",
+        input_bindings={"file_contexts_json": {"$ref": "file_contexts.file_contexts_json"}},
+    )
+
+
 def _step_sdet() -> Dict[str, Any]:
     return _agent(
         id="sdet",
@@ -148,14 +158,14 @@ def _step_sdet() -> Dict[str, Any]:
         input_bindings={
             "dag_task": {"$ref": "intent"},
             "acceptance_criteria": {"$ref": "acceptance_criteria"},
-            "context_chunks_json": {"$ref": "file_contexts.file_contexts_json"},
+            "context_chunks_json": {"$ref": "sdet_context_clipped.file_contexts_json"},
             "testing_standards": (
                 "Follow the repository's existing testing patterns. "
                 "Mock external dependencies. Write focused, edge-case-aware tests. "
                 "Ensure tests fail before the implementation exists."
             ),
         },
-        max_tokens=3072,
+        max_tokens=4096,
     )
 
 
@@ -485,12 +495,13 @@ def default_judge_chain(_task: Any | None = None) -> Dict[str, Any]:
 
 
 def default_full_pipeline_coder_chain(_task: Any | None = None) -> Dict[str, Any]:
-    """TDD coder chain: librarian → load → sdet → coder_builder → write_all."""
+    """TDD coder chain: librarian → load → clip (SDET) → sdet → coder_builder → write_all."""
     return {
         "steps": [
             _step_ast_repo_map(),
             _step_context_librarian(),
             _step_load_files(),
+            _step_clip_context_for_sdet(),
             _step_sdet(),
             _step_coder_builder(),
             _step_write_files(),
@@ -599,21 +610,35 @@ def _block_context_librarian() -> List[Dict[str, Any]]:
 
 def _block_sdet() -> List[Dict[str, Any]]:
     return [
-        {**_agent_step(
-            "sdet", "sdet_v1", "sdet_output",
-            {
-                "dag_task": {"$ref": "task_input.intent"},
-                "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
-                "context_chunks_json": {"$ref": "file_contexts.file_contexts_json"},
-                "testing_standards": (
-                    "Follow the repository's existing testing patterns. "
-                    "Mock external dependencies. Write focused, edge-case-aware tests. "
-                    "Ensure tests fail before the implementation exists."
-                ),
-            },
-            max_tokens=4096,
-            temperature=0.1,
-        ), "skip_if_present": True},
+        {
+            **_tool_step(
+                "clip_context_for_sdet",
+                "truncate_file_contexts_for_sdet",
+                "sdet_context_clipped",
+                {"file_contexts_json": {"$ref": "file_contexts.file_contexts_json"}},
+            ),
+            "skip_if_present": True,
+        },
+        {
+            **_agent_step(
+                "sdet",
+                "sdet_v1",
+                "sdet_output",
+                {
+                    "dag_task": {"$ref": "task_input.intent"},
+                    "acceptance_criteria": {"$ref": "task_input.acceptance_criteria"},
+                    "context_chunks_json": {"$ref": "sdet_context_clipped.file_contexts_json"},
+                    "testing_standards": (
+                        "Follow the repository's existing testing patterns. "
+                        "Mock external dependencies. Write focused, edge-case-aware tests. "
+                        "Ensure tests fail before the implementation exists."
+                    ),
+                },
+                max_tokens=4096,
+                temperature=0.1,
+            ),
+            "skip_if_present": True,
+        },
     ]
 
 

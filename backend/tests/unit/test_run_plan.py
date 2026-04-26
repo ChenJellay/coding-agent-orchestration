@@ -65,6 +65,17 @@ def test_full_tdd_coder_has_doc_prefix_then_tdd_body() -> None:
     assert _ids(chain)[-1] == "write_files"
 
 
+def test_tdd_coder_clips_file_context_before_sdet() -> None:
+    """SDET sees truncated payloads; coder_builder still binds full ``file_contexts``."""
+    chain = build_coder_chain(_task(), RunPlan(write_tests=True))
+    ids = _ids(chain)
+    assert ids.index("load_files") < ids.index("clip_context_for_sdet") < ids.index("sdet")
+    sdet = next(s for s in chain["steps"] if s["id"] == "sdet")
+    assert sdet["input_bindings"]["context_chunks_json"] == {"$ref": "sdet_context_clipped.file_contexts_json"}
+    coder = next(s for s in chain["steps"] if s["id"] == "coder_builder")
+    assert coder["input_bindings"]["file_contexts_json"] == {"$ref": "file_contexts.file_contexts_json"}
+
+
 def test_skip_doc_chain_prefix_drops_doc_block() -> None:
     """When the doc was merged at compile time, per-node coder skips the prefix."""
     task = _task("product_eng")

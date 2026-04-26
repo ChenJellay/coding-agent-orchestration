@@ -1753,7 +1753,7 @@ function TaskInterventionPage() {
     setActionNote(null)
     setBusy(true)
     try {
-      await applyAndRerun({
+      const res = await applyAndRerun({
         task_id: task.task_id,
         checkpoint_id: latestCp.checkpoint_id,
         guidance: guidance.trim() || undefined,
@@ -1761,7 +1761,11 @@ function TaskInterventionPage() {
         feature_id: featureId,
         node_id: nodeId,
       })
-      setActionNote('Apply + re-run scheduled.')
+      setActionNote(
+        res.reRunId
+          ? `Re-run queued (${res.reRunId}). The node should switch to RUNNING while the verification loop executes; this page will refresh from the event stream.`
+          : 'Apply + re-run queued.',
+      )
       setRefreshTick((t) => t + 1)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

@@ -287,7 +287,7 @@ export async function applyAndRerun(params: {
   doc_url?: string
   feature_id?: string
   node_id?: string
-}): Promise<{ ok: true }> {
+}): Promise<{ ok: true; reRunId?: string }> {
   return await postJson('/api/tasks/apply-and-rerun', params)
 }
 

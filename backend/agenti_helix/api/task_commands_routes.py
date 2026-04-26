@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from agenti_helix.api.auth import Role, require_auth, require_editor
-from agenti_helix.api.repo_run_lock import hold_repo_execution_lock
+from agenti_helix.api.repo_run_lock import RepoLockTimeoutError, hold_repo_execution_lock
 from agenti_helix.api.errors import raise_http_error
 from agenti_helix.runtime.pipeline_presets import PIPELINE_MODES
 from agenti_helix.api.response_caches import invalidate_features_and_triage_caches
@@ -179,6 +179,59 @@ def _feedback_from_context_and_guidance(*, task_id: str, guidance: Optional[str]
     return "\n".join(parts).strip()
 
 
+_MAX_CHECKPOINT_FEEDBACK_INJECT_CHARS = 6000
+
+
+def _feedback_blob_from_checkpoint_tool_logs(checkpoint: Checkpoint) -> str:
+    """Summarise judge / static / escalation signals from a prior attempt for the next coder run."""
+    logs = checkpoint.tool_logs or {}
+    if not isinstance(logs, dict):
+        return ""
+    chunks: List[str] = []
+
+    judge = logs.get("judge")
+    if isinstance(judge, dict):
+        parts_j: List[str] = []
+        v = judge.get("verdict")
+        if v:
+            parts_j.append(f"Judge verdict: {v}")
+        j = judge.get("justification")
+        if isinstance(j, str) and j.strip():
+            parts_j.append(f"Justification: {j.strip()}")
+        lines = judge.get("problematic_lines")
+        if isinstance(lines, list) and lines:
+            parts_j.append("Problematic lines: " + ", ".join(str(x) for x in lines[:24]))
+        if parts_j:
+            chunks.append("\n".join(parts_j))
+
+    static = logs.get("static_checks")
+    if isinstance(static, dict):
+        errs = static.get("errors")
+        if isinstance(errs, list) and errs:
+            chunks.append("Static checks: " + "; ".join(str(e) for e in errs[:16]))
+
+    esc = logs.get("human_escalation")
+    if isinstance(esc, str) and esc.strip():
+        chunks.append(f"Coder escalation: {esc.strip()}")
+
+    out = "\n\n".join(chunks).strip()
+    if not out:
+        return ""
+    header = "Signals from the checkpoint you are re-running from (previous attempt):\n"
+    out = header + out
+    if len(out) > _MAX_CHECKPOINT_FEEDBACK_INJECT_CHARS:
+        out = out[: _MAX_CHECKPOINT_FEEDBACK_INJECT_CHARS - 24].rstrip() + "\n… (truncated)"
+    return out
+
+
+def _merge_injected_feedback(*, prior_checkpoint: str, context_and_human: str) -> str:
+    prior_checkpoint = (prior_checkpoint or "").strip()
+    context_and_human = (context_and_human or "").strip()
+    if prior_checkpoint and context_and_human:
+        return f"{prior_checkpoint}\n\n---\n\nReviewer / task context:\n{context_and_human}".strip()
+    return prior_checkpoint or context_and_human
+
+
 def _run_rerun_job(
     *,
     cancel_token: CancelToken,
@@ -188,19 +241,88 @@ def _run_rerun_job(
     checkpoint_id: str,
     guidance: Optional[str],
 ) -> None:
-    # The background thread does all state updates so the UI can poll safely.
+    """Background worker: validate checkpoint, restore workspace, run ``run_verification_loop``."""
     if cancel_token.is_cancelled():
         return
 
+    trace_rerun = str(uuid.uuid4())
     log_event(
         run_id=dag_id,
         hypothesis_id=node_id,
         location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
         message="Re-run requested (background job)",
-        data={"task_id": task_id, "checkpoint_id": checkpoint_id},
+        data={"task_id": task_id, "checkpoint_id": checkpoint_id, "trace_id": trace_rerun},
+        trace_id=trace_rerun,
+        dag_id=dag_id,
     )
 
-    ref = find_task_ref(task_id=task_id, feature_id=dag_id, node_id=node_id)
+    try:
+        ref = find_task_ref(task_id=task_id, feature_id=dag_id, node_id=node_id)
+    except KeyError:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run aborted: unknown task",
+            data={"task_id": task_id},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        return
+    except RuntimeError as exc:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run aborted: task lookup error",
+            data={"task_id": task_id, "error": str(exc)},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        return
+
+    try:
+        checkpoint: Checkpoint = load_checkpoint(checkpoint_id)
+    except FileNotFoundError:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run aborted: checkpoint not found",
+            data={"checkpoint_id": checkpoint_id},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        return
+    except Exception as exc:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run aborted: checkpoint load error",
+            data={"checkpoint_id": checkpoint_id, "error": str(exc)},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        return
+
+    if checkpoint.task_id != ref.task.task_id:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run aborted: checkpoint does not belong to task",
+            data={"checkpoint_id": checkpoint_id, "expected_task": ref.task.task_id, "got": checkpoint.task_id},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        return
+
+    prior_fb = _feedback_blob_from_checkpoint_tool_logs(checkpoint)
+    ctx_fb = _feedback_from_context_and_guidance(task_id=task_id, guidance=guidance)
+    injected = _merge_injected_feedback(prior_checkpoint=prior_fb, context_and_human=ctx_fb)
+    task_to_run = _build_task_intent_with_injected_guidance(task=ref.task, injected=injected)
+
     _set_node_state(
         dag_id=dag_id,
         node_id=node_id,
@@ -208,9 +330,12 @@ def _run_rerun_job(
         verification_status=None,
         bump_attempts=True,
     )
+    try:
+        invalidate_features_and_triage_caches()
+    except Exception:
+        pass
 
     if cancel_token.is_cancelled():
-        # Best-effort: update state and stop early.
         _set_node_state(
             dag_id=dag_id,
             node_id=node_id,
@@ -218,20 +343,12 @@ def _run_rerun_job(
             verification_status=VerificationStatus.BLOCKED,
             bump_attempts=False,
         )
+        try:
+            invalidate_features_and_triage_caches()
+        except Exception:
+            pass
         return
 
-    checkpoint: Checkpoint = load_checkpoint(checkpoint_id)
-    if checkpoint.task_id != ref.task.task_id:
-        raise_http_error(
-            code="checkpoint_mismatch",
-            message="checkpoint_id does not belong to task_id",
-            status_code=409,
-        )
-
-    # Restore file to the provided checkpoint state so the next retry is scoped correctly.
-    injected = _feedback_from_context_and_guidance(task_id=task_id, guidance=guidance)
-    task_to_run = ref.task
-    task_to_run = _build_task_intent_with_injected_guidance(task=task_to_run, injected=injected)
     rollback_to_checkpoint(ref.task, checkpoint)
 
     if cancel_token.is_cancelled():
@@ -242,14 +359,68 @@ def _run_rerun_job(
             verification_status=VerificationStatus.BLOCKED,
             bump_attempts=False,
         )
+        try:
+            invalidate_features_and_triage_caches()
+        except Exception:
+            pass
         return
 
-    with hold_repo_execution_lock([str(task_to_run.repo_path)]):
-        final_state = run_verification_loop(task_to_run, cancel_token=cancel_token)
+    try:
+        with hold_repo_execution_lock([str(task_to_run.repo_path)], acquire_timeout_s=300.0):
+            final_state = run_verification_loop(
+                task_to_run,
+                cancel_token=cancel_token,
+                trace_id=trace_rerun,
+                dag_id=dag_id,
+            )
+    except RepoLockTimeoutError as exc:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run failed: workspace lock timeout (another run likely holds the repo)",
+            data={"task_id": task_id, "error": str(exc)},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        _set_node_state(
+            dag_id=dag_id,
+            node_id=node_id,
+            status=DagNodeStatus.FAILED,
+            verification_status=VerificationStatus.BLOCKED,
+            bump_attempts=False,
+        )
+        try:
+            invalidate_features_and_triage_caches()
+        except Exception:
+            pass
+        return
+    except Exception as exc:
+        log_event(
+            run_id=dag_id,
+            hypothesis_id=node_id,
+            location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
+            message="Re-run failed: verification loop raised",
+            data={"task_id": task_id, "error": str(exc)},
+            trace_id=trace_rerun,
+            dag_id=dag_id,
+        )
+        _set_node_state(
+            dag_id=dag_id,
+            node_id=node_id,
+            status=DagNodeStatus.FAILED,
+            verification_status=VerificationStatus.BLOCKED,
+            bump_attempts=False,
+        )
+        try:
+            invalidate_features_and_triage_caches()
+        except Exception:
+            pass
+        return
+
     cp = getattr(final_state, "checkpoint", None)
     cp_status = getattr(cp, "status", None)
 
-    # Map checkpoint status to DAG node status for UI tone.
     if cp_status == VerificationStatus.PASSED:
         _set_node_state(
             dag_id=dag_id,
@@ -275,12 +446,19 @@ def _run_rerun_job(
             bump_attempts=False,
         )
 
+    try:
+        invalidate_features_and_triage_caches()
+    except Exception:
+        pass
+
     log_event(
         run_id=dag_id,
         hypothesis_id=node_id,
         location="agenti_helix/api/task_commands_routes.py:_run_rerun_job",
         message="Re-run finished (background job)",
         data={"task_id": task_id, "checkpoint_id": checkpoint_id, "cp_status": str(cp_status)},
+        trace_id=trace_rerun,
+        dag_id=dag_id,
     )
 
 
@@ -458,8 +636,8 @@ class SignoffApplyRequestBody(BaseModel):
     signed_by: Optional[str] = Field(default=None, description="Optional reviewer id or display name for audit trail.")
 
 
-@router.post("/api/tasks/rerun")
-def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
+def _schedule_verification_rerun(body: RerunRequestBody) -> Dict[str, Any]:
+    """Validate task + checkpoint, then enqueue ``_run_rerun_job`` (HTTP handlers call this)."""
     try:
         ref = find_task_ref(task_id=body.task_id, feature_id=body.feature_id, node_id=body.node_id)
     except KeyError:
@@ -478,7 +656,6 @@ def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) ->
         raise_http_error(code="checkpoint_mismatch", message="checkpoint_id does not belong to task_id", status_code=409)
 
     task_key = f"{ref.dag_id}|{ref.node_id}|{ref.task.task_id}"
-    # Store job cancellation token now; cooperative cancellation will be added in a later step.
     start_background_job(
         meta={"task_id": ref.task.task_id, "checkpoint_id": body.checkpoint_id, "action": "rerun"},
         task_key=task_key,
@@ -491,8 +668,16 @@ def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) ->
             guidance=body.guidance,
         ),
     )
-
+    try:
+        invalidate_features_and_triage_caches()
+    except Exception:
+        pass
     return {"ok": True, "reRunId": task_key}
+
+
+@router.post("/api/tasks/rerun")
+def rerun_task(body: RerunRequestBody, _role: Role = Depends(require_editor)) -> Dict[str, Any]:
+    return _schedule_verification_rerun(body)
 
 
 @router.post("/api/tasks/abort")
@@ -547,8 +732,7 @@ def apply_and_rerun(body: ApplyAndRerunRequestBody, _role: Role = Depends(requir
     if body.doc_url:
         save_task_context(task_id=body.task_id, doc_url=body.doc_url, notes=None)
 
-    # Reuse the same behavior as rerun: schedule a background job and return immediately.
-    resp = rerun_task(
+    return _schedule_verification_rerun(
         RerunRequestBody(
             task_id=body.task_id,
             checkpoint_id=body.checkpoint_id,
@@ -557,7 +741,6 @@ def apply_and_rerun(body: ApplyAndRerunRequestBody, _role: Role = Depends(requir
             node_id=body.node_id,
         )
     )
-    return resp
 
 
 @router.put("/api/dags/{dag_id}/intent")

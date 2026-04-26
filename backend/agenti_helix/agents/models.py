@@ -42,8 +42,28 @@ class CodeFile(BaseModel):
 
 
 class SdetOutput(BaseModel):
-    testing_strategy: str = Field(description="Reasoning for the test cases and edge cases covered")
-    test_files: List[CodeFile] = Field(description="The generated test files")
+    """Tight caps so local models finish JSON before hitting output token limits."""
+
+    testing_strategy: str = Field(
+        description="Reasoning for the test cases and edge cases covered (keep brief)",
+        max_length=900,
+    )
+    test_files: List[CodeFile] = Field(
+        description="Generated test files (prefer one file; max two)",
+        min_length=1,
+        max_length=2,
+    )
+
+    @model_validator(mode="after")
+    def _sdet_body_size_caps(self) -> "SdetOutput":
+        max_body = 10_000
+        for tf in self.test_files:
+            if len(tf.content) > max_body:
+                raise ValueError(
+                    f"test_files entry {tf.file_path!r} is {len(tf.content)} chars; "
+                    f"keep each file under {max_body} so the JSON object can complete within the output budget."
+                )
+        return self
 
 
 class CoderOutput(BaseModel):
