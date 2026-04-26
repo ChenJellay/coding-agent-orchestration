@@ -37,6 +37,7 @@ Before checking scenario-specific criteria, every run must satisfy:
 - [ ] `attempt_count = 1` (no retries)
 - [ ] `diff` in checkpoint changes only the color value, not structure
 - [ ] No files other than `src/components/header.js` in the diff
+- [ ] Patch application does not trip the safety gate (no `Destructive patch rejected` / `Coder failed before verification` in the trace)
 - [ ] Time from submission to staged PASS < 120 seconds (patch pipeline SLA used in headless eval)
 
 **Measures:**

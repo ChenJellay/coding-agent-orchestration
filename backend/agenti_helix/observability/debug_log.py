@@ -62,12 +62,16 @@ def log_event(
         # #endregion
         return
 
-    # UI policy (2026-04): Only persist LLM I/O traces. System action logs are no longer recorded.
+    # Logging policy:
+    # - Default: persist system lifecycle events + llm_trace into events.jsonl (needed for evals/audits).
+    # - Optional: set AGENTI_HELIX_LOG_LLM_ONLY=true to persist only llm_trace lines.
     kind = (data or {}).get("kind") if isinstance(data, dict) else None
+    llm_only = os.environ.get("AGENTI_HELIX_LOG_LLM_ONLY", "").strip().lower() in {"1", "true", "yes"}
+    should_write = (kind == "llm_trace") or (not llm_only)
     # #region agent log
     try:
         _p = Path("/Users/jerrychen/startup/coding-agent-orchestration/.cursor/debug-9274ce.log")
-        _skip = None if kind == "llm_trace" else "not_llm_trace"
+        _skip = None if should_write else "llm_only"
         _line = json.dumps(
             {
                 "sessionId": "9274ce",
@@ -90,7 +94,7 @@ def log_event(
     except Exception:
         pass
     # #endregion
-    if kind != "llm_trace":
+    if not should_write:
         return
 
     payload: Dict[str, Any] = {

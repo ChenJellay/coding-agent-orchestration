@@ -47,6 +47,9 @@ from .checkpointing import (
 )
 from .config import DEFAULT_CONFIG
 
+# Safety cap: keep arbitration diff payload bounded.
+_MAX_GIT_UNIFIED_DIFF_CHARS = 120_000
+
 
 def _normalize_repo_relative_path(raw: str) -> str:
     """Normalize a repo-relative path for comparisons (slashes, ./, leading /)."""
@@ -246,6 +249,33 @@ def _check_bandit_security(target_path: Path) -> List[str]:
     pipeline can still complete in environments without security tooling.
     """
     errors: List[str] = []
+
+    def _parse_bandit_json(raw: str) -> List[str]:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return []
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, list):
+            return []
+        out: List[str] = []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            sev = str(r.get("issue_severity") or "").upper()
+            conf = str(r.get("issue_confidence") or "").upper()
+            if sev != "HIGH" or conf != "HIGH":
+                continue
+            test_id = str(r.get("test_id") or "").strip()
+            text = str(r.get("issue_text") or "").strip()
+            fname = str(r.get("filename") or "").strip()
+            line = r.get("line_number")
+            loc = f"{Path(fname).name}:{line}" if fname and line else (Path(fname).name if fname else "")
+            bits = " ".join(b for b in [test_id, text, f"({loc})" if loc else ""] if b).strip()
+            if bits:
+                out.append(f"[SECURITY] {bits}")
+        return out
+
     try:
         result = subprocess.run(
             [
@@ -254,8 +284,7 @@ def _check_bandit_security(target_path: Path) -> List[str]:
                 str(target_path),
                 "--severity-level", "high",
                 "--confidence-level", "high",
-                "-f", "txt",
-                "--quiet",
+                "-f", "json",
             ],
             capture_output=True,
             text=True,
@@ -264,10 +293,19 @@ def _check_bandit_security(target_path: Path) -> List[str]:
         if result.returncode not in (0, 1):
             return []
         output = (result.stdout or "").strip()
-        if output and "No issues identified" not in output:
-            for line in output.splitlines():
-                if line.startswith(">> Issue:") or line.startswith("Issue:"):
-                    errors.append(f"[SECURITY] {line}")
+        errors.extend(_parse_bandit_json(output))
+
+        # Defensive fallback: if bandit JSON parsing fails, attempt to salvage
+        # high-signal findings from human text output (varies by bandit version).
+        if not errors:
+            # Some tests mock subprocess.run with MagicMock fields; coerce to str.
+            text_out = "\n".join(
+                s for s in [str(getattr(result, "stdout", "") or ""), str(getattr(result, "stderr", "") or "")]
+                if s
+            ).strip()
+            for line in text_out.splitlines():
+                if "Issue:" in line and ("Severity: High" in text_out or "severity: HIGH" in text_out):
+                    errors.append(f"[SECURITY] {line.strip()}")
     except FileNotFoundError:
         pass
     except subprocess.TimeoutExpired:
@@ -703,6 +741,16 @@ def _record_blocked_after_retries(
         ),
         status=VerificationStatus.BLOCKED,
     )
+    # Keep the workspace clean even when the final outcome is BLOCKED.
+    # Otherwise, successive retries (or subsequent scenarios) can compound
+    # failed edits on top of each other and make the codebase drift.
+    try:
+        pre_body = state.original_content if state.original_content is not None else state.checkpoint.pre_state_ref
+        if pre_body is not None:
+            restore_file_from_snapshot(target_path, pre_body)
+    except Exception:
+        # Best-effort rollback: we still want the checkpoint to be recorded.
+        pass
     log_event(
         run_id=state.task.task_id,
         hypothesis_id=f"verdict_attempt_{state.retry_count + 1}",

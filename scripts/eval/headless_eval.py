@@ -285,6 +285,14 @@ def check_expectations(
     dag_id: str,
 ) -> List[str]:
     errors: List[str] = []
+    # Many important signals (e.g. bandit findings) live under ev["data"].
+    # For matching expectations, consider the whole event payload, not only `message`.
+    def _ev_text(ev: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(ev, ensure_ascii=False)
+        except Exception:
+            return str(ev)
+
     exp_col = expect.get("column")
     if exp_col and column != exp_col:
         errors.append(f"column: got {column!r}, want {exp_col!r}")
@@ -294,17 +302,17 @@ def check_expectations(
         errors.append(f"column: got {column!r}, want one of {cols_in!r}")
 
     for sub in expect.get("events_contain") or []:
-        if not any(sub in str(ev.get("message", "")) for ev in events):
+        if not any(sub in _ev_text(ev) for ev in events):
             errors.append(f"missing event message containing: {sub!r}")
 
     for sub in expect.get("events_forbid") or []:
-        if any(sub in str(ev.get("message", "")) for ev in events):
+        if any(sub in _ev_text(ev) for ev in events):
             errors.append(f"forbidden event message appeared: {sub!r}")
 
     any_subs = expect.get("events_contain_any")
     if isinstance(any_subs, list) and any_subs:
         if not any(
-            sub in str(ev.get("message", "")) or sub in str(ev.get("location", ""))
+            sub in _ev_text(ev)
             for ev in events
             for sub in any_subs
             if isinstance(sub, str) and sub

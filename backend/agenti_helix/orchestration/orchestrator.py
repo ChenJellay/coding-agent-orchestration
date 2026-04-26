@@ -299,6 +299,8 @@ def _execute_dag_body(spec: DagSpec) -> DagExecutionResult:
         if any(node_states[p].status is DagNodeStatus.FAILED for p in preds):
             node_state.status = DagNodeStatus.FAILED
             failed_nodes.append(node_id)
+            # Persist cascade-fail immediately so dashboards/evals don't read stale PENDING.
+            persist_dag_execution_state(spec.dag_id, node_states)
             continue
         if any(node_states[p].status is not DagNodeStatus.PASSED_VERIFICATION for p in preds):
             # Upstream still running, pending, or awaiting human sign-off — do not fail this node yet.

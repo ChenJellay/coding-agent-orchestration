@@ -235,6 +235,32 @@ def tool_apply_line_patch_and_validate(
             return result
         raise FileNotFoundError(f"Patch target does not exist: {target_path}")
 
+    # Guard against common JSX-destructive edits in line-patch mode.
+    # If the original range contains JSX tags, the replacement must preserve those tags;
+    # otherwise models may accidentally delete opening tags and leave dangling attributes.
+    try:
+        lang = detect_language(target_path)
+        if lang == "javascript":
+            original_lines = target_path.read_text(encoding="utf-8").splitlines()
+            s = max(1, patch_typed.start_line)
+            e = max(s, patch_typed.end_line)
+            orig_slice = "\n".join(original_lines[s - 1 : min(e, len(original_lines))])
+            repl_slice = "\n".join(patch_typed.replacement_lines)
+
+            def _contains_tag(text: str, tag: str) -> bool:
+                return tag in text
+
+            tag_markers = ["<button", "</button>", "<header", "</header>", "<h1", "</h1>"]
+            for m in tag_markers:
+                if _contains_tag(orig_slice, m) and not _contains_tag(repl_slice, m):
+                    raise ValueError(
+                        f"Destructive patch rejected: original range contains {m!r} but replacement does not. "
+                        "Choose a smaller range (e.g. a single style line) or fully replace the whole element."
+                    )
+    except Exception as exc:
+        # Surface as a structured error so the verification loop can retry cleanly.
+        raise
+
     apply_line_patch_to_file(target_path, patch_typed)
 
     # Syntax check for JS/TS (tree-sitter) — surface errors so the judge
@@ -262,7 +288,16 @@ def tool_apply_line_patch_and_validate(
 def tool_snapshot_target_file(*, repo_root: str | Path, target_file: str) -> str:
     repo_root_path = Path(repo_root).resolve()
     target_path = repo_root_path / target_file
-    return target_path.read_text(encoding="utf-8")
+    raw = target_path.read_text(encoding="utf-8")
+    # Provide a stable numbered listing for line-patch coders.
+    # Each physical line becomes "N|<original line>" (1-based).
+    # This makes it much harder for the model to miscount or choose structurally unsafe ranges.
+    lines = raw.splitlines()
+    numbered = "\n".join(f"{i + 1}|{line}" for i, line in enumerate(lines))
+    # Preserve the trailing newline signal: if the file ends with \n, keep it.
+    if raw.endswith("\n"):
+        numbered += "\n"
+    return numbered
 
 
 def tool_infer_language_from_target_file(*, target_file: str) -> str:
